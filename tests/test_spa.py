@@ -798,6 +798,10 @@ class TestPriorityOneOperations(Base):
         self.assertEqual(rows[0]["payment_status"],"partial")
         settlement = self.c.get("/api/payments/settlement?received_on="+__import__("datetime").date.today().isoformat(),headers=self.h).json()
         self.assertEqual((settlement["gross"],settlement["refunds"],settlement["net"]),(2000.0,100.0,1900.0))
+        activity=self.c.get("/api/payments?received_on="+__import__("datetime").date.today().isoformat(),headers=self.h).json()
+        self.assertEqual(sum(1 for x in activity if x["event_type"]=="payment"),2)
+        self.assertEqual(sum(1 for x in activity if x["event_type"]=="refund"),1)
+        self.assertTrue(all(x["payment_id"] for x in activity))
         history = self.c.get(f"/api/customers/{c}", headers=self.h).json()["payments"]
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0]["method"], "cash")
