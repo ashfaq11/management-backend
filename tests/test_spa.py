@@ -796,7 +796,7 @@ class TestPriorityOneOperations(Base):
         self.assertEqual(rows[0]["paid_amount"], 1900.0)
         self.assertEqual(rows[0]["balance_due"], 100.0)
         self.assertEqual(rows[0]["payment_status"],"partial")
-        settlement = self.c.get("/api/payments/settlement?received_on=2026-11-20",headers=self.h).json()
+        settlement = self.c.get("/api/payments/settlement?received_on="+__import__("datetime").date.today().isoformat(),headers=self.h).json()
         self.assertEqual((settlement["gross"],settlement["refunds"],settlement["net"]),(2000.0,100.0,1900.0))
         history = self.c.get(f"/api/customers/{c}", headers=self.h).json()["payments"]
         self.assertEqual(len(history), 2)
@@ -881,6 +881,6 @@ class TestPriorityOneOperations(Base):
         self.c.post(f"/api/appointments/{a}/payments",json={"amount":300,"method":"upi"},headers=self.h)
         self.post("/api/users",username="summaryuser",password="summary123",role="staff")
         token=self.c.post("/api/auth/login",json={"username":"summaryuser","password":"summary123"}).json()["token"]
-        response=self.c.get("/api/payments/settlement?received_on=2026-11-20",headers={"Authorization":f"Bearer {token}"})
+        response=self.c.get("/api/payments/settlement?received_on="+__import__("datetime").date.today().isoformat(),headers={"Authorization":f"Bearer {token}"})
         self.assertEqual(response.status_code,200,response.text)
         self.assertEqual(response.json()["gross"],300.0)
