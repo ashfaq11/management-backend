@@ -494,6 +494,72 @@ class TestTherapistDetails(Base):
         self.assertEqual((row["upi_id"], row["specialities"]), ("asha@upi", None))
 
 
+class TestTherapistShifts(Base):
+    def create_shift(self, name="Day shift", start_time="09:00", end_time="17:00"):
+        return self.post("/api/shifts", name=name, start_time=start_time, end_time=end_time).json()["id"]
+
+    def assign(self, therapist, shift, weekday):
+        return self.post("/api/shift-assignments", therapist_id=therapist, shift_id=shift,
+                         day_of_week=weekday)
+
+    def test_assigned_shift_limits_appointment_time_and_weekday(self):
+        t, s, c = self.seed()
+        shift = self.create_shift()
+        assigned = self.assign(t, shift, 4)  # Friday (ISO weekday)
+        self.assertEqual(assigned.status_code, 201, assigned.text)
+
+        inside = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                           start_at="2026-11-20T10:00")
+        self.assertEqual(inside.status_code, 201, inside.text)
+
+        before = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                           start_at="2026-11-20T08:30")
+        self.assertEqual(before.status_code, 409)
+
+        unscheduled_day = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                                    start_at="2026-11-21T10:00")
+        self.assertEqual(unscheduled_day.status_code, 409)
+
+    def test_shift_assignment_can_be_changed_for_weekday(self):
+        t, _, _ = self.seed()
+        first = self.create_shift("Morning", "09:00", "13:00")
+        second = self.create_shift("Evening", "14:00", "20:00")
+        a = self.assign(t, first, 0)
+        b = self.assign(t, second, 0)
+        self.assertEqual((a.status_code, b.status_code), (201, 201))
+        rows = self.c.get(f"/api/shift-assignments?therapist_id={t}", headers=self.h).json()
+        monday = [x for x in rows if x["day_of_week"] == 0]
+        self.assertEqual(len(monday), 1)
+        self.assertEqual(monday[0]["shift_id"], second)
+
+    def test_shift_report_shows_roster_and_completed_work(self):
+        t, s, c = self.seed()
+        shift = self.create_shift("Friday", "09:00", "17:00")
+        self.assign(t, shift, 4)
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-20T10:00", duration_min=90).json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+
+        r = self.c.get("/api/reports/shifts?month=2026-11", headers=self.h)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["summary"]["assigned_therapists"], 1)
+        self.assertEqual(body["summary"]["completed"], 1)
+        self.assertEqual(body["summary"]["completed_minutes"], 90)
+        self.assertEqual(body["assignments"][0]["day_name"], "Friday")
+
+    def test_staff_cannot_create_shifts_or_view_shift_report(self):
+        self.post("/api/users", username="shiftstaff", password="shiftstaff1", role="staff")
+        tok = self.c.post("/api/auth/login", json={"username": "shiftstaff", "password": "shiftstaff1"}).json()["token"]
+        headers = {"Authorization": f"Bearer {tok}"}
+        create = self.c.post("/api/shifts",
+                             json={"name": "Day", "start_time": "09:00", "end_time": "17:00"},
+                             headers=headers)
+        self.assertEqual(create.status_code, 403)
+        report = self.c.get("/api/reports/shifts?month=2026-11", headers=headers)
+        self.assertEqual(report.status_code, 403)
+
+
 class TestCustomerPlans(Base):
     def make_appointment(self, therapist, service, customer, **extra):
         body = dict(customer_id=customer, therapist_id=therapist, service_id=service,
