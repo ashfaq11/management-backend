@@ -372,21 +372,67 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(422, "month must be YYYY-MM")
 
     @app.get("/api/reports/summary")
-    def summary(month: str = Query(...), _=Depends(admin)):
+    def summary(month: str = Query(...), therapist_id: int | None = Query(None), _=Depends(admin)):
+        """The month's figures. Revenue counts COMPLETED appointments only, at the price agreed at booking.
+        `lines` is every completed service (who, what, for whom, how much); `by_therapist` gives each
+        therapist's count and amount with a per-service breakdown. `therapist_id` narrows everything but
+        new_customers to one therapist."""
         check_month(month)
         lo, hi = payroll.month_bounds(month)
-        by_status = db.all("""SELECT status, COUNT(*) AS count, COALESCE(SUM(price),0) AS amount
-                              FROM appointments WHERE start_at >= %s AND start_at < %s GROUP BY status
-                              ORDER BY status""", (lo, hi))
-        by_service = db.all("""SELECT s.name AS service, COUNT(*) AS count, SUM(a.price) AS revenue
-                               FROM appointments a JOIN services s ON s.id=a.service_id
-                               WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s
-                               GROUP BY s.id, s.name ORDER BY revenue DESC""", (lo, hi))
+        who, args = ("", (lo, hi)) if therapist_id is None else (" AND a.therapist_id = %s", (lo, hi, therapist_id))
+        by_status = db.all(f"""SELECT a.status, COUNT(*) AS count, COALESCE(SUM(a.price),0) AS amount
+                               FROM appointments a WHERE a.start_at >= %s AND a.start_at < %s{who}
+                               GROUP BY a.status ORDER BY a.status""", args)
+        lines = db.all(f"""SELECT a.id, a.start_at, a.price, c.name AS customer, s.name AS service,
+                                  t.id AS therapist_id, t.name AS therapist
+                           FROM appointments a JOIN customers c ON c.id=a.customer_id
+                           JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
+                           WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s{who}
+                           ORDER BY a.start_at, a.id""", args)
+        by_service: dict[str, dict] = {}
+        by_therapist: dict[int, dict] = {}
+        for r in lines:
+            price = payroll.money(r["price"])
+            sv = by_service.setdefault(r["service"], {"service": r["service"], "count": 0, "revenue": 0})
+            sv["count"] += 1
+            sv["revenue"] = payroll.money(sv["revenue"]) + price
+            th = by_therapist.setdefault(r["therapist_id"], {"therapist_id": r["therapist_id"],
+                                                              "therapist": r["therapist"], "count": 0,
+                                                              "revenue": 0, "services": {}})
+            th["count"] += 1
+            th["revenue"] = payroll.money(th["revenue"]) + price
+            ts = th["services"].setdefault(r["service"], {"service": r["service"], "count": 0, "revenue": 0})
+            ts["count"] += 1
+            ts["revenue"] = payroll.money(ts["revenue"]) + price
+
+        def out(d: dict) -> dict:
+            return {**d, "revenue": float(d["revenue"])}
+
+        therapists = []
+        for th in sorted(by_therapist.values(), key=lambda x: (-x["revenue"], x["therapist"].lower())):
+            services = sorted((out(v) for v in th["services"].values()), key=lambda x: -x["revenue"])
+            therapists.append({**out(th), "services": services})
         # created_at is a timestamptz and the session zone is the spa's, so these are local calendar months
         new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE created_at >= %s AND created_at < %s", (lo, hi))["n"]
-        rev = sum(r["revenue"] for r in by_service)
-        return {"month": month, "revenue": round(rev, 2), "new_customers": new_c,
-                "by_status": by_status, "by_service": by_service}
+        rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
+        return {"month": month, "therapist_id": therapist_id, "revenue": float(rev),
+                "services_count": len(lines), "new_customers": new_c, "by_status": by_status,
+                "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
+                "by_therapist": therapists, "lines": lines}
+
+    @app.get("/api/reports/summary/pdf")
+    def summary_pdf(month: str = Query(...), therapist_id: int | None = Query(None), user=Depends(admin)):
+        """The same report as /api/reports/summary (same filters), as a PDF to download or print."""
+        r = summary(month, therapist_id, user)
+        label = "all-therapists"
+        if therapist_id is not None:
+            t = db.one("SELECT name FROM therapists WHERE id=%s", (therapist_id,))
+            if not t:
+                raise HTTPException(404, "Therapist not found")
+            r["therapist"] = t["name"]
+            label = re.sub(r"[^A-Za-z0-9_-]", "_", t["name"])
+        return Response(payroll.report_pdf(r, business), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="report_{month}_{label}.pdf"'})
 
     @app.get("/api/reports/incentives")
     def incentives(month: str = Query(...), _=Depends(admin)):

@@ -141,6 +141,36 @@ class TestPayroll(Base):
         r = self.c.get("/api/reports/summary?month=2026-11", headers=self.h).json()
         self.assertEqual(r["revenue"], 2000.0)
 
+    def test_summary_details_by_therapist(self):
+        t, s, c = self.seed()
+        t2 = self.post("/api/therapists", name="Meena", fixed_salary=0, incentive_percent=5).json()["id"]
+        s2 = self.post("/api/services", name="Facial", duration_min=30, price=800).json()["id"]
+        done = [(t, s, "09"), (t, s2, "11"), (t2, s, "09"), (t, s, "13")]
+        for th, sv, hr in done:
+            a = self.post("/api/appointments", customer_id=c, therapist_id=th, service_id=sv,
+                          start_at=f"2026-11-12T{hr}:00").json()["id"]
+            self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        # booked (not done) does not count as revenue
+        self.post("/api/appointments", customer_id=c, therapist_id=t2, service_id=s2, start_at="2026-11-13T09:00")
+        r = self.c.get("/api/reports/summary?month=2026-11", headers=self.h).json()
+        self.assertEqual((r["revenue"], r["services_count"], len(r["lines"])), (6800.0, 4, 4))
+        first = r["by_therapist"][0]
+        self.assertEqual((first["therapist_id"], first["count"], first["revenue"]), (t, 3, 4800.0))
+        self.assertEqual([(x["service"], x["count"], x["revenue"]) for x in first["services"]],
+                         [("Massage", 2, 4000.0), ("Facial", 1, 800.0)])
+        self.assertEqual({x["therapist"] for x in r["lines"]}, {"Asha", "Meena"})
+        one = self.c.get(f"/api/reports/summary?month=2026-11&therapist_id={t2}", headers=self.h).json()
+        self.assertEqual((one["revenue"], one["services_count"], len(one["by_therapist"])), (2000.0, 1, 1))
+        self.assertEqual(sum(x["count"] for x in one["by_status"]), 2)  # the booked one shows in by_status
+        for q in ("", f"&therapist_id={t2}"):
+            pdf = self.c.get(f"/api/reports/summary/pdf?month=2026-11{q}", headers=self.h)
+            self.assertEqual(pdf.status_code, 200)
+            self.assertTrue(pdf.content.startswith(b"%PDF"))
+        self.assertIn("Meena", self.c.get(f"/api/reports/summary/pdf?month=2026-11&therapist_id={t2}",
+                                          headers=self.h).headers["content-disposition"])
+        self.assertEqual(self.c.get("/api/reports/summary/pdf?month=2026-11&therapist_id=99999",
+                                    headers=self.h).status_code, 404)
+
 
 class TestCors(Base):
     def test_ui_origin_allowed(self):

@@ -76,3 +76,67 @@ def payslip_pdf(p: dict, business: str) -> bytes:
     f.append(t2)
     doc.build(f)
     return buf.getvalue()
+
+
+def report_pdf(r: dict, business: str) -> bytes:
+    """The monthly revenue report: totals, by service, by therapist (with each one's services), and every
+    completed service line by line."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    st = getSampleStyleSheet()
+    buf = io.BytesIO()
+    y, m = r["month"].split("-")
+    label = f"{calendar.month_name[int(m)]} {y}"
+    who = r.get("therapist") or "All therapists"
+    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Report {label} {who}")
+    head = colors.HexColor("#2f5d50")
+
+    def table(rows, widths, total=False, numeric=2):
+        t = Table(rows, colWidths=widths, repeatRows=1)
+        style = [("BACKGROUND", (0, 0), (-1, 0), head), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                 ("GRID", (0, 0), (-1, -1), .25, colors.grey), ("FONTSIZE", (0, 0), (-1, -1), 8),
+                 ("ALIGN", (-numeric, 0), (-1, -1), "RIGHT")]
+        if total:
+            style.append(("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"))
+        t.setStyle(TableStyle(style))
+        return t
+
+    def amt(v):
+        return f"{v:,.2f}"
+
+    f = [Paragraph(business, st["Title"]), Paragraph(f"Revenue report - {label}", st["Heading2"]),
+         Paragraph(f"Therapist: <b>{who}</b>", st["Normal"]),
+         Paragraph(f"Revenue (completed services): <b>Rs {amt(r['revenue'])}</b> from "
+                   f"<b>{r['services_count']}</b> services", st["Normal"])]
+    if r.get("therapist_id") is None:
+        f.append(Paragraph(f"New customers: {r['new_customers']}", st["Normal"]))
+
+    f += [Spacer(1, 10), Paragraph("By service", st["Heading3"])]
+    rows = [["Service", "Done", "Revenue"]] + [[x["service"], x["count"], amt(x["revenue"])] for x in r["by_service"]]
+    rows.append(["Total", r["services_count"], amt(r["revenue"])])
+    f.append(table(rows, [300, 70, 100], total=True))
+
+    f += [Spacer(1, 10), Paragraph("By therapist", st["Heading3"])]
+    rows = [["Therapist / service", "Done", "Amount"]]
+    bold = []
+    for t in r["by_therapist"]:
+        bold.append(len(rows))
+        rows.append([t["therapist"], t["count"], amt(t["revenue"])])
+        rows += [["    " + x["service"], x["count"], amt(x["revenue"])] for x in t["services"]]
+    if len(rows) == 1:
+        rows.append(["-", "-", "-"])
+    tt = table(rows, [300, 70, 100])
+    tt.setStyle(TableStyle([("FONTNAME", (0, i), (-1, i), "Helvetica-Bold") for i in bold]))
+    f.append(tt)
+
+    f += [Spacer(1, 10), Paragraph("All services done", st["Heading3"])]
+    rows = [["Date", "Customer", "Service", "Therapist", "Price"]]
+    rows += [[str(x["start_at"]).replace("T", " ")[:16], x["customer"], x["service"], x["therapist"], amt(x["price"])]
+             for x in r["lines"]] or [["-", "-", "-", "-", "-"]]
+    rows.append(["Total", "", "", "", amt(r["revenue"])])
+    f.append(table(rows, [85, 120, 110, 95, 60], total=True, numeric=1))
+    doc.build(f)
+    return buf.getvalue()
