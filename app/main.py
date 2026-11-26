@@ -57,6 +57,7 @@ class AppointmentIn(BaseModel):
     start_at: str  # local wall-clock "YYYY-MM-DDTHH:MM"
     notes: Optional[str] = None
     price: Optional[float] = Field(default=None, ge=0)  # override list price
+    duration_min: Optional[int] = Field(default=None, gt=0, le=720)  # override the service's length
 
 
 class StatusIn(BaseModel):
@@ -300,7 +301,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         try:
             return t.insert("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,price,notes)
                                VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                            (b.customer_id, th["id"], sv["id"], start, sv["duration_min"],
+                            (b.customer_id, th["id"], sv["id"], start, b.duration_min or sv["duration_min"],
                              sv["price"] if b.price is None else b.price, b.notes))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
@@ -338,10 +339,12 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             th, sv, start = resolve_slot(t, b)
             # explicit price wins; a different service takes its list price; otherwise keep what was agreed
             price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
+            # the same rule for the length
+            minutes = b.duration_min or (sv["duration_min"] if sv["id"] != a["service_id"] else a["duration_min"])
             try:
                 t.run("""UPDATE appointments SET customer_id=%s,therapist_id=%s,service_id=%s,start_at=%s,
                          duration_min=%s,price=%s,notes=%s,updated_at=now() WHERE id=%s""",
-                      (b.customer_id, th["id"], sv["id"], start, sv["duration_min"], price, b.notes, aid))
+                      (b.customer_id, th["id"], sv["id"], start, minutes, price, b.notes, aid))
             except pgerr.ExclusionViolation:
                 raise HTTPException(409, SLOT_TAKEN)
         return {"id": aid}

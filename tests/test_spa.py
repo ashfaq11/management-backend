@@ -133,6 +133,23 @@ class TestPayroll(Base):
         t, *_ = self.seed()
         self.assertEqual(self.c.get(f"/api/payroll/{t}/2026-13", headers=self.h).status_code, 422)
 
+    def test_duration_override(self):
+        t, s, c = self.seed()
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T09:00", duration_min=90).json()["id"]
+        # 90 minutes: 10:00 now clashes, 10:30 does not
+        self.assertEqual(self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                                   start_at="2026-11-10T10:00").status_code, 409)
+        self.assertEqual(self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                                   start_at="2026-11-10T10:30").status_code, 201)
+        body = dict(customer_id=c, therapist_id=t, service_id=s, start_at="2026-11-10T08:00")
+        self.assertEqual(self.c.put(f"/api/appointments/{a}", json=body, headers=self.h).status_code, 200)
+        row = [x for x in self.c.get("/api/appointments?date=2026-11-10", headers=self.h).json() if x["id"] == a][0]
+        self.assertEqual(row["duration_min"], 90)  # kept when not given
+        self.c.put(f"/api/appointments/{a}", json={**body, "duration_min": 45}, headers=self.h)
+        row = [x for x in self.c.get("/api/appointments?date=2026-11-10", headers=self.h).json() if x["id"] == a][0]
+        self.assertEqual(row["duration_min"], 45)
+
     def test_summary(self):
         t, s, c = self.seed()
         a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
