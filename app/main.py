@@ -70,6 +70,14 @@ class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
 
 
+class BonusIn(BaseModel):
+    therapist_id: int
+    on_date: dt.date
+    amount: float = Field(gt=0, le=1_000_000)
+    note: Optional[str] = Field(default=None, max_length=200)
+    appointment_id: Optional[int] = None
+
+
 class UserUpdate(BaseModel):
     role: Literal["admin", "staff"]
     is_active: bool
@@ -496,9 +504,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         rows = [payroll.compute_payslip(db, t, month) for t in
                 db.all("SELECT * FROM therapists WHERE is_active ORDER BY lower(name)")]
         for r in rows:
-            r.pop("lines")
+            r.pop("lines"); r.pop("bonuses")
         return {"month": month, "therapists": rows,
-                "total_incentive": round(sum(r["incentive"] for r in rows), 2),
+                "total_incentive": round(sum(r["incentive"] + r["extra_incentive"] for r in rows), 2),
                 "total_payroll": round(sum(r["net_pay"] for r in rows), 2)}
 
     def payslip_for(tid: int, month: str):
@@ -507,6 +515,40 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not t:
             raise HTTPException(404, "Therapist not found")
         return payroll.compute_payslip(db, t, month)
+
+    # ---- extra incentives (admin) -----------------------------------------
+    @app.get("/api/bonuses")
+    def bonuses(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
+                _=Depends(admin)):
+        lo, hi = period(month, date_from, date_to)
+        sql = """SELECT b.id, b.therapist_id, t.name AS therapist, b.on_date, b.amount, b.note, b.appointment_id,
+                        u.username AS added_by, b.created_at
+                 FROM therapist_bonuses b JOIN therapists t ON t.id=b.therapist_id
+                 LEFT JOIN users u ON u.id=b.created_by
+                 WHERE b.on_date >= %s AND b.on_date < %s"""
+        args: list = [lo, hi]
+        if therapist_id is not None:
+            sql += " AND b.therapist_id=%s"; args.append(therapist_id)
+        return db.all(sql + " ORDER BY b.on_date DESC, b.id DESC", args)
+
+    @app.post("/api/bonuses", status_code=201)
+    def add_bonus(b: BonusIn, u=Depends(admin)):
+        if not db.one("SELECT 1 FROM therapists WHERE id=%s", (b.therapist_id,)):
+            raise HTTPException(404, "Therapist not found")
+        if b.appointment_id is not None and not db.one(
+                "SELECT 1 FROM appointments WHERE id=%s AND therapist_id=%s", (b.appointment_id, b.therapist_id)):
+            raise HTTPException(404, "Appointment not found for this therapist")
+        bid = db.insert("""INSERT INTO therapist_bonuses(therapist_id,on_date,amount,note,appointment_id,created_by)
+                           VALUES(%s,%s,%s,%s,%s,%s)""",
+                        (b.therapist_id, b.on_date, b.amount, (b.note or "").strip() or None, b.appointment_id, u["id"]))
+        return {"id": bid}
+
+    @app.delete("/api/bonuses/{bid}", status_code=204)
+    def delete_bonus(bid: int, _=Depends(admin)):
+        if not db.run("DELETE FROM therapist_bonuses WHERE id=%s", (bid,)):
+            raise HTTPException(404, "Not found")
+        return Response(status_code=204)
 
     @app.get("/api/payroll/{tid}/{month}")
     def payslip(tid: int, month: str, _=Depends(admin)):

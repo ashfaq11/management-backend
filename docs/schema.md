@@ -11,6 +11,9 @@ erDiagram
   services ||--o{ appointments : has
   therapists ||--o{ appointments : has
   users ||--o{ sessions : has
+  appointments ||--o{ therapist_bonuses : has
+  users ||--o{ therapist_bonuses : has
+  therapists ||--o{ therapist_bonuses : has
 ```
 
 | Table | Purpose |
@@ -19,6 +22,7 @@ erDiagram
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
+| [`therapist_bonuses`](#therapist_bonuses) | Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive. |
 | [`therapists`](#therapists) | Staff who perform services and are paid on payslips. Never deleted, only set inactive, so past payslips stay reproducible. |
 | [`users`](#users) | Staff logins. Role admin = everything; staff = customers, onboarding, appointments. |
 
@@ -130,6 +134,33 @@ Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token 
 
 - `sessions_expires_idx`: `CREATE INDEX sessions_expires_idx ON sessions USING btree (expires_at)`
 - `sessions_user_idx`: `CREATE INDEX sessions_user_idx ON sessions USING btree (user_id)`
+
+## therapist_bonuses
+
+Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `therapist_id` | bigint | no |  | Who gets it. |
+| `on_date` | date | no |  | The day the incentive is for; decides which month's payslip it is on. |
+| `amount` | numeric(12,2) | no |  | INR, more than 0. |
+| `note` | text | yes |  | Why, e.g. Festival bonus, Extra hours. |
+| `appointment_id` | bigint | yes |  | The appointment it was given for, when it was given from the appointments list (optional). |
+| `created_by` | bigint | yes |  | The user who added it. |
+| `created_at` | timestamp with time zone | no | `now()` | When it was added. |
+
+**Constraints**
+
+- Check `therapist_bonuses_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Foreign key `therapist_bonuses_appointment_id_fkey`: `FOREIGN KEY (appointment_id) REFERENCES appointments(id)`
+- Foreign key `therapist_bonuses_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `therapist_bonuses_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
+- Primary key `therapist_bonuses_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `therapist_bonuses_therapist_idx`: `CREATE INDEX therapist_bonuses_therapist_idx ON therapist_bonuses USING btree (therapist_id, on_date)`
 
 ## therapists
 

@@ -33,11 +33,18 @@ def compute_payslip(db, therapist: dict, month: str) -> dict:
     pct = Decimal(str(therapist["incentive_percent"]))
     incentive = money(revenue * pct / 100)
     fixed = money(therapist["fixed_salary"])
+    bonuses = db.all(
+        """SELECT id, on_date, amount, note FROM therapist_bonuses
+           WHERE therapist_id=%s AND on_date >= %s AND on_date < %s ORDER BY on_date, id""",
+        (therapist["id"], lo, hi))
+    extra = sum((money(b["amount"]) for b in bonuses), Decimal("0"))
     return {
         "therapist_id": therapist["id"], "therapist": therapist["name"], "month": month,
         "fixed_salary": float(fixed), "services_count": len(rows),
         "service_revenue": float(revenue), "incentive_percent": float(pct),
-        "incentive": float(incentive), "net_pay": float(fixed + incentive), "lines": rows,
+        "incentive": float(incentive), "extra_incentive": float(extra),
+        "net_pay": float(fixed + incentive + extra), "lines": rows,
+        "bonuses": [{**b, "amount": float(money(b["amount"]))} for b in bonuses],
     }
 
 
@@ -58,6 +65,8 @@ def payslip_pdf(p: dict, business: str) -> bytes:
             ["Fixed salary", f"{p['fixed_salary']:,.2f}"],
             [f"Incentive ({p['incentive_percent']:g}% of {p['service_revenue']:,.2f}"
              f" from {p['services_count']} services)", f"{p['incentive']:,.2f}"],
+            *[[f"Extra incentive {str(b['on_date'])}" + (f" - {b['note']}" if b.get("note") else ""),
+               f"{b['amount']:,.2f}"] for b in p.get("bonuses", [])],
             ["Net pay", f"{p['net_pay']:,.2f}"]]
     t = Table(earn, colWidths=[340, 130])
     t.setStyle(TableStyle([

@@ -114,6 +114,26 @@ class TestPayroll(Base):
         inc = self.c.get("/api/reports/incentives?month=2026-11", headers=self.h).json()
         self.assertEqual(inc["total_payroll"], 20400.0)
 
+    def test_extra_incentives(self):
+        t, s, c = self.seed(pct=10, salary=20000)
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T09:00").json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        b1 = self.post("/api/bonuses", therapist_id=t, on_date="2026-11-14", amount=500, note="Festival bonus")
+        self.assertEqual(b1.status_code, 201)
+        self.post("/api/bonuses", therapist_id=t, on_date="2026-11-10", amount=150, appointment_id=a)
+        self.post("/api/bonuses", therapist_id=t, on_date="2026-12-01", amount=999)  # next month
+        p = self.c.get(f"/api/payroll/{t}/2026-11", headers=self.h).json()
+        self.assertEqual((p["incentive"], p["extra_incentive"], p["net_pay"], len(p["bonuses"])), (200.0, 650.0, 20850.0, 2))
+        self.assertTrue(self.c.get(f"/api/payroll/{t}/2026-11/pdf", headers=self.h).content.startswith(b"%PDF"))
+        inc = self.c.get("/api/reports/incentives?month=2026-11", headers=self.h).json()
+        self.assertEqual((inc["total_incentive"], inc["total_payroll"]), (850.0, 20850.0))
+        listed = self.c.get(f"/api/bonuses?month=2026-11&therapist_id={t}", headers=self.h).json()
+        self.assertEqual([x["amount"] for x in listed], [500.0, 150.0])
+        self.assertEqual(self.c.delete(f"/api/bonuses/{b1.json()['id']}", headers=self.h).status_code, 204)
+        self.assertEqual(self.c.get(f"/api/payroll/{t}/2026-11", headers=self.h).json()["extra_incentive"], 150.0)
+        self.assertEqual(self.post("/api/bonuses", therapist_id=t, on_date="2026-11-14", amount=0).status_code, 422)
+
     def test_price_override_and_snapshot(self):
         t, s, c = self.seed(pct=10)
         a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
