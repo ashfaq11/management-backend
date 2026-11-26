@@ -98,8 +98,7 @@ class _Pdf:
         self.flow: list = []
 
     def _page(self, canvas, doc):
-        from reportlab.lib.pagesizes import A4
-        w, h = A4
+        w, h = doc.pagesize
         c = self.c
         canvas.saveState()
         canvas.setFillColor(c.HexColor(self.ACC))
@@ -120,7 +119,6 @@ class _Pdf:
         canvas.setFillColor(c.HexColor(self.MUT))
         canvas.setFont("Helvetica", 7.5)
         canvas.drawString(36, 28, f"{self.business} \u00b7 {self.title} \u00b7 {self.period}")
-        canvas.drawRightString(w - 36, 28, f"Page {doc.page}")
         canvas.restoreState()
 
     def heading(self, text):
@@ -165,14 +163,61 @@ class _Pdf:
         t.setStyle(TableStyle(style))
         self.flow.append(t)
 
-    def build(self) -> bytes:
+    def build(self, pagesize=None) -> bytes:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate
         buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=100, bottomMargin=54,
-                                title=f"{self.business} - {self.title} - {self.period}", author=self.business)
-        doc.build(self.flow, onFirstPage=self._page, onLaterPages=self._page)
+        doc = SimpleDocTemplate(buf, pagesize=pagesize or A4, leftMargin=36, rightMargin=36, topMargin=100, bottomMargin=54,
+                                title=f"{self.business} - {self.title} - {self.period}", author=self.business,
+                                subject=self.title, creator="StudioDesk")
+        doc.build(self.flow, onFirstPage=self._page, onLaterPages=self._page, canvasmaker=_numbered_canvas(self.MUT))
         return buf.getvalue()
+
+    def spacer(self, h=10):
+        from reportlab.platypus import Spacer
+        self.flow.append(Spacer(1, h))
+
+    def info(self, pairs, cols=2):
+        """Label/value pairs laid out in columns on a soft panel (e.g. 'Billed to', 'Pay to')."""
+        from reportlab.platypus import Paragraph, Table, TableStyle
+        cells = [[Paragraph(k.upper(), self.st["kl"]), Paragraph(v or "-", self.st["p"])] for k, v in pairs]
+        rows = []
+        for i in range(0, len(cells), cols):
+            r = cells[i:i + cols]
+            rows.append(r + [""] * (cols - len(r)))
+        width = 523 / cols
+        t = Table(rows, colWidths=[width] * cols)
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), self.c.HexColor(self.SOFT)), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 6),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+        self.flow.append(t)
+
+
+def _numbered_canvas(muted: str):
+    """A canvas that writes 'Page X of Y' at the bottom right once the page count is known."""
+    from reportlab.lib import colors
+    from reportlab.pdfgen.canvas import Canvas
+
+    class Numbered(Canvas):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._pages = []
+
+        def showPage(self):
+            self._pages.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            total = len(self._pages)
+            for state in self._pages:
+                self.__dict__.update(state)
+                w = self._pagesize[0]
+                self.setFont("Helvetica", 7.5)
+                self.setFillColor(colors.HexColor(muted))
+                self.drawRightString(w - 36, 28, f"Page {self._pageNumber} of {total}")
+                super().showPage()
+            super().save()
+    return Numbered
 
 
 def amt(v) -> str:
@@ -195,8 +240,16 @@ def payslip_pdf(p: dict, business: str) -> bytes:
     d.heading("Completed services")
     body = [[str(r["start_at"]).replace("T", " ")[:16], r["customer"], r["service"], amt(r["price"])] for r in p["lines"]]
     d.table([["Date", "Customer", "Service", "Price (Rs)"], *(body or [["-", "-", "-", "-"]])], [110, 160, 170, 83])
-    d.flow.append(__import__("reportlab.platypus", fromlist=["Spacer"]).Spacer(1, 30))
-    d.text("Computer-generated payslip; no signature required.", muted=True)
+    t = p.get("therapist_profile") or {}
+    acct = t.get("bank_account_number") or ""
+    pay_to = [("Account holder", t.get("bank_account_name") or p["therapist"]), ("Bank", t.get("bank_name")),
+              ("Account", ("XXXX " + acct[-4:]) if len(acct) > 4 else acct), ("IFSC", (t.get("bank_ifsc") or "").upper()),
+              ("UPI", t.get("upi_id")), ("Phone", t.get("phone"))]
+    if any(v for _, v in pay_to[1:5]):
+        d.heading("Pay to")
+        d.info(pay_to, cols=3)
+    d.spacer(36)
+    d.text("This is a computer-generated payslip and does not need a signature.", muted=True)
     return d.build()
 
 
@@ -260,6 +313,91 @@ def report_pdf(r: dict, business: str) -> bytes:
                  for x in r["plan_lines"]]
         rows.append(["Total", "", "", "", "", amt(r["plan_sales"])])
         d.table(rows, [88, 120, 130, 55, 55, 75], numeric=2, total=True)
+    return d.build()
+
+
+METHODS = {"cash": "Cash", "upi": "UPI", "card": "Card", "bank_transfer": "Bank transfer", "other": "Other"}
+
+
+def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
+    """A customer receipt (A5): number and date, billed to, the service, the amount received in a highlighted box
+    with a PAID stamp, the payment method, any refunds, and a thank-you footer."""
+    from reportlab.lib.pagesizes import A5
+    from reportlab.platypus import Paragraph, Table, TableStyle
+    from xml.sax.saxutils import escape as e
+
+    number = f"SP-{p['id']:06d}"
+    received = str(p["received_at"]).replace("T", " ")[:16]
+    d = _Pdf(business, "Payment receipt", number, received)
+    c = d.c
+    refunded = sum(float(r["amount"]) for r in refunds)
+    net = float(p["amount"]) - refunded
+
+    # amount box with stamp
+    stamp = "REFUNDED" if net <= 0.004 else ("PARTLY REFUNDED" if refunded else "PAID")
+    stamp_col = "#c0362c" if refunded else "#15803d"
+    box = Table([[Paragraph("AMOUNT RECEIVED", d.st["kl"]), Paragraph(f'<font color="{stamp_col}"><b>{stamp}</b></font>', d.st["r"])],
+                 [Paragraph(f'<font size="22"><b>Rs {amt(p["amount"])}</b></font>', d.st["p"]), ""]],
+                colWidths=[220, 120], rowHeights=[16, 34])
+    box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), c.HexColor("#e3f3f1")), ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                             ("RIGHTPADDING", (0, 0), (-1, -1), 12), ("TOPPADDING", (0, 0), (-1, 0), 8),
+                             ("LINEBEFORE", (0, 0), (0, -1), 3, c.HexColor(d.ACC)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    d.flow.append(box)
+    d.spacer(10)
+
+    d.heading("Billed to")
+    d.text(f"<b>{e(p['customer'])}</b><br/>{e(p.get('phone') or '')}")
+    d.heading("Details")
+    rows = [["Service", "Therapist", "Appointment"],
+            [p["service"], p["therapist"], str(p["start_at"]).replace("T", " ")[:16]]]
+    d.table(rows, [140, 100, 100], numeric=1)
+    d.spacer(8)
+    pay = [["Payment method", METHODS.get(p["method"], p["method"])],
+           ["Reference", p.get("reference") or "-"], ["Received on", received]]
+    if p.get("note"):
+        pay.append(["Note", p["note"]])
+    t = Table([[Paragraph(f"<b>{e(k)}</b>", d.st["m"]), Paragraph(e(str(v)), d.st["p"])] for k, v in pay], colWidths=[110, 230])
+    t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), .25, c.HexColor(d.LINE)), ("TOPPADDING", (0, 0), (-1, -1), 4),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+    d.flow.append(t)
+    if refunds:
+        d.heading("Refunds")
+        rr = [["Date", "Reason", "Amount (Rs)"]]
+        rr += [[str(r["refunded_at"]).replace("T", " ")[:16], r.get("reason") or "-", amt(r["amount"])] for r in refunds]
+        rr.append(["Net received", "", amt(net)])
+        d.table(rr, [100, 160, 80], total=True)
+    d.spacer(18)
+    d.text(f"<b>Thank you for visiting {e(business)}.</b>")
+    d.text("This is a computer-generated receipt and does not need a signature.", muted=True)
+
+    # A5: narrower band and margins
+    from reportlab.platypus import SimpleDocTemplate
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A5, leftMargin=36, rightMargin=36, topMargin=100, bottomMargin=54,
+                            title=f"{business} - Receipt {number}", author=business, creator="StudioDesk")
+    doc.build(d.flow, onFirstPage=d._page, onLaterPages=d._page, canvasmaker=_numbered_canvas(d.MUT))
+    return buf.getvalue()
+
+
+def settlement_pdf(r: dict, lines: list, business: str) -> bytes:
+    """The day's cash-up: totals by payment method, refunds, net, and every payment."""
+    day = dt.date.fromisoformat(str(r["date"])[:10])
+    d = _Pdf(business, "Daily settlement", day.strftime("%d %b %Y"))
+    d.kpis([("Collected", f"Rs {amt(r['gross'])}"), ("Refunds", f"Rs {amt(r['refunds'])}"), ("Net", f"Rs {amt(r['net'])}"),
+            ("Payments", str(sum(m["count"] for m in r["methods"])))])
+    d.heading("By payment method")
+    rows = [["Method", "Payments", "Collected (Rs)", "Refunds (Rs)", "Net (Rs)"]]
+    rows += [[METHODS.get(m["method"], m["method"]), m["count"], amt(m["gross"]), amt(m["refunds"]), amt(m["gross"] - m["refunds"])]
+             for m in r["methods"]] or [["-", "-", "-", "-", "-"]]
+    rows.append(["Total", sum(m["count"] for m in r["methods"]), amt(r["gross"]), amt(r["refunds"]), amt(r["net"])])
+    d.table(rows, [143, 80, 100, 100, 100], numeric=4, total=True)
+    d.heading("Payments")
+    pr = [["Time", "Receipt", "Customer", "Service", "Method", "Amount (Rs)"]]
+    pr += [[str(x["received_at"]).replace("T", " ")[11:16], f"SP-{x['id']:06d}", x["customer"], x["service"],
+            METHODS.get(x["method"], x["method"]), amt(x["amount"])] for x in lines] or [["-"] * 6]
+    d.table(pr, [45, 70, 130, 130, 68, 80])
+    d.spacer(30)
+    d.text("Counted by: ____________________        Checked by: ____________________", muted=True)
     return d.build()
 
 

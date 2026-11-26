@@ -984,6 +984,17 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"date": day, "methods": sorted(by_method.values(), key=lambda x: x["method"]),
                 "gross": round(gross,2), "refunds": round(refunds,2), "net": round(gross-refunds,2)}
 
+    @app.get("/api/payments/settlement/pdf")
+    def payment_settlement_pdf(received_on: dt.date | None = None, u=Depends(member)):
+        r = payment_settlement(received_on, u)
+        lines = db.all("""SELECT p.id, p.received_at, p.amount, p.method, c.name AS customer, s.name AS service
+                          FROM payments p JOIN customers c ON c.id=p.customer_id
+                          JOIN appointments a ON a.id=p.appointment_id JOIN services s ON s.id=a.service_id
+                          WHERE p.spa_id=%s AND p.received_at::date=%s ORDER BY p.received_at""", (u["spa"], r["date"]))
+        name = payroll.file_name(u["spa_name"], "Settlement", str(r["date"])[:10])
+        return Response(payroll.settlement_pdf(r, lines, u["spa_name"]), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+
     @app.get("/api/payments/{pid}/receipt")
     def payment_receipt(pid: int, u=Depends(member)):
         p = db.one("""SELECT p.*, c.name AS customer, c.phone, a.start_at, s.name AS service,
@@ -994,25 +1005,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                       WHERE p.id=%s AND p.spa_id=%s""", (pid, u["spa"]))
         if not p:
             raise HTTPException(404, "Receipt not found")
-        from xml.sax.saxutils import escape
-        from reportlab.lib.pagesizes import A5
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
-        buf = io.BytesIO()
-        styles = getSampleStyleSheet()
-        doc = SimpleDocTemplate(buf, pagesize=A5, title=f"Receipt SP-{pid:06d}")
-        story = [Paragraph(escape(p["spa_name"]), styles["Title"]), Paragraph("Payment receipt", styles["Heading2"]),
-                 Paragraph(f"Receipt: <b>SP-{pid:06d}</b>", styles["Normal"]),
-                 Paragraph(f"Customer: {escape(p['customer'])} ({escape(p['phone'])})", styles["Normal"]),
-                 Paragraph(f"Appointment: {escape(str(p['start_at']).replace('T',' ')[:16])} · {escape(p['service'])}", styles["Normal"]),
-                 Paragraph(f"Therapist: {escape(p['therapist'])}", styles["Normal"]), Spacer(1,10),
-                 Table([["Amount received", f"Rs {float(p['amount']):,.2f}"],
-                        ["Payment method", p["method"].replace("_"," ").title()],
-                        ["Reference", escape(p["reference"] or "—")],
-                        ["Note", escape(p["note"] or "—")]], colWidths=[100,180])]
-        doc.build(story)
-        return Response(buf.getvalue(), media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="receipt_SP-{pid:06d}.pdf"'})
+        refunds = db.all("SELECT amount, reason, refunded_at FROM payment_refunds WHERE payment_id=%s AND spa_id=%s ORDER BY refunded_at",
+                         (pid, u["spa"]))
+        name = payroll.file_name(p["spa_name"], "Receipt", f"SP-{pid:06d}")
+        return Response(payroll.receipt_pdf(p, refunds, p["spa_name"]), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
     def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
@@ -1410,7 +1407,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         t = db.one("SELECT * FROM therapists WHERE id=%s AND spa_id=%s", (tid, spa))
         if not t:
             raise HTTPException(404, "Therapist not found")
-        return payroll.compute_payslip(db, t, month)
+        p = payroll.compute_payslip(db, t, month)
+        p["therapist_profile"] = {k: t.get(k) for k in ("phone", "bank_name", "bank_account_name", "bank_account_number",
+                                                          "bank_ifsc", "upi_id")}
+        return p
 
     # ---- extra incentives (admin) -----------------------------------------
     @app.get("/api/bonuses")
