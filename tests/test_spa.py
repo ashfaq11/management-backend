@@ -703,6 +703,10 @@ class TestPlanUpdates(Base):
 
 
 class TestPriorityOneOperations(Base):
+    def booking(self, therapist_id, service_id, customer_id, start):
+        return self.post("/api/appointments", therapist_id=therapist_id, service_id=service_id,
+                         customer_id=customer_id, start_at=start)
+
     def test_customer_page_is_paginated_and_searchable(self):
         self.post("/api/customers", name="Aarav", phone="9991000001")
         self.post("/api/customers", name="Bhavna", phone="9991000002")
@@ -767,9 +771,13 @@ class TestPriorityOneOperations(Base):
                             headers=self.h)
         self.assertEqual(first.status_code, 201, first.text)
         self.assertEqual(first.json()["balance_due"], 1400.0)
+        partial_row = self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual(partial_row["payment_status"],"partial")
         second = self.c.post(f"/api/appointments/{a}/payments",
                              json={"amount": 1400, "method": "cash"}, headers=self.h)
         self.assertEqual(second.status_code, 201, second.text)
+        paid_row = self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual(paid_row["payment_status"],"paid")
         over = self.c.post(f"/api/appointments/{a}/payments",
                            json={"amount": 1, "method": "cash"}, headers=self.h)
         self.assertEqual(over.status_code, 409)
@@ -787,6 +795,9 @@ class TestPriorityOneOperations(Base):
         rows = self.c.get("/api/appointments?date=2026-11-20", headers=self.h).json()
         self.assertEqual(rows[0]["paid_amount"], 1900.0)
         self.assertEqual(rows[0]["balance_due"], 100.0)
+        self.assertEqual(rows[0]["payment_status"],"partial")
+        settlement = self.c.get("/api/payments/settlement?received_on=2026-11-20",headers=self.h).json()
+        self.assertEqual((settlement["gross"],settlement["refunds"],settlement["net"]),(2000.0,100.0,1900.0))
         history = self.c.get(f"/api/customers/{c}", headers=self.h).json()["payments"]
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0]["method"], "cash")
@@ -799,6 +810,16 @@ class TestPriorityOneOperations(Base):
         done = self.c.patch(f"/api/appointments/{a}/status",
                             json={"status": "completed", "plan_type": "rupees"}, headers=self.h)
         self.assertEqual(done.status_code, 200, done.text)
+        status_row=self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual((status_row["payment_status"],status_row["plan_unit"]),("prepaid","rupees"))
+        reopened=self.c.patch(f"/api/appointments/{a}/status",json={"status":"booked"},headers=self.h)
+        self.assertEqual(reopened.status_code,200,reopened.text)
+        status_row=self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual((status_row["payment_status"],status_row["balance_due"]),("pending",2000.0))
+        redone=self.c.patch(f"/api/appointments/{a}/status",json={"status":"completed","plan_type":"rupees"},headers=self.h)
+        self.assertEqual(redone.status_code,200,redone.text)
+        status_row=self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual((status_row["payment_status"],status_row["plan_unit"]),("prepaid","rupees"))
         payment = self.c.post(f"/api/appointments/{a}/payments",
                               json={"amount": 1, "method": "cash"}, headers=self.h)
         self.assertEqual(payment.status_code, 409)
@@ -843,3 +864,23 @@ class TestPriorityOneOperations(Base):
         self.assertEqual(response.status_code,201,response.text)
         detail=self.c.get(f"/api/customers/{response.json()['id']}",headers=self.h).json()
         self.assertIsNone(detail["preferred_payment_method"])
+
+
+    def test_no_payment_is_pending_and_cancelled_cannot_be_paid(self):
+        t,s,c=self.seed()
+        a=self.booking(t,s,c,"2026-11-20T10:00").json()["id"]
+        row=self.c.get("/api/appointments?date=2026-11-20",headers=self.h).json()[0]
+        self.assertEqual((row["payment_status"],row["balance_due"]),("pending",2000.0))
+        self.c.patch(f"/api/appointments/{a}/status",json={"status":"cancelled"},headers=self.h)
+        response=self.c.post(f"/api/appointments/{a}/payments",json={"amount":100,"method":"cash"},headers=self.h)
+        self.assertEqual(response.status_code,409)
+
+    def test_member_can_access_daily_settlement_summary(self):
+        t,s,c=self.seed()
+        a=self.booking(t,s,c,"2026-11-20T10:00").json()["id"]
+        self.c.post(f"/api/appointments/{a}/payments",json={"amount":300,"method":"upi"},headers=self.h)
+        self.post("/api/users",username="summaryuser",password="summary123",role="staff")
+        token=self.c.post("/api/auth/login",json={"username":"summaryuser","password":"summary123"}).json()["token"]
+        response=self.c.get("/api/payments/settlement?received_on=2026-11-20",headers={"Authorization":f"Bearer {token}"})
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(response.json()["gross"],300.0)
