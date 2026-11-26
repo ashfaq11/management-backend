@@ -87,6 +87,7 @@ class AppointmentIn(BaseModel):
 
 class StatusIn(BaseModel):
     status: Status
+    plan_type: Optional[Literal["hours", "rupees"]] = None
 
 
 class CustomerPlanIn(BaseModel):
@@ -380,12 +381,17 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Customer not found")
         c["appointments"] = db.all(
             """SELECT a.*, s.name AS service, t.name AS therapist,
-                      p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit
+                      p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit,
+                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at
                FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
-               LEFT JOIN plan_redemptions r ON r.appointment_id=a.id AND r.reversed_at IS NULL
+               LEFT JOIN LATERAL (
+                   SELECT * FROM plan_redemptions x
+                   WHERE x.appointment_id=a.id AND x.spa_id=a.spa_id
+                   ORDER BY x.created_at DESC, x.id DESC LIMIT 1
+               ) r ON TRUE
                LEFT JOIN customer_plans p ON p.id=r.plan_id
-               WHERE a.customer_id=%s ORDER BY a.start_at DESC""", (cid,))
+               WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
         c["plans"] = db.all(
             """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
                                       WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
@@ -534,31 +540,27 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
                 deduction = None
-                if b.status == "completed":
-                    # Prefer the oldest unexpired plan that can cover the whole service.
-                    # Do not partially consume a package; the customer pays normally instead.
-                    hours_needed = round(a["duration_min"] / 60.0, 2)
-                    rupees_needed = round(float(a["price"]), 2)
-                    candidates = t.all(
+                if b.status == "completed" and b.plan_type:
+                    # Staff explicitly chooses hours or rupees; never auto-select a balance type.
+                    amount = (round(a["duration_min"] / 60.0, 2)
+                              if b.plan_type == "hours" else round(float(a["price"]), 2))
+                    plan = t.one(
                         """SELECT * FROM customer_plans
-                           WHERE customer_id=%s AND spa_id=%s AND balance >=
-                             CASE WHEN plan_type='hours' THEN %s ELSE %s END
+                           WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
-                           ORDER BY created_at, id FOR UPDATE""",
-                        (a["customer_id"], u["spa"], hours_needed, rupees_needed))
-                    plan = next((p for p in candidates
-                                 if (p["plan_type"] == "hours" and float(p["balance"]) >= hours_needed)
-                                 or (p["plan_type"] == "rupees" and float(p["balance"]) >= rupees_needed)), None)
-                    if plan:
-                        amount = hours_needed if plan["plan_type"] == "hours" else rupees_needed
-                        t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
-                        t.insert(
-                            """INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit)
-                               VALUES(%s,%s,%s,%s,%s)""",
-                            (plan["id"], aid, u["spa"], amount, plan["plan_type"]))
-                        remaining = round(float(plan["balance"]) - amount, 2)
-                        deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
-                                     "amount": amount, "unit": plan["plan_type"], "remaining_balance": remaining}
+                           ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
+                        (a["customer_id"], u["spa"], b.plan_type, amount))
+                    if not plan:
+                        unit_label = "hours" if b.plan_type == "hours" else "rupees"
+                        raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
+                    t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
+                    t.insert(
+                        """INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit)
+                           VALUES(%s,%s,%s,%s,%s)""",
+                        (plan["id"], aid, u["spa"], amount, b.plan_type))
+                    remaining = round(float(plan["balance"]) - amount, 2)
+                    deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
+                                 "amount": amount, "unit": b.plan_type, "remaining_balance": remaining}
                 elif a["status"] == "completed":
                     # Re-open/cancel a completed booking: refund its active package deduction.
                     redemption = t.one(
