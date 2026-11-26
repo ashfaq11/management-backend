@@ -700,3 +700,111 @@ class TestPlanUpdates(Base):
         self.assertEqual((rep["sold_hours"], rep["topped_up_hours"], rep["topups"]), (8.0, 3.0, 1))
         self.assertEqual(self.post(f"/api/customers/{c}/plans/999/topup", amount=1).status_code, 404)
         self.assertEqual(self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=0).status_code, 422)
+
+
+class TestPriorityOneOperations(Base):
+    def test_customer_page_is_paginated_and_searchable(self):
+        self.post("/api/customers", name="Aarav", phone="9991000001")
+        self.post("/api/customers", name="Bhavna", phone="9991000002")
+        self.post("/api/customers", name="Charan", phone="9991000003")
+        page = self.c.get("/api/customers/page?page=2&page_size=2", headers=self.h)
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertEqual((page.json()["total"], page.json()["page"], len(page.json()["items"])), (3, 2, 1))
+        search = self.c.get("/api/customers/page?q=bhav", headers=self.h).json()
+        self.assertEqual([x["name"] for x in search["items"]], ["Bhavna"])
+
+    def test_customer_optional_preferred_payment_method(self):
+        created = self.post("/api/customers", name="Meera", phone="9991000004",
+                            preferred_payment_method="upi")
+        self.assertEqual(created.status_code, 201, created.text)
+        cid = created.json()["id"]
+        detail = self.c.get(f"/api/customers/{cid}", headers=self.h).json()
+        self.assertEqual(detail["preferred_payment_method"], "upi")
+        invalid = self.post("/api/customers", name="Wrong", phone="9991000005",
+                            preferred_payment_method="crypto")
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_appointment_calendar_date_range(self):
+        t, s, c = self.seed()
+        self.booking(t, s, c, "2026-11-10T10:00")
+        self.booking(t, s, c, "2026-11-12T10:00")
+        self.booking(t, s, c, "2026-11-14T10:00")
+        r = self.c.get("/api/appointments?from=2026-11-11&to=2026-11-13", headers=self.h)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([x["start_at"][:10] for x in r.json()], ["2026-11-12"])
+
+    def test_dashboard_returns_daily_operational_metrics(self):
+        t, s, c = self.seed()
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-20T10:00").json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        r = self.c.get("/api/dashboard", headers=self.h)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn("today", body)
+        self.assertIn("collections", body)
+        self.assertIn("therapists_on_shift", body)
+        self.assertIn("upcoming", body)
+
+    def test_partial_payments_and_refund_respect_outstanding_balance(self):
+        t, s, c = self.seed()
+        a = self.booking(t, s, c, "2026-11-20T10:00").json()["id"]
+        first = self.c.post(f"/api/appointments/{a}/payments",
+                            json={"amount": 600, "method": "upi", "reference": "UPI-123"},
+                            headers=self.h)
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(first.json()["balance_due"], 1400.0)
+        second = self.c.post(f"/api/appointments/{a}/payments",
+                             json={"amount": 1400, "method": "cash"}, headers=self.h)
+        self.assertEqual(second.status_code, 201, second.text)
+        over = self.c.post(f"/api/appointments/{a}/payments",
+                           json={"amount": 1, "method": "cash"}, headers=self.h)
+        self.assertEqual(over.status_code, 409)
+
+        refund = self.c.post(f"/api/payments/{first.json()['id']}/refunds",
+                             json={"amount": 100, "reason": "Customer overpayment"}, headers=self.h)
+        self.assertEqual(refund.status_code, 201, refund.text)
+        over_refund = self.c.post(f"/api/payments/{first.json()['id']}/refunds",
+                                  json={"amount": 501}, headers=self.h)
+        self.assertEqual(over_refund.status_code, 409)
+
+        rows = self.c.get("/api/appointments?date=2026-11-20", headers=self.h).json()
+        self.assertEqual(rows[0]["paid_amount"], 1900.0)
+        self.assertEqual(rows[0]["balance_due"], 100.0)
+        history = self.c.get(f"/api/customers/{c}", headers=self.h).json()["payments"]
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["method"], "cash")
+
+    def test_prepaid_redemption_prevents_double_cash_collection(self):
+        t, s, c = self.seed()
+        self.c.post(f"/api/customers/{c}/plans",
+                    json={"name": "Rupee wallet", "plan_type": "rupees", "amount": 3000}, headers=self.h)
+        a = self.booking(t, s, c, "2026-11-20T10:00").json()["id"]
+        done = self.c.patch(f"/api/appointments/{a}/status",
+                            json={"status": "completed", "plan_type": "rupees"}, headers=self.h)
+        self.assertEqual(done.status_code, 200, done.text)
+        payment = self.c.post(f"/api/appointments/{a}/payments",
+                              json={"amount": 1, "method": "cash"}, headers=self.h)
+        self.assertEqual(payment.status_code, 409)
+
+    def test_staff_can_collect_but_cannot_refund_or_view_settlement(self):
+        t, s, c = self.seed()
+        a = self.booking(t, s, c, "2026-11-20T10:00").json()["id"]
+        self.post("/api/users", username="cashier", password="cashier123", role="staff")
+        token = self.c.post("/api/auth/login", json={"username": "cashier", "password": "cashier123"}).json()["token"]
+        h = {"Authorization": f"Bearer {token}"}
+        payment = self.c.post(f"/api/appointments/{a}/payments",
+                              json={"amount": 100, "method": "cash"}, headers=h)
+        self.assertEqual(payment.status_code, 201, payment.text)
+        self.assertEqual(self.c.post(f"/api/payments/{payment.json()['id']}/refunds",
+                                     json={"amount": 10}, headers=h).status_code, 403)
+        self.assertEqual(self.c.get("/api/reports/payments", headers=h).status_code, 403)
+
+    def test_payment_receipt_is_available_to_spa_member(self):
+        t, s, c = self.seed()
+        a = self.booking(t, s, c, "2026-11-20T10:00").json()["id"]
+        payment = self.c.post(f"/api/appointments/{a}/payments",
+                              json={"amount": 500, "method": "card"}, headers=self.h).json()
+        receipt = self.c.get(f"/api/payments/{payment['id']}/receipt", headers=self.h)
+        self.assertEqual(receipt.status_code, 200)
+        self.assertEqual(receipt.headers["content-type"], "application/pdf")
