@@ -655,7 +655,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                               THEN 'prepaid'
                               WHEN COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
                               WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
-                              ELSE 'unpaid' END AS payment_status
+                              ELSE 'pending' END AS payment_status,
+                         (SELECT r.unit FROM plan_redemptions r WHERE r.appointment_id=a.id AND r.spa_id=a.spa_id
+                           AND r.reversed_at IS NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS plan_unit
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
                  JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                  LEFT JOIN LATERAL (
