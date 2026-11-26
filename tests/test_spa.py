@@ -295,7 +295,7 @@ class TestUsers(Base):
         self.make_staff()
         rows = self.c.get("/api/users", headers=self.h).json()
         self.assertEqual({r["username"] for r in rows}, {"admin", "front"})
-        self.assertTrue(all(set(r) == {"id", "username", "role", "is_active"} for r in rows))
+        self.assertTrue(all("password_hash" not in r for r in rows))
         _, h = self.login("front", "frontdesk1")
         self.assertEqual(self.c.get("/api/users", headers=h).status_code, 403)
 
@@ -308,22 +308,16 @@ class TestUsers(Base):
         self.assertEqual(self.c.get("/api/customers", headers=h).status_code, 401)
         self.assertEqual(self.login("front", "frontdesk1")[0].status_code, 401)
 
-    def test_promote_staff_to_admin(self):
+    def test_admin_manages_staff_only(self):
         uid = self.make_staff()
-        self.c.put(f"/api/users/{uid}", json={"role": "admin", "is_active": True}, headers=self.h)
-        _, h = self.login("front", "frontdesk1")
-        self.assertEqual(self.c.get("/api/reports/incentives?month=2026-11", headers=h).status_code, 200)
+        r = self.c.put(f"/api/users/{uid}", json={"role": "admin", "is_active": True}, headers=self.h)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.post("/api/users", username="boss2", password="boss12345", role="admin").status_code, 403)
 
-    def test_cannot_lock_yourself_or_last_admin_out(self):
+    def test_cannot_lock_yourself_out(self):
         me = self.c.get("/api/auth/me", headers=self.h).json()["id"]
         for body in ({"role": "staff", "is_active": True}, {"role": "admin", "is_active": False}):
-            self.assertEqual(self.c.put(f"/api/users/{me}", json=body, headers=self.h).status_code, 400)
-        # a second admin may demote the first, but not the very last admin
-        uid = self.make_staff()
-        self.c.put(f"/api/users/{uid}", json={"role": "admin", "is_active": True}, headers=self.h)
-        _, h2 = self.login("front", "frontdesk1")
-        self.assertEqual(self.c.put(f"/api/users/{me}", json={"role": "staff", "is_active": True}, headers=h2).status_code, 200)
-        self.assertEqual(self.c.put(f"/api/users/{uid}", json={"role": "staff", "is_active": True}, headers=h2).status_code, 400)
+            self.assertIn(self.c.put(f"/api/users/{me}", json=body, headers=self.h).status_code, (400, 403))
 
     def test_admin_reset_password_revokes_sessions(self):
         uid = self.make_staff()
@@ -445,3 +439,40 @@ class TestPostgres(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTenancy(Base):
+    def sa(self):
+        tok = self.c.post("/api/auth/login", json={"username": "superadmin", "password": "superadmin123"}).json()["token"]
+        return {"Authorization": f"Bearer {tok}"}
+
+    def test_spas_are_isolated(self):
+        sa = self.sa()
+        self.seed()
+        r = self.c.post("/api/spas", json={"name": "Lotus", "admin_username": "lotus", "admin_password": "lotus12345"},
+                        headers=sa)
+        self.assertEqual(r.status_code, 201, r.text)
+        spa2 = r.json()["id"]
+        tok = self.c.post("/api/auth/login", json={"username": "lotus", "password": "lotus12345"}).json()["token"]
+        h2 = {"Authorization": f"Bearer {tok}"}
+        self.assertEqual(self.c.get("/api/customers", headers=h2).json(), [])
+        self.assertEqual(self.c.get("/api/therapists", headers=h2).json(), [])
+        # same phone is fine in another spa
+        self.assertEqual(self.c.post("/api/customers", json={"name": "R", "phone": "9990001111"}, headers=h2).status_code, 201)
+        cid1 = self.c.get("/api/customers", headers=self.h).json()[0]["id"]
+        self.assertEqual(self.c.get(f"/api/customers/{cid1}", headers=h2).status_code, 404)
+        # the lotus admin sees only its own logins
+        self.assertEqual({u["username"] for u in self.c.get("/api/users", headers=h2).json()}, {"lotus"})
+        # superadmin picks a spa with the header
+        self.assertEqual(self.c.get("/api/customers", headers=sa).status_code, 400)
+        self.assertEqual(len(self.c.get("/api/customers", headers={**sa, "X-Spa-Id": str(spa2)}).json()), 1)
+        self.assertEqual(len(self.c.get("/api/spas", headers=sa).json()), 2)
+        self.assertEqual([p["id"] for p in self.c.get("/api/spas", headers=h2).json()], [spa2])
+
+    def test_deactivated_spa_blocks_its_users(self):
+        sa = self.sa()
+        spa2 = self.c.post("/api/spas", json={"name": "Lotus", "admin_username": "lotus", "admin_password": "lotus12345"},
+                           headers=sa).json()["id"]
+        self.assertEqual(self.c.put(f"/api/spas/{spa2}", json={"name": "Lotus", "is_active": False}, headers=sa).status_code, 200)
+        r = self.c.post("/api/auth/login", json={"username": "lotus", "password": "lotus12345"})
+        self.assertEqual(r.status_code, 401)

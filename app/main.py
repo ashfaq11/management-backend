@@ -83,6 +83,20 @@ class UserUpdate(BaseModel):
     is_active: bool
 
 
+class SpaIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class SpaCreate(SpaIn):
+    """A new spa and its first admin, created together."""
+    admin_username: str = Field(min_length=3)
+    admin_password: str = Field(min_length=8)
+
+
+class SpaUpdate(SpaIn):
+    is_active: bool = True
+
+
 class PasswordReset(BaseModel):
     password: str = Field(min_length=8)
 
@@ -95,19 +109,29 @@ class PasswordChange(BaseModel):
 class UserIn(BaseModel):
     username: str = Field(min_length=3)
     password: str = Field(min_length=8)
-    role: Literal["admin", "staff"] = "staff"
+    role: Literal["superadmin", "admin", "staff"] = "staff"
+    spa_id: Optional[int] = None  # superadmin only: which spa an admin/staff login belongs to
 
 
 def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastAPI:
     db = Database(dsn or default_dsn(), schema or os.environ.get("SPA_PG_SCHEMA", "spa"),
                   tz=os.environ.get("SPA_TZ", "Asia/Kolkata"),
                   pool_max=int(os.environ.get("PG_POOL_MAX", "10")))
-    business = os.environ.get("SPA_NAME", "Serenity Spa")
+    # The first spa (created by migration 004) takes SPA_NAME until a superadmin renames it.
+    db.run("UPDATE spas SET name=%s WHERE id=(SELECT min(id) FROM spas) AND name='My Spa'",
+           (os.environ.get("SPA_NAME", "Serenity Spa"),))
     # first start only; atomic, so several processes starting together create exactly one admin
-    db.run("""INSERT INTO users(username,password_hash,role)
-              SELECT %s,%s,'admin' WHERE NOT EXISTS (SELECT 1 FROM users)""",
+    db.run("""INSERT INTO users(username,password_hash,role,spa_id)
+              SELECT %s,%s,'admin',(SELECT min(id) FROM spas) WHERE NOT EXISTS (SELECT 1 FROM users)""",
            (os.environ.get("ADMIN_USER", "admin"),
             security.hash_password(os.environ.get("ADMIN_PASSWORD", "admin12345"))))
+    # and one superadmin, who creates spas and their admins
+    db.run("""INSERT INTO users(username,password_hash,role,spa_id)
+              SELECT %s,%s,'superadmin',NULL WHERE NOT EXISTS (SELECT 1 FROM users WHERE role='superadmin')
+              AND NOT EXISTS (SELECT 1 FROM users WHERE lower(username)=lower(%s))""",
+           (os.environ.get("SUPERADMIN_USER", "superadmin"),
+            security.hash_password(os.environ.get("SUPERADMIN_PASSWORD", "superadmin123")),
+            os.environ.get("SUPERADMIN_USER", "superadmin")))
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -118,34 +142,59 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     app.state.db = db
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],
-                       allow_headers=["Authorization", "Content-Type"],
+                       allow_headers=["Authorization", "Content-Type", "X-Spa-Id"],
                        max_age=3600)  # browsers reuse the preflight answer, so a cross-origin UI pays it once an hour
 
     # ---- auth ---------------------------------------------------------
-    def current_user(authorization: str = Header(default="")):
+    def current_user(authorization: str = Header(default=""), x_spa_id: Optional[int] = Header(default=None)):
+        """The caller, with `spa` = the spa they are working in: their own for admin/staff; for a superadmin the
+        one chosen with the X-Spa-Id header (None when none is chosen). A deactivated spa signs its users out."""
         tok = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-        u = db.one("""SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id
-                      WHERE s.token_hash=%s AND s.expires_at>now() AND u.is_active""",
+        u = db.one("""SELECT u.id,u.username,u.role,u.spa_id,p.name AS spa_name FROM sessions s
+                      JOIN users u ON u.id=s.user_id LEFT JOIN spas p ON p.id=u.spa_id
+                      WHERE s.token_hash=%s AND s.expires_at>now() AND u.is_active
+                        AND (u.spa_id IS NULL OR p.is_active)""",
                    (security.fingerprint(tok),)) if tok else None
         if not u:
             raise HTTPException(401, "Not authenticated")
+        u["spa"] = u["spa_id"]
+        if u["role"] == "superadmin" and x_spa_id is not None:
+            p = db.one("SELECT id,name FROM spas WHERE id=%s", (x_spa_id,))
+            if not p:
+                raise HTTPException(404, "Spa not found")
+            u["spa"], u["spa_name"] = p["id"], p["name"]
         return u
 
-    def admin(u=Depends(current_user)):
-        if u["role"] != "admin":
+    def member(u=Depends(current_user)):
+        """Anyone working inside one spa (a superadmin must pick one first)."""
+        if u["spa"] is None:
+            raise HTTPException(400, "Choose a spa first")
+        return u
+
+    def admin(u=Depends(member)):
+        if u["role"] not in ("admin", "superadmin"):
             raise HTTPException(403, "Admin only")
+        return u
+
+    def superadmin(u=Depends(current_user)):
+        if u["role"] != "superadmin":
+            raise HTTPException(403, "Superadmin only")
         return u
 
     @app.post("/api/auth/login")
     def login(b: Login):
-        u = db.one("SELECT * FROM users WHERE lower(username)=lower(%s) AND is_active", (b.username,))
+        u = db.one("""SELECT u.* FROM users u LEFT JOIN spas p ON p.id=u.spa_id
+                      WHERE lower(u.username)=lower(%s) AND u.is_active AND (u.spa_id IS NULL OR p.is_active)""",
+                   (b.username,))
         if not u or not security.verify_password(b.password, u["password_hash"]):
             raise HTTPException(401, "Invalid username or password")
         tok = security.new_token()
         db.run("DELETE FROM sessions WHERE expires_at<now()")  # housekeeping
         db.run("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(%s,%s,now()+make_interval(hours=>%s))",
                (security.fingerprint(tok), u["id"], SESSION_HOURS))
-        return {"token": tok, "username": u["username"], "role": u["role"]}
+        spa = db.one("SELECT name FROM spas WHERE id=%s", (u["spa_id"],)) if u["spa_id"] else None
+        return {"token": tok, "username": u["username"], "role": u["role"], "spa_id": u["spa_id"],
+                "spa_name": spa["name"] if spa else None}
 
     @app.post("/api/auth/logout", status_code=204)
     def logout(authorization: str = Header(default=""), u=Depends(current_user)):
@@ -166,67 +215,136 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             t.run("DELETE FROM sessions WHERE user_id=%s AND token_hash<>%s",
                   (u["id"], security.fingerprint(authorization[7:])))
 
-    # ---- users (admin) --------------------------------------------------
+    # ---- spas (superadmin) ------------------------------------------------
+    @app.get("/api/spas")
+    def spas(u=Depends(current_user)):
+        """Superadmin: every spa with its people and this month's revenue. Others: just their own spa."""
+        sql = """SELECT p.id, p.name, p.is_active, p.created_at,
+                        (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='admin' AND x.is_active) AS admins,
+                        (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='staff' AND x.is_active) AS staff,
+                        (SELECT COUNT(*) FROM customers c WHERE c.spa_id=p.id) AS customers,
+                        (SELECT COALESCE(SUM(a.price),0) FROM appointments a WHERE a.spa_id=p.id AND a.status='completed'
+                           AND a.start_at >= date_trunc('month', localtimestamp)) AS revenue_this_month
+                 FROM spas p"""
+        if u["role"] != "superadmin":
+            return db.all(sql + " WHERE p.id=%s", (u["spa_id"],))
+        return db.all(sql + " ORDER BY lower(p.name)")
+
+    @app.post("/api/spas", status_code=201)
+    def add_spa(b: SpaCreate, _=Depends(superadmin)):
+        with db.tx() as t:
+            try:
+                sid = t.insert("INSERT INTO spas(name) VALUES(%s)", (b.name.strip(),))
+            except pgerr.UniqueViolation:
+                raise HTTPException(409, "A spa with this name already exists")
+            try:
+                uid = t.insert("INSERT INTO users(username,password_hash,role,spa_id) VALUES(%s,%s,'admin',%s)",
+                               (b.admin_username.strip(), security.hash_password(b.admin_password), sid))
+            except pgerr.UniqueViolation:
+                raise HTTPException(409, "Username taken")
+        return {"id": sid, "admin_id": uid}
+
+    @app.put("/api/spas/{sid}")
+    def edit_spa(sid: int, b: SpaUpdate, _=Depends(superadmin)):
+        with db.tx() as t:
+            try:
+                if not t.run("UPDATE spas SET name=%s, is_active=%s WHERE id=%s", (b.name.strip(), b.is_active, sid)):
+                    raise HTTPException(404, "Spa not found")
+            except pgerr.UniqueViolation:
+                raise HTTPException(409, "A spa with this name already exists")
+            if not b.is_active:
+                t.run("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE spa_id=%s)", (sid,))
+        return {"id": sid}
+
+    # ---- users: superadmin manages everyone; an admin manages the staff of their own spa ----
+    def user_in_scope(t, me, uid, lock=False):
+        row = t.one("SELECT id,role,spa_id,is_active FROM users WHERE id=%s" + (" FOR UPDATE" if lock else ""), (uid,))
+        # an admin sees only their own spa's logins, and changes only staff (and themselves for passwords)
+        if not row or (me["role"] != "superadmin" and row["spa_id"] != me["spa_id"]):
+            raise HTTPException(404, "User not found")
+        return row
+
     @app.get("/api/users")
-    def users(_=Depends(admin)):
-        return db.all("SELECT id,username,role,is_active FROM users ORDER BY lower(username)")
+    def users(me=Depends(current_user)):
+        if me["role"] == "staff":
+            raise HTTPException(403, "Admin only")
+        sql = """SELECT u.id,u.username,u.role,u.is_active,u.spa_id,p.name AS spa FROM users u
+                 LEFT JOIN spas p ON p.id=u.spa_id"""
+        if me["role"] == "superadmin":
+            return db.all(sql + " ORDER BY p.name NULLS FIRST, lower(u.username)")
+        return db.all(sql + " WHERE u.spa_id=%s ORDER BY lower(u.username)", (me["spa_id"],))
 
     @app.post("/api/users", status_code=201)
-    def add_user(b: UserIn, _=Depends(admin)):
+    def add_user(b: UserIn, me=Depends(current_user)):
+        if me["role"] == "staff":
+            raise HTTPException(403, "Admin only")
+        if me["role"] == "admin":
+            if b.role != "staff":
+                raise HTTPException(403, "An admin can create staff logins only; ask the superadmin for an admin")
+            spa = me["spa_id"]
+        else:
+            spa = None if b.role == "superadmin" else (b.spa_id or me["spa"])
+            if b.role != "superadmin" and (not spa or not db.one("SELECT 1 FROM spas WHERE id=%s", (spa,))):
+                raise HTTPException(422, "Choose the spa for this login")
         try:
-            return {"id": db.insert("INSERT INTO users(username,password_hash,role) VALUES(%s,%s,%s)",
-                                    (b.username.strip(), security.hash_password(b.password), b.role))}
+            return {"id": db.insert("INSERT INTO users(username,password_hash,role,spa_id) VALUES(%s,%s,%s,%s)",
+                                    (b.username.strip(), security.hash_password(b.password), b.role, spa))}
         except pgerr.UniqueViolation:
             raise HTTPException(409, "Username taken")
 
     @app.put("/api/users/{uid}")
-    def edit_user(uid: int, b: UserUpdate, me=Depends(admin)):
+    def edit_user(uid: int, b: UserUpdate, me=Depends(current_user)):
+        if me["role"] == "staff":
+            raise HTTPException(403, "Admin only")
         with db.tx() as t:
-            # lock every active admin row so two admins cannot demote each other at the same moment
-            admins = {r["id"] for r in t.all("SELECT id FROM users WHERE role='admin' AND is_active ORDER BY id FOR UPDATE")}
-            if not t.one("SELECT 1 FROM users WHERE id=%s FOR UPDATE", (uid,)):
-                raise HTTPException(404, "User not found")
-            if uid == me["id"] and (not b.is_active or b.role != "admin"):
+            row = user_in_scope(t, me, uid, lock=True)
+            if uid == me["id"]:
                 raise HTTPException(400, "You cannot deactivate or demote your own account")
-            if admins <= {uid} and (not b.is_active or b.role != "admin"):
-                raise HTTPException(400, "At least one active admin is required")
+            if row["role"] == "superadmin":
+                raise HTTPException(400, "A superadmin cannot be changed here")
+            if me["role"] == "admin" and (row["role"] != "staff" or b.role != "staff"):
+                raise HTTPException(403, "An admin can change staff logins only")
             t.run("UPDATE users SET role=%s, is_active=%s WHERE id=%s", (b.role, b.is_active, uid))
             if not b.is_active:
                 t.run("DELETE FROM sessions WHERE user_id=%s", (uid,))
         return {"id": uid, "role": b.role, "is_active": b.is_active}
 
     @app.post("/api/users/{uid}/password", status_code=204)
-    def reset_password(uid: int, b: PasswordReset, _=Depends(admin)):
+    def reset_password(uid: int, b: PasswordReset, me=Depends(current_user)):
+        if me["role"] == "staff":
+            raise HTTPException(403, "Admin only")
         with db.tx() as t:
-            if not t.run("UPDATE users SET password_hash=%s WHERE id=%s", (security.hash_password(b.password), uid)):
-                raise HTTPException(404, "User not found")
+            row = user_in_scope(t, me, uid)
+            if me["role"] == "admin" and row["role"] != "staff" and uid != me["id"]:
+                raise HTTPException(403, "An admin can reset staff passwords only")
+            t.run("UPDATE users SET password_hash=%s WHERE id=%s", (security.hash_password(b.password), uid))
             t.run("DELETE FROM sessions WHERE user_id=%s", (uid,))
 
     # ---- customers ----------------------------------------------------
     PHONE_TAKEN = "A customer with this phone already exists"
 
-    def insert_customer(t, b: CustomerIn) -> int:
+    def insert_customer(t, b: CustomerIn, spa: int) -> int:
         try:
-            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes)
-                               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes))
+            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,spa_id)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, spa))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
 
     @app.get("/api/customers")
-    def customers(q: str = "", _=Depends(current_user)):
+    def customers(q: str = "", u=Depends(member)):
         like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        return db.all("SELECT * FROM customers WHERE name ILIKE %s OR phone ILIKE %s ORDER BY lower(name) LIMIT 200",
-                      (like, like))
+        return db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)
+                         ORDER BY lower(name) LIMIT 200""", (u["spa"], like, like))
 
     @app.post("/api/customers", status_code=201)
-    def add_customer(b: CustomerIn, _=Depends(current_user)):
+    def add_customer(b: CustomerIn, u=Depends(member)):
         with db.tx() as t:
-            return {"id": insert_customer(t, b)}
+            return {"id": insert_customer(t, b, u["spa"])}
 
     @app.get("/api/customers/{cid}")
-    def customer(cid: int, _=Depends(current_user)):
-        c = db.one("SELECT * FROM customers WHERE id=%s", (cid,))
+    def customer(cid: int, u=Depends(member)):
+        c = db.one("SELECT * FROM customers WHERE id=%s AND spa_id=%s", (cid, u["spa"]))
         if not c:
             raise HTTPException(404, "Customer not found")
         c["appointments"] = db.all(
@@ -236,11 +354,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return c
 
     @app.put("/api/customers/{cid}")
-    def edit_customer(cid: int, b: CustomerIn, _=Depends(current_user)):
+    def edit_customer(cid: int, b: CustomerIn, u=Depends(member)):
         try:
             n = db.run("""UPDATE customers SET name=%s,phone=%s,email=%s,gender=%s,dob=%s,address=%s,notes=%s,
-                          updated_at=now() WHERE id=%s""",
-                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, cid))
+                          updated_at=now() WHERE id=%s AND spa_id=%s""",
+                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, cid, u["spa"]))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
         if not n:
@@ -249,40 +367,42 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     # ---- therapists & services (admin-managed) -------------------------
     @app.get("/api/therapists")
-    def therapists(_=Depends(current_user)):
-        return db.all("SELECT * FROM therapists ORDER BY lower(name)")
+    def therapists(u=Depends(member)):
+        return db.all("SELECT * FROM therapists WHERE spa_id=%s ORDER BY lower(name)", (u["spa"],))
 
     @app.post("/api/therapists", status_code=201)
-    def add_therapist(b: TherapistIn, _=Depends(admin)):
-        return {"id": db.insert("""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on)
-                                   VALUES(%s,%s,%s,%s,%s,%s)""",
-                                (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on))}
+    def add_therapist(b: TherapistIn, u=Depends(admin)):
+        return {"id": db.insert("""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on,spa_id)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                                (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on,
+                                 u["spa"]))}
 
     @app.put("/api/therapists/{tid}")
-    def edit_therapist(tid: int, b: TherapistIn, _=Depends(admin)):
+    def edit_therapist(tid: int, b: TherapistIn, u=Depends(admin)):
         if not db.run("""UPDATE therapists SET name=%s,phone=%s,fixed_salary=%s,incentive_percent=%s,is_active=%s,
-                         joined_on=%s WHERE id=%s""",
-                      (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on, tid)):
+                         joined_on=%s WHERE id=%s AND spa_id=%s""",
+                      (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on, tid,
+                       u["spa"])):
             raise HTTPException(404, "Therapist not found")
         return {"id": tid}
 
     @app.get("/api/services")
-    def services(_=Depends(current_user)):
-        return db.all("SELECT * FROM services ORDER BY lower(name)")
+    def services(u=Depends(member)):
+        return db.all("SELECT * FROM services WHERE spa_id=%s ORDER BY lower(name)", (u["spa"],))
 
     @app.post("/api/services", status_code=201)
-    def add_service(b: ServiceIn, _=Depends(admin)):
+    def add_service(b: ServiceIn, u=Depends(admin)):
         try:
-            return {"id": db.insert("INSERT INTO services(name,price,duration_min,is_active) VALUES(%s,%s,%s,%s)",
-                                    (b.name.strip(), b.price, b.duration_min, b.is_active))}
+            return {"id": db.insert("INSERT INTO services(name,price,duration_min,is_active,spa_id) VALUES(%s,%s,%s,%s,%s)",
+                                    (b.name.strip(), b.price, b.duration_min, b.is_active, u["spa"]))}
         except pgerr.UniqueViolation:
             raise HTTPException(409, "Service already exists")
 
     @app.put("/api/services/{sid}")
-    def edit_service(sid: int, b: ServiceIn, _=Depends(admin)):
+    def edit_service(sid: int, b: ServiceIn, u=Depends(admin)):
         try:
-            n = db.run("UPDATE services SET name=%s,price=%s,duration_min=%s,is_active=%s WHERE id=%s",
-                       (b.name.strip(), b.price, b.duration_min, b.is_active, sid))
+            n = db.run("UPDATE services SET name=%s,price=%s,duration_min=%s,is_active=%s WHERE id=%s AND spa_id=%s",
+                       (b.name.strip(), b.price, b.duration_min, b.is_active, sid, u["spa"]))
         except pgerr.UniqueViolation:
             raise HTTPException(409, "Service already exists")
         if not n:
@@ -292,37 +412,38 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     # ---- appointments ---------------------------------------------------
     # Double-booking is refused by the database itself (appointments_no_overlap), so it holds even
     # with several API processes; we only translate that error into a 409.
-    def resolve_slot(t, b: AppointmentIn):
+    def resolve_slot(t, b: AppointmentIn, spa: int):
         """Validate a booking request; returns (therapist, service, start). Shared by create and edit."""
         try:
             start = dt.datetime.fromisoformat(b.start_at).replace(tzinfo=None, second=0, microsecond=0)
         except ValueError:
             raise HTTPException(422, "start_at must be YYYY-MM-DDTHH:MM")
-        if not t.one("SELECT 1 FROM customers WHERE id=%s", (b.customer_id,)):
+        if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s", (b.customer_id, spa)):
             raise HTTPException(404, "Customer not found")
-        th = t.one("SELECT * FROM therapists WHERE id=%s AND is_active", (b.therapist_id,))
-        sv = t.one("SELECT * FROM services WHERE id=%s AND is_active", (b.service_id,))
+        th = t.one("SELECT * FROM therapists WHERE id=%s AND spa_id=%s AND is_active", (b.therapist_id, spa))
+        sv = t.one("SELECT * FROM services WHERE id=%s AND spa_id=%s AND is_active", (b.service_id, spa))
         if not th or not sv:
             raise HTTPException(404, "Therapist or service not found (or inactive)")
         return th, sv, start
 
-    def insert_appointment(t, b: AppointmentIn) -> int:
-        th, sv, start = resolve_slot(t, b)
+    def insert_appointment(t, b: AppointmentIn, spa: int) -> int:
+        th, sv, start = resolve_slot(t, b, spa)
         try:
-            return t.insert("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,price,notes)
-                               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+            return t.insert("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,price,notes,
+                                                        spa_id)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
                             (b.customer_id, th["id"], sv["id"], start, b.duration_min or sv["duration_min"],
-                             sv["price"] if b.price is None else b.price, b.notes))
+                             sv["price"] if b.price is None else b.price, b.notes, spa))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
 
     @app.get("/api/appointments")
     def appointments(date: Optional[dt.date] = None, therapist_id: Optional[int] = None,
-                     status: Optional[Status] = None, _=Depends(current_user)):
+                     status: Optional[Status] = None, u=Depends(member)):
         sql = """SELECT a.*, c.name AS customer, c.phone, s.name AS service, t.name AS therapist
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
-                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE true"""
-        args = []
+                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE a.spa_id=%s"""
+        args = [u["spa"]]
         if date:
             sql += " AND a.start_at >= %s AND a.start_at < %s"
             args += [date, date + dt.timedelta(days=1)]
@@ -333,20 +454,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return db.all(sql + " ORDER BY a.start_at LIMIT 500", args)
 
     @app.post("/api/appointments", status_code=201)
-    def add_appointment(b: AppointmentIn, _=Depends(current_user)):
+    def add_appointment(b: AppointmentIn, u=Depends(member)):
         with db.tx() as t:
-            return {"id": insert_appointment(t, b)}
+            return {"id": insert_appointment(t, b, u["spa"])}
 
     @app.put("/api/appointments/{aid}")
-    def edit_appointment(aid: int, b: AppointmentIn, _=Depends(current_user)):
+    def edit_appointment(aid: int, b: AppointmentIn, u=Depends(member)):
         """Reschedule / change an appointment. Only while still 'booked': completed ones feed payroll."""
         with db.tx() as t:
-            a = t.one("SELECT * FROM appointments WHERE id=%s FOR UPDATE", (aid,))
+            a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
             if not a:
                 raise HTTPException(404, "Appointment not found")
             if a["status"] != "booked":
                 raise HTTPException(409, "Only booked appointments can be edited; change the status first")
-            th, sv, start = resolve_slot(t, b)
+            th, sv, start = resolve_slot(t, b, u["spa"])
             # explicit price wins; a different service takes its list price; otherwise keep what was agreed
             price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
             # the same rule for the length
@@ -360,9 +481,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"id": aid}
 
     @app.patch("/api/appointments/{aid}/status")
-    def set_status(aid: int, b: StatusIn, _=Depends(current_user)):
+    def set_status(aid: int, b: StatusIn, u=Depends(member)):
         try:  # re-opening a cancelled slot someone else has since taken is refused by the constraint
-            n = db.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
+            n = db.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s AND spa_id=%s",
+                       (b.status, aid, u["spa"]))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
         if not n:
@@ -371,12 +493,12 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
-    def onboard(b: OnboardIn, _=Depends(current_user)):
+    def onboard(b: OnboardIn, u=Depends(member)):
         with db.tx() as t:  # a clashing first appointment rolls the new customer back too
-            cid = insert_customer(t, b)
+            cid = insert_customer(t, b, u["spa"])
             aid = None
             if b.first_appointment:
-                aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}))
+                aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
         return {"customer_id": cid, "appointment_id": aid}
 
     # ---- reports & payroll (admin) --------------------------------------
@@ -403,13 +525,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def summary(month: str | None = Query(None), therapist_id: int | None = Query(None),
                 date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
                 customer_id: int | None = Query(None), service_id: int | None = Query(None),
-                _=Depends(admin)):
+                u=Depends(admin)):
         """The month's figures. Revenue counts COMPLETED appointments only, at the price agreed at booking.
         `lines` is every completed service (who, what, for whom, how much); `by_therapist` gives each
         therapist's count and amount with a per-service breakdown. `therapist_id` narrows everything but
         new_customers to one therapist."""
         lo, hi = period(month, date_from, date_to)
-        who, extra = "", []
+        who, extra = " AND a.spa_id = %s", [u["spa"]]
         for col, val in (("therapist_id", therapist_id), ("customer_id", customer_id), ("service_id", service_id)):
             if val is not None:
                 who += f" AND a.{col} = %s"
@@ -448,7 +570,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             services = sorted((out(v) for v in th["services"].values()), key=lambda x: -x["revenue"])
             therapists.append({**out(th), "services": services})
         # created_at is a timestamptz and the session zone is the spa's, so these are local calendar months
-        new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE created_at >= %s AND created_at < %s", (lo, hi))["n"]
+        new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s AND created_at >= %s AND created_at < %s",
+                       (u["spa"], lo, hi))["n"]
         rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
         return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
                 "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
@@ -462,7 +585,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         for key, table, val in (("therapist", "therapists", therapist_id), ("customer", "customers", customer_id),
                                 ("service", "services", service_id)):
             if val is not None:
-                row = db.one(f"SELECT name FROM {table} WHERE id=%s", (val,))
+                row = db.one(f"SELECT name FROM {table} WHERE id=%s AND spa_id=%s", (val, user["spa"]))
                 if not row:
                     raise HTTPException(404, f"{key.title()} not found")
                 r[key] = row["name"]
@@ -477,7 +600,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
         """The same report as /api/reports/summary (same filters), as a PDF to download or print."""
         r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
-        return Response(payroll.report_pdf(r, business), media_type="application/pdf",
+        return Response(payroll.report_pdf(r, user["spa_name"]), media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
 
     @app.get("/api/reports/summary/csv")
@@ -499,19 +622,19 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 
     @app.get("/api/reports/incentives")
-    def incentives(month: str = Query(...), _=Depends(admin)):
+    def incentives(month: str = Query(...), u=Depends(admin)):
         check_month(month)
         rows = [payroll.compute_payslip(db, t, month) for t in
-                db.all("SELECT * FROM therapists WHERE is_active ORDER BY lower(name)")]
+                db.all("SELECT * FROM therapists WHERE spa_id=%s AND is_active ORDER BY lower(name)", (u["spa"],))]
         for r in rows:
             r.pop("lines"); r.pop("bonuses")
         return {"month": month, "therapists": rows,
                 "total_incentive": round(sum(r["incentive"] + r["extra_incentive"] for r in rows), 2),
                 "total_payroll": round(sum(r["net_pay"] for r in rows), 2)}
 
-    def payslip_for(tid: int, month: str):
+    def payslip_for(tid: int, month: str, spa: int):
         check_month(month)
-        t = db.one("SELECT * FROM therapists WHERE id=%s", (tid,))
+        t = db.one("SELECT * FROM therapists WHERE id=%s AND spa_id=%s", (tid, spa))
         if not t:
             raise HTTPException(404, "Therapist not found")
         return payroll.compute_payslip(db, t, month)
@@ -520,45 +643,46 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/bonuses")
     def bonuses(month: str | None = Query(None), therapist_id: int | None = Query(None),
                 date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
-                _=Depends(admin)):
+                u=Depends(admin)):
         lo, hi = period(month, date_from, date_to)
         sql = """SELECT b.id, b.therapist_id, t.name AS therapist, b.on_date, b.amount, b.note, b.appointment_id,
                         u.username AS added_by, b.created_at
                  FROM therapist_bonuses b JOIN therapists t ON t.id=b.therapist_id
                  LEFT JOIN users u ON u.id=b.created_by
-                 WHERE b.on_date >= %s AND b.on_date < %s"""
-        args: list = [lo, hi]
+                 WHERE b.spa_id=%s AND b.on_date >= %s AND b.on_date < %s"""
+        args: list = [u["spa"], lo, hi]
         if therapist_id is not None:
             sql += " AND b.therapist_id=%s"; args.append(therapist_id)
         return db.all(sql + " ORDER BY b.on_date DESC, b.id DESC", args)
 
     @app.post("/api/bonuses", status_code=201)
     def add_bonus(b: BonusIn, u=Depends(admin)):
-        if not db.one("SELECT 1 FROM therapists WHERE id=%s", (b.therapist_id,)):
+        if not db.one("SELECT 1 FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"])):
             raise HTTPException(404, "Therapist not found")
         if b.appointment_id is not None and not db.one(
                 "SELECT 1 FROM appointments WHERE id=%s AND therapist_id=%s", (b.appointment_id, b.therapist_id)):
             raise HTTPException(404, "Appointment not found for this therapist")
-        bid = db.insert("""INSERT INTO therapist_bonuses(therapist_id,on_date,amount,note,appointment_id,created_by)
-                           VALUES(%s,%s,%s,%s,%s,%s)""",
-                        (b.therapist_id, b.on_date, b.amount, (b.note or "").strip() or None, b.appointment_id, u["id"]))
+        bid = db.insert("""INSERT INTO therapist_bonuses(therapist_id,on_date,amount,note,appointment_id,created_by,spa_id)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                        (b.therapist_id, b.on_date, b.amount, (b.note or "").strip() or None, b.appointment_id, u["id"],
+                         u["spa"]))
         return {"id": bid}
 
     @app.delete("/api/bonuses/{bid}", status_code=204)
-    def delete_bonus(bid: int, _=Depends(admin)):
-        if not db.run("DELETE FROM therapist_bonuses WHERE id=%s", (bid,)):
+    def delete_bonus(bid: int, u=Depends(admin)):
+        if not db.run("DELETE FROM therapist_bonuses WHERE id=%s AND spa_id=%s", (bid, u["spa"])):
             raise HTTPException(404, "Not found")
         return Response(status_code=204)
 
     @app.get("/api/payroll/{tid}/{month}")
-    def payslip(tid: int, month: str, _=Depends(admin)):
-        return payslip_for(tid, month)
+    def payslip(tid: int, month: str, u=Depends(admin)):
+        return payslip_for(tid, month, u["spa"])
 
     @app.get("/api/payroll/{tid}/{month}/pdf")
-    def payslip_pdf(tid: int, month: str, _=Depends(admin)):
-        p = payslip_for(tid, month)
+    def payslip_pdf(tid: int, month: str, u=Depends(admin)):
+        p = payslip_for(tid, month, u["spa"])
         name = re.sub(r"[^A-Za-z0-9_-]", "_", p["therapist"])
-        return Response(payroll.payslip_pdf(p, business), media_type="application/pdf",
+        return Response(payroll.payslip_pdf(p, u["spa_name"]), media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="payslip_{name}_{month}.pdf"'})
 
     @app.get("/api/health")

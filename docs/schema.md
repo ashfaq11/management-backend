@@ -9,11 +9,17 @@ do not edit by hand; change a `migrations/NNN_*.sql` file and regenerate. Raw DD
 erDiagram
   customers ||--o{ appointments : has
   services ||--o{ appointments : has
+  spas ||--o{ appointments : has
   therapists ||--o{ appointments : has
+  spas ||--o{ customers : has
+  spas ||--o{ services : has
   users ||--o{ sessions : has
   appointments ||--o{ therapist_bonuses : has
   users ||--o{ therapist_bonuses : has
+  spas ||--o{ therapist_bonuses : has
   therapists ||--o{ therapist_bonuses : has
+  spas ||--o{ therapists : has
+  spas ||--o{ users : has
 ```
 
 | Table | Purpose |
@@ -22,6 +28,7 @@ erDiagram
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
+| [`spas`](#spas) | Each spa (business) using the system. Its admins and staff see only its data; a superadmin sees every spa. |
 | [`therapist_bonuses`](#therapist_bonuses) | Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive. |
 | [`therapists`](#therapists) | Staff who perform services and are paid on payslips. Never deleted, only set inactive, so past payslips stay reproducible. |
 | [`users`](#users) | Staff logins. Role admin = everything; staff = customers, onboarding, appointments. |
@@ -44,6 +51,7 @@ One booking of one customer with one therapist for one service. Completed appoin
 | `notes` | text | yes |  | Free-text note for this visit. |
 | `created_at` | timestamp with time zone | no | `now()` | When it was booked. |
 | `updated_at` | timestamp with time zone | no | `now()` | Last reschedule or status change. |
+| `spa_id` | bigint | no |  | The spa of the booking; always that of its customer, therapist and service. |
 
 **Constraints**
 
@@ -52,6 +60,7 @@ One booking of one customer with one therapist for one service. Completed appoin
 - Check `appointments_status_check`: `CHECK ((status = ANY (ARRAY['booked'::text, 'completed'::text, 'cancelled'::text, 'no_show'::text])))`
 - Foreign key `appointments_customer_id_fkey`: `FOREIGN KEY (customer_id) REFERENCES customers(id)`
 - Foreign key `appointments_service_id_fkey`: `FOREIGN KEY (service_id) REFERENCES services(id)`
+- Foreign key `appointments_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Foreign key `appointments_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
 - Primary key `appointments_pkey`: `PRIMARY KEY (id)`
 - Exclusion `appointments_no_overlap`: `EXCLUDE USING gist (therapist_id WITH =, tsrange(start_at, end_at) WITH &&) WHERE ((status = ANY (ARRAY['booked'::text, 'completed'::text])))` - A therapist cannot have two booked/completed appointments whose time ranges overlap (back-to-back is allowed). Enforced by the database so concurrent requests cannot double-book.
@@ -60,6 +69,7 @@ One booking of one customer with one therapist for one service. Completed appoin
 
 - `appointments_customer_idx`: `CREATE INDEX appointments_customer_idx ON appointments USING btree (customer_id, start_at DESC)`
 - `appointments_no_overlap`: `CREATE INDEX appointments_no_overlap ON appointments USING gist (therapist_id, tsrange(start_at, end_at)) WHERE (status = ANY (ARRAY['booked'::text, 'completed'::text]))`
+- `appointments_spa_start_idx`: `CREATE INDEX appointments_spa_start_idx ON appointments USING btree (spa_id, start_at)`
 - `appointments_start_idx`: `CREATE INDEX appointments_start_idx ON appointments USING btree (start_at)`
 - `appointments_therapist_idx`: `CREATE INDEX appointments_therapist_idx ON appointments USING btree (therapist_id, start_at)`
 
@@ -79,17 +89,20 @@ Spa clients, created by onboarding or by hand.
 | `notes` | text | yes |  | Allergies, skin type, preferences. |
 | `created_at` | timestamp with time zone | no | `now()` | Onboarding time; the "new customers" report counts by it in the spa time zone. |
 | `updated_at` | timestamp with time zone | no | `now()` | Last edit. |
+| `spa_id` | bigint | no |  | The spa this customer belongs to; phone is unique within it (customers_phone_key). |
 
 **Constraints**
 
 - Check `customers_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Foreign key `customers_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `customers_pkey`: `PRIMARY KEY (id)`
-- Unique `customers_phone_key`: `UNIQUE (phone)`
+- Unique `customers_phone_key`: `UNIQUE (spa_id, phone)`
 
 **Indexes**
 
 - `customers_name_idx`: `CREATE INDEX customers_name_idx ON customers USING btree (lower(name))`
-- `customers_phone_key`: `CREATE UNIQUE INDEX customers_phone_key ON customers USING btree (phone)`
+- `customers_phone_key`: `CREATE UNIQUE INDEX customers_phone_key ON customers USING btree (spa_id, phone)`
+- `customers_spa_idx`: `CREATE INDEX customers_spa_idx ON customers USING btree (spa_id, lower(name))`
 
 ## services
 
@@ -102,17 +115,19 @@ Price list of treatments. Editing a price affects future bookings only.
 | `price` | numeric(12,2) | no |  | List price in INR, copied onto an appointment when it is booked. |
 | `duration_min` | integer | no | `60` | Minutes a booking blocks on the therapist's calendar. |
 | `is_active` | boolean | no | `true` | Inactive services cannot be booked; history keeps pointing at them. |
+| `spa_id` | bigint | no |  | The spa offering this service; name is unique within it. |
 
 **Constraints**
 
 - Check `services_duration_min_check`: `CHECK ((duration_min > 0))`
 - Check `services_name_check`: `CHECK ((length(btrim(name)) > 0))`
 - Check `services_price_check`: `CHECK ((price >= (0)::numeric))`
+- Foreign key `services_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `services_pkey`: `PRIMARY KEY (id)`
 
 **Indexes**
 
-- `services_name_key`: `CREATE UNIQUE INDEX services_name_key ON services USING btree (lower(name))`
+- `services_name_key`: `CREATE UNIQUE INDEX services_name_key ON services USING btree (spa_id, lower(name))`
 
 ## sessions
 
@@ -135,6 +150,26 @@ Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token 
 - `sessions_expires_idx`: `CREATE INDEX sessions_expires_idx ON sessions USING btree (expires_at)`
 - `sessions_user_idx`: `CREATE INDEX sessions_user_idx ON sessions USING btree (user_id)`
 
+## spas
+
+Each spa (business) using the system. Its admins and staff see only its data; a superadmin sees every spa.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `name` | text | no |  | Business name, shown in the app and on payslips and reports; unique ignoring case. |
+| `is_active` | boolean | no | `true` | False stops every login of this spa at once (superadmin only); data is kept. |
+| `created_at` | timestamp with time zone | no | `now()` | When the spa was added. |
+
+**Constraints**
+
+- Check `spas_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Primary key `spas_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `spas_name_key`: `CREATE UNIQUE INDEX spas_name_key ON spas USING btree (lower(name))`
+
 ## therapist_bonuses
 
 Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive.
@@ -149,17 +184,20 @@ Extra incentives for a therapist on a date, added to that month's payslip on top
 | `appointment_id` | bigint | yes |  | The appointment it was given for, when it was given from the appointments list (optional). |
 | `created_by` | bigint | yes |  | The user who added it. |
 | `created_at` | timestamp with time zone | no | `now()` | When it was added. |
+| `spa_id` | bigint | no |  | The spa of the therapist. |
 
 **Constraints**
 
 - Check `therapist_bonuses_amount_check`: `CHECK ((amount > (0)::numeric))`
 - Foreign key `therapist_bonuses_appointment_id_fkey`: `FOREIGN KEY (appointment_id) REFERENCES appointments(id)`
 - Foreign key `therapist_bonuses_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `therapist_bonuses_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Foreign key `therapist_bonuses_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
 - Primary key `therapist_bonuses_pkey`: `PRIMARY KEY (id)`
 
 **Indexes**
 
+- `therapist_bonuses_spa_idx`: `CREATE INDEX therapist_bonuses_spa_idx ON therapist_bonuses USING btree (spa_id, on_date)`
 - `therapist_bonuses_therapist_idx`: `CREATE INDEX therapist_bonuses_therapist_idx ON therapist_bonuses USING btree (therapist_id, on_date)`
 
 ## therapists
@@ -176,13 +214,19 @@ Staff who perform services and are paid on payslips. Never deleted, only set ina
 | `is_active` | boolean | no | `true` | Inactive therapists cannot be booked and drop out of the monthly payroll list. |
 | `joined_on` | date | yes |  | Optional joining date. |
 | `created_at` | timestamp with time zone | no | `now()` | When the record was added. |
+| `spa_id` | bigint | no |  | The spa this therapist works for. |
 
 **Constraints**
 
 - Check `therapists_fixed_salary_check`: `CHECK ((fixed_salary >= (0)::numeric))`
 - Check `therapists_incentive_percent_check`: `CHECK (((incentive_percent >= (0)::numeric) AND (incentive_percent <= (100)::numeric)))`
 - Check `therapists_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Foreign key `therapists_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `therapists_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `therapists_spa_idx`: `CREATE INDEX therapists_spa_idx ON therapists USING btree (spa_id)`
 
 ## users
 
@@ -193,16 +237,20 @@ Staff logins. Role admin = everything; staff = customers, onboarding, appointmen
 | `id` | bigint | no | identity | Surrogate key. |
 | `username` | text | no |  | Login name, at least 3 characters; unique ignoring case (users_username_key). |
 | `password_hash` | text | no |  | PBKDF2-SHA256 hash "pbkdf2$iterations$salt$hash"; the password itself is never stored. |
-| `role` | text | no | `'staff'::text` | admin or staff. |
+| `role` | text | no | `'staff'::text` | superadmin (every spa, creates spas and their admins), admin (one spa, creates its staff) or staff. |
 | `is_active` | boolean | no | `true` | False blocks login and ends all sessions immediately; accounts are deactivated, never deleted. |
 | `created_at` | timestamp with time zone | no | `now()` | When the account was created. |
+| `spa_id` | bigint | yes |  | The spa an admin or staff login belongs to; NULL for a superadmin (users_spa_by_role). |
 
 **Constraints**
 
-- Check `users_role_check`: `CHECK ((role = ANY (ARRAY['admin'::text, 'staff'::text])))`
+- Check `users_role_check`: `CHECK ((role = ANY (ARRAY['superadmin'::text, 'admin'::text, 'staff'::text])))`
+- Check `users_spa_by_role`: `CHECK (((role = 'superadmin'::text) = (spa_id IS NULL)))`
 - Check `users_username_check`: `CHECK ((length(btrim(username)) >= 3))`
+- Foreign key `users_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `users_pkey`: `PRIMARY KEY (id)`
 
 **Indexes**
 
+- `users_spa_idx`: `CREATE INDEX users_spa_idx ON users USING btree (spa_id)`
 - `users_username_key`: `CREATE UNIQUE INDEX users_username_key ON users USING btree (lower(username))`
