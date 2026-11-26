@@ -4,6 +4,7 @@ Incentive = sum of price of the therapist's COMPLETED appointments in the month
 x the therapist's incentive_percent. Prices are snapshotted on the appointment.
 """
 import calendar
+import datetime as dt
 import io
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -15,9 +16,9 @@ def money(v) -> Decimal:
 
 
 def month_bounds(month: str):
+    """[first day, first day of next month) as dates: the half-open range used in every monthly query."""
     y, m = map(int, month.split("-"))
-    last = calendar.monthrange(y, m)[1]
-    return f"{y:04d}-{m:02d}-01T00:00", f"{y:04d}-{m:02d}-{last:02d}T23:59:59"
+    return dt.date(y, m, 1), (dt.date(y + 1, 1, 1) if m == 12 else dt.date(y, m + 1, 1))
 
 
 def compute_payslip(db, therapist: dict, month: str) -> dict:
@@ -26,7 +27,7 @@ def compute_payslip(db, therapist: dict, month: str) -> dict:
         """SELECT a.id, a.start_at, a.price, c.name AS customer, s.name AS service
            FROM appointments a JOIN customers c ON c.id=a.customer_id
            JOIN services s ON s.id=a.service_id
-           WHERE a.therapist_id=? AND a.status='completed' AND a.start_at BETWEEN ? AND ?
+           WHERE a.therapist_id=%s AND a.status='completed' AND a.start_at >= %s AND a.start_at < %s
            ORDER BY a.start_at""", (therapist["id"], lo, hi))
     revenue = sum((money(r["price"]) for r in rows), Decimal("0"))
     pct = Decimal(str(therapist["incentive_percent"]))

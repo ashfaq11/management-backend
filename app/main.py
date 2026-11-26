@@ -1,22 +1,21 @@
 import datetime as dt
 import os
 import re
+from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from psycopg import errors as pgerr
 from pydantic import BaseModel, Field
 
 from . import payroll, security
-from .db import Database, default_path
+from .db import Database, default_dsn
 
 MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 SESSION_HOURS = 12
+SLOT_TAKEN = "Therapist already has an appointment at that time"
 Status = Literal["booked", "completed", "cancelled", "no_show"]
-
-
-def now() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ---- request models -------------------------------------------------------
@@ -30,7 +29,7 @@ class CustomerIn(BaseModel):
     phone: str = Field(min_length=5)
     email: Optional[str] = None
     gender: Optional[str] = None
-    dob: Optional[str] = None
+    dob: Optional[dt.date] = None
     address: Optional[str] = None
     notes: Optional[str] = None
 
@@ -41,7 +40,7 @@ class TherapistIn(BaseModel):
     fixed_salary: float = Field(ge=0)
     incentive_percent: float = Field(ge=0, le=100)
     is_active: bool = True
-    joined_on: Optional[str] = None
+    joined_on: Optional[dt.date] = None
 
 
 class ServiceIn(BaseModel):
@@ -88,14 +87,24 @@ class UserIn(BaseModel):
     role: Literal["admin", "staff"] = "staff"
 
 
-def create_app(db_path: Optional[str] = None) -> FastAPI:
-    db = Database(db_path or default_path())
+def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastAPI:
+    db = Database(dsn or default_dsn(), schema or os.environ.get("SPA_PG_SCHEMA", "spa"),
+                  tz=os.environ.get("SPA_TZ", "Asia/Kolkata"),
+                  pool_max=int(os.environ.get("PG_POOL_MAX", "10")))
     business = os.environ.get("SPA_NAME", "Serenity Spa")
-    if not db.one("SELECT 1 FROM users LIMIT 1"):
-        db.run("INSERT INTO users(username,password_hash,role) VALUES(?,?,'admin')",
-               (os.environ.get("ADMIN_USER", "admin"),
-                security.hash_password(os.environ.get("ADMIN_PASSWORD", "admin12345"))))
-    app = FastAPI(title="Spa Management API")
+    # first start only; atomic, so several processes starting together create exactly one admin
+    db.run("""INSERT INTO users(username,password_hash,role)
+              SELECT %s,%s,'admin' WHERE NOT EXISTS (SELECT 1 FROM users)""",
+           (os.environ.get("ADMIN_USER", "admin"),
+            security.hash_password(os.environ.get("ADMIN_PASSWORD", "admin12345"))))
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+        db.close()
+
+    app = FastAPI(title="Spa Management API", lifespan=lifespan)
+    app.state.db = db
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],
                        allow_headers=["Authorization", "Content-Type"])
@@ -104,8 +113,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def current_user(authorization: str = Header(default="")):
         tok = authorization[7:] if authorization.lower().startswith("bearer ") else ""
         u = db.one("""SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id
-                      WHERE s.token_hash=? AND s.expires_at>? AND u.is_active=1""",
-                   (security.fingerprint(tok), now())) if tok else None
+                      WHERE s.token_hash=%s AND s.expires_at>now() AND u.is_active""",
+                   (security.fingerprint(tok),)) if tok else None
         if not u:
             raise HTTPException(401, "Not authenticated")
         return u
@@ -117,18 +126,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/api/auth/login")
     def login(b: Login):
-        u = db.one("SELECT * FROM users WHERE username=? AND is_active=1", (b.username,))
+        u = db.one("SELECT * FROM users WHERE lower(username)=lower(%s) AND is_active", (b.username,))
         if not u or not security.verify_password(b.password, u["password_hash"]):
             raise HTTPException(401, "Invalid username or password")
         tok = security.new_token()
-        exp = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=SESSION_HOURS)
-               ).strftime("%Y-%m-%dT%H:%M:%S")
-        db.run("INSERT INTO sessions VALUES(?,?,?)", (security.fingerprint(tok), u["id"], exp))
+        db.run("DELETE FROM sessions WHERE expires_at<now()")  # housekeeping
+        db.run("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(%s,%s,now()+make_interval(hours=>%s))",
+               (security.fingerprint(tok), u["id"], SESSION_HOURS))
         return {"token": tok, "username": u["username"], "role": u["role"]}
 
     @app.post("/api/auth/logout", status_code=204)
     def logout(authorization: str = Header(default=""), u=Depends(current_user)):
-        db.run("DELETE FROM sessions WHERE token_hash=?", (security.fingerprint(authorization[7:]),))
+        db.run("DELETE FROM sessions WHERE token_hash=%s", (security.fingerprint(authorization[7:]),))
 
     @app.get("/api/auth/me")
     def me(u=Depends(current_user)):
@@ -136,217 +145,225 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/api/auth/password", status_code=204)
     def change_password(b: PasswordChange, authorization: str = Header(default=""), u=Depends(current_user)):
-        row = db.one("SELECT password_hash FROM users WHERE id=?", (u["id"],))
+        row = db.one("SELECT password_hash FROM users WHERE id=%s", (u["id"],))
         if not security.verify_password(b.current_password, row["password_hash"]):
             raise HTTPException(400, "Current password is wrong")
-        db.run("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(b.new_password), u["id"]))
-        # sign out every other device, keep this one
-        db.run("DELETE FROM sessions WHERE user_id=? AND token_hash<>?",
-               (u["id"], security.fingerprint(authorization[7:])))
+        with db.tx() as t:
+            t.run("UPDATE users SET password_hash=%s WHERE id=%s", (security.hash_password(b.new_password), u["id"]))
+            # sign out every other device, keep this one
+            t.run("DELETE FROM sessions WHERE user_id=%s AND token_hash<>%s",
+                  (u["id"], security.fingerprint(authorization[7:])))
 
+    # ---- users (admin) --------------------------------------------------
     @app.get("/api/users")
     def users(_=Depends(admin)):
-        return db.all("SELECT id,username,role,is_active FROM users ORDER BY username")
+        return db.all("SELECT id,username,role,is_active FROM users ORDER BY lower(username)")
 
     @app.post("/api/users", status_code=201)
     def add_user(b: UserIn, _=Depends(admin)):
-        if db.one("SELECT 1 FROM users WHERE username=?", (b.username,)):
+        try:
+            return {"id": db.insert("INSERT INTO users(username,password_hash,role) VALUES(%s,%s,%s)",
+                                    (b.username.strip(), security.hash_password(b.password), b.role))}
+        except pgerr.UniqueViolation:
             raise HTTPException(409, "Username taken")
-        return {"id": db.run("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
-                             (b.username, security.hash_password(b.password), b.role))}
 
     @app.put("/api/users/{uid}")
     def edit_user(uid: int, b: UserUpdate, me=Depends(admin)):
-        target = db.one("SELECT * FROM users WHERE id=?", (uid,))
-        if not target:
-            raise HTTPException(404, "User not found")
-        with db.lock:  # check + write atomically so two admins cannot both demote each other
+        with db.tx() as t:
+            # lock every active admin row so two admins cannot demote each other at the same moment
+            admins = {r["id"] for r in t.all("SELECT id FROM users WHERE role='admin' AND is_active ORDER BY id FOR UPDATE")}
+            if not t.one("SELECT 1 FROM users WHERE id=%s FOR UPDATE", (uid,)):
+                raise HTTPException(404, "User not found")
             if uid == me["id"] and (not b.is_active or b.role != "admin"):
                 raise HTTPException(400, "You cannot deactivate or demote your own account")
-            others = db.one("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND is_active=1 AND id<>?", (uid,))["n"]
-            if others == 0 and (not b.is_active or b.role != "admin"):
+            if admins <= {uid} and (not b.is_active or b.role != "admin"):
                 raise HTTPException(400, "At least one active admin is required")
-            db.run("UPDATE users SET role=?, is_active=? WHERE id=?", (b.role, int(b.is_active), uid))
+            t.run("UPDATE users SET role=%s, is_active=%s WHERE id=%s", (b.role, b.is_active, uid))
             if not b.is_active:
-                db.run("DELETE FROM sessions WHERE user_id=?", (uid,))
+                t.run("DELETE FROM sessions WHERE user_id=%s", (uid,))
         return {"id": uid, "role": b.role, "is_active": b.is_active}
 
     @app.post("/api/users/{uid}/password", status_code=204)
     def reset_password(uid: int, b: PasswordReset, _=Depends(admin)):
-        if not db.one("SELECT 1 FROM users WHERE id=?", (uid,)):
-            raise HTTPException(404, "User not found")
-        db.run("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(b.password), uid))
-        db.run("DELETE FROM sessions WHERE user_id=?", (uid,))
+        with db.tx() as t:
+            if not t.run("UPDATE users SET password_hash=%s WHERE id=%s", (security.hash_password(b.password), uid)):
+                raise HTTPException(404, "User not found")
+            t.run("DELETE FROM sessions WHERE user_id=%s", (uid,))
 
     # ---- customers ----------------------------------------------------
-    def insert_customer(b: CustomerIn) -> int:
-        if db.one("SELECT 1 FROM customers WHERE phone=?", (b.phone,)):
-            raise HTTPException(409, "A customer with this phone already exists")
-        return db.run("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,created_at)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (b.name, b.phone, b.email, b.gender, b.dob, b.address, b.notes, now()))
+    PHONE_TAKEN = "A customer with this phone already exists"
+
+    def insert_customer(t, b: CustomerIn) -> int:
+        try:
+            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes))
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, PHONE_TAKEN)
 
     @app.get("/api/customers")
     def customers(q: str = "", _=Depends(current_user)):
-        like = f"%{q}%"
-        return db.all("SELECT * FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY name LIMIT 200",
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return db.all("SELECT * FROM customers WHERE name ILIKE %s OR phone ILIKE %s ORDER BY lower(name) LIMIT 200",
                       (like, like))
 
     @app.post("/api/customers", status_code=201)
     def add_customer(b: CustomerIn, _=Depends(current_user)):
-        return {"id": insert_customer(b)}
+        with db.tx() as t:
+            return {"id": insert_customer(t, b)}
 
     @app.get("/api/customers/{cid}")
     def customer(cid: int, _=Depends(current_user)):
-        c = db.one("SELECT * FROM customers WHERE id=?", (cid,))
+        c = db.one("SELECT * FROM customers WHERE id=%s", (cid,))
         if not c:
             raise HTTPException(404, "Customer not found")
         c["appointments"] = db.all(
             """SELECT a.*, s.name AS service, t.name AS therapist FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
-               WHERE a.customer_id=? ORDER BY a.start_at DESC""", (cid,))
+               WHERE a.customer_id=%s ORDER BY a.start_at DESC""", (cid,))
         return c
 
     @app.put("/api/customers/{cid}")
     def edit_customer(cid: int, b: CustomerIn, _=Depends(current_user)):
-        if not db.one("SELECT 1 FROM customers WHERE id=?", (cid,)):
+        try:
+            n = db.run("""UPDATE customers SET name=%s,phone=%s,email=%s,gender=%s,dob=%s,address=%s,notes=%s,
+                          updated_at=now() WHERE id=%s""",
+                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, cid))
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, PHONE_TAKEN)
+        if not n:
             raise HTTPException(404, "Customer not found")
-        if db.one("SELECT 1 FROM customers WHERE phone=? AND id<>?", (b.phone, cid)):
-            raise HTTPException(409, "A customer with this phone already exists")
-        db.run("UPDATE customers SET name=?,phone=?,email=?,gender=?,dob=?,address=?,notes=? WHERE id=?",
-               (b.name, b.phone, b.email, b.gender, b.dob, b.address, b.notes, cid))
         return {"id": cid}
 
     # ---- therapists & services (admin-managed) -------------------------
     @app.get("/api/therapists")
     def therapists(_=Depends(current_user)):
-        return db.all("SELECT * FROM therapists ORDER BY name")
+        return db.all("SELECT * FROM therapists ORDER BY lower(name)")
 
     @app.post("/api/therapists", status_code=201)
     def add_therapist(b: TherapistIn, _=Depends(admin)):
-        return {"id": db.run("""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on)
-                                VALUES(?,?,?,?,?,?)""",
-                             (b.name, b.phone, b.fixed_salary, b.incentive_percent, int(b.is_active), b.joined_on))}
+        return {"id": db.insert("""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on)
+                                   VALUES(%s,%s,%s,%s,%s,%s)""",
+                                (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on))}
 
     @app.put("/api/therapists/{tid}")
     def edit_therapist(tid: int, b: TherapistIn, _=Depends(admin)):
-        if not db.one("SELECT 1 FROM therapists WHERE id=?", (tid,)):
+        if not db.run("""UPDATE therapists SET name=%s,phone=%s,fixed_salary=%s,incentive_percent=%s,is_active=%s,
+                         joined_on=%s WHERE id=%s""",
+                      (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on, tid)):
             raise HTTPException(404, "Therapist not found")
-        db.run("""UPDATE therapists SET name=?,phone=?,fixed_salary=?,incentive_percent=?,is_active=?,joined_on=?
-                  WHERE id=?""", (b.name, b.phone, b.fixed_salary, b.incentive_percent, int(b.is_active),
-                                  b.joined_on, tid))
         return {"id": tid}
 
     @app.get("/api/services")
     def services(_=Depends(current_user)):
-        return db.all("SELECT * FROM services ORDER BY name")
+        return db.all("SELECT * FROM services ORDER BY lower(name)")
 
     @app.post("/api/services", status_code=201)
     def add_service(b: ServiceIn, _=Depends(admin)):
-        if db.one("SELECT 1 FROM services WHERE name=?", (b.name,)):
+        try:
+            return {"id": db.insert("INSERT INTO services(name,price,duration_min,is_active) VALUES(%s,%s,%s,%s)",
+                                    (b.name.strip(), b.price, b.duration_min, b.is_active))}
+        except pgerr.UniqueViolation:
             raise HTTPException(409, "Service already exists")
-        return {"id": db.run("INSERT INTO services(name,price,duration_min,is_active) VALUES(?,?,?,?)",
-                             (b.name, b.price, b.duration_min, int(b.is_active)))}
 
     @app.put("/api/services/{sid}")
     def edit_service(sid: int, b: ServiceIn, _=Depends(admin)):
-        if not db.one("SELECT 1 FROM services WHERE id=?", (sid,)):
+        try:
+            n = db.run("UPDATE services SET name=%s,price=%s,duration_min=%s,is_active=%s WHERE id=%s",
+                       (b.name.strip(), b.price, b.duration_min, b.is_active, sid))
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, "Service already exists")
+        if not n:
             raise HTTPException(404, "Service not found")
-        db.run("UPDATE services SET name=?,price=?,duration_min=?,is_active=? WHERE id=?",
-               (b.name, b.price, b.duration_min, int(b.is_active), sid))
         return {"id": sid}
 
     # ---- appointments ---------------------------------------------------
-    def resolve_slot(b: AppointmentIn, exclude_id: Optional[int] = None):
-        """Validate a booking request; returns (therapist, service, start_s). Shared by create and edit."""
+    # Double-booking is refused by the database itself (appointments_no_overlap), so it holds even
+    # with several API processes; we only translate that error into a 409.
+    def resolve_slot(t, b: AppointmentIn):
+        """Validate a booking request; returns (therapist, service, start). Shared by create and edit."""
         try:
-            start = dt.datetime.fromisoformat(b.start_at)
+            start = dt.datetime.fromisoformat(b.start_at).replace(tzinfo=None, second=0, microsecond=0)
         except ValueError:
             raise HTTPException(422, "start_at must be YYYY-MM-DDTHH:MM")
-        start_s = start.strftime("%Y-%m-%dT%H:%M")
-        if not db.one("SELECT 1 FROM customers WHERE id=?", (b.customer_id,)):
+        if not t.one("SELECT 1 FROM customers WHERE id=%s", (b.customer_id,)):
             raise HTTPException(404, "Customer not found")
-        t = db.one("SELECT * FROM therapists WHERE id=? AND is_active=1", (b.therapist_id,))
-        s = db.one("SELECT * FROM services WHERE id=? AND is_active=1", (b.service_id,))
-        if not t or not s:
+        th = t.one("SELECT * FROM therapists WHERE id=%s AND is_active", (b.therapist_id,))
+        sv = t.one("SELECT * FROM services WHERE id=%s AND is_active", (b.service_id,))
+        if not th or not sv:
             raise HTTPException(404, "Therapist or service not found (or inactive)")
-        end = (start + dt.timedelta(minutes=s["duration_min"])).strftime("%Y-%m-%dT%H:%M")
-        clash = db.one(
-            """SELECT 1 FROM appointments WHERE therapist_id=? AND status IN('booked','completed') AND id<>?
-               AND start_at<? AND strftime('%Y-%m-%dT%H:%M', start_at, '+'||duration_min||' minutes')>?""",
-            (t["id"], exclude_id or 0, end, start_s))
-        if clash:
-            raise HTTPException(409, "Therapist already has an appointment at that time")
-        return t, s, start_s
+        return th, sv, start
 
-    def insert_appointment(b: AppointmentIn) -> int:
-        t, s, start_s = resolve_slot(b)
-        price = s["price"] if b.price is None else b.price
-        return db.run("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,
-                         price,status,notes,created_at) VALUES(?,?,?,?,?,?,'booked',?,?)""",
-                      (b.customer_id, t["id"], s["id"], start_s, s["duration_min"], price, b.notes, now()))
-
-    @app.put("/api/appointments/{aid}")
-    def edit_appointment(aid: int, b: AppointmentIn, _=Depends(current_user)):
-        """Reschedule / change an appointment. Only while still 'booked': completed ones feed payroll."""
-        with db.lock:
-            a = db.one("SELECT * FROM appointments WHERE id=?", (aid,))
-            if not a:
-                raise HTTPException(404, "Appointment not found")
-            if a["status"] != "booked":
-                raise HTTPException(409, "Only booked appointments can be edited; change the status first")
-            t, s, start_s = resolve_slot(b, exclude_id=aid)
-            # explicit price wins; a different service takes its list price; otherwise keep what was agreed
-            price = b.price if b.price is not None else (s["price"] if s["id"] != a["service_id"] else a["price"])
-            db.run("""UPDATE appointments SET customer_id=?,therapist_id=?,service_id=?,start_at=?,duration_min=?,
-                      price=?,notes=? WHERE id=?""",
-                   (b.customer_id, t["id"], s["id"], start_s, s["duration_min"], price, b.notes, aid))
-        return {"id": aid}
+    def insert_appointment(t, b: AppointmentIn) -> int:
+        th, sv, start = resolve_slot(t, b)
+        try:
+            return t.insert("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,price,notes)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                            (b.customer_id, th["id"], sv["id"], start, sv["duration_min"],
+                             sv["price"] if b.price is None else b.price, b.notes))
+        except pgerr.ExclusionViolation:
+            raise HTTPException(409, SLOT_TAKEN)
 
     @app.get("/api/appointments")
-    def appointments(date: Optional[str] = None, therapist_id: Optional[int] = None,
+    def appointments(date: Optional[dt.date] = None, therapist_id: Optional[int] = None,
                      status: Optional[Status] = None, _=Depends(current_user)):
         sql = """SELECT a.*, c.name AS customer, c.phone, s.name AS service, t.name AS therapist
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
-                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE 1=1"""
+                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE true"""
         args = []
         if date:
-            sql += " AND substr(a.start_at,1,10)=?"; args.append(date)
+            sql += " AND a.start_at >= %s AND a.start_at < %s"
+            args += [date, date + dt.timedelta(days=1)]
         if therapist_id:
-            sql += " AND a.therapist_id=?"; args.append(therapist_id)
+            sql += " AND a.therapist_id=%s"; args.append(therapist_id)
         if status:
-            sql += " AND a.status=?"; args.append(status)
+            sql += " AND a.status=%s"; args.append(status)
         return db.all(sql + " ORDER BY a.start_at LIMIT 500", args)
 
     @app.post("/api/appointments", status_code=201)
     def add_appointment(b: AppointmentIn, _=Depends(current_user)):
-        return {"id": insert_appointment(b)}
+        with db.tx() as t:
+            return {"id": insert_appointment(t, b)}
+
+    @app.put("/api/appointments/{aid}")
+    def edit_appointment(aid: int, b: AppointmentIn, _=Depends(current_user)):
+        """Reschedule / change an appointment. Only while still 'booked': completed ones feed payroll."""
+        with db.tx() as t:
+            a = t.one("SELECT * FROM appointments WHERE id=%s FOR UPDATE", (aid,))
+            if not a:
+                raise HTTPException(404, "Appointment not found")
+            if a["status"] != "booked":
+                raise HTTPException(409, "Only booked appointments can be edited; change the status first")
+            th, sv, start = resolve_slot(t, b)
+            # explicit price wins; a different service takes its list price; otherwise keep what was agreed
+            price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
+            try:
+                t.run("""UPDATE appointments SET customer_id=%s,therapist_id=%s,service_id=%s,start_at=%s,
+                         duration_min=%s,price=%s,notes=%s,updated_at=now() WHERE id=%s""",
+                      (b.customer_id, th["id"], sv["id"], start, sv["duration_min"], price, b.notes, aid))
+            except pgerr.ExclusionViolation:
+                raise HTTPException(409, SLOT_TAKEN)
+        return {"id": aid}
 
     @app.patch("/api/appointments/{aid}/status")
     def set_status(aid: int, b: StatusIn, _=Depends(current_user)):
-        if not db.one("SELECT 1 FROM appointments WHERE id=?", (aid,)):
+        try:  # re-opening a cancelled slot someone else has since taken is refused by the constraint
+            n = db.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
+        except pgerr.ExclusionViolation:
+            raise HTTPException(409, SLOT_TAKEN)
+        if not n:
             raise HTTPException(404, "Appointment not found")
-        db.run("UPDATE appointments SET status=? WHERE id=?", (b.status, aid))
         return {"id": aid, "status": b.status}
 
-    # ---- onboarding: customer (+ optional first booking) in one call ----
+    # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
     def onboard(b: OnboardIn, _=Depends(current_user)):
-        if b.first_appointment:  # validate first so nothing is half-created
-            fa = b.first_appointment
-            if not db.one("SELECT 1 FROM therapists WHERE id=? AND is_active=1", (fa.therapist_id,)) or \
-               not db.one("SELECT 1 FROM services WHERE id=? AND is_active=1", (fa.service_id,)):
-                raise HTTPException(404, "Therapist or service not found (or inactive)")
-        cid = insert_customer(b)
-        out = {"customer_id": cid, "appointment_id": None}
-        if b.first_appointment:
-            fa = b.first_appointment.model_copy(update={"customer_id": cid})
-            try:
-                out["appointment_id"] = insert_appointment(fa)
-            except HTTPException:
-                db.run("DELETE FROM customers WHERE id=?", (cid,))
-                raise
-        return out
+        with db.tx() as t:  # a clashing first appointment rolls the new customer back too
+            cid = insert_customer(t, b)
+            aid = None
+            if b.first_appointment:
+                aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}))
+        return {"customer_id": cid, "appointment_id": aid}
 
     # ---- reports & payroll (admin) --------------------------------------
     def check_month(month: str):
@@ -357,13 +374,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def summary(month: str = Query(...), _=Depends(admin)):
         check_month(month)
         lo, hi = payroll.month_bounds(month)
-        by_status = db.all("""SELECT status, COUNT(*) AS count, ROUND(SUM(price),2) AS amount
-                              FROM appointments WHERE start_at BETWEEN ? AND ? GROUP BY status""", (lo, hi))
-        by_service = db.all("""SELECT s.name AS service, COUNT(*) AS count, ROUND(SUM(a.price),2) AS revenue
+        by_status = db.all("""SELECT status, COUNT(*) AS count, COALESCE(SUM(price),0) AS amount
+                              FROM appointments WHERE start_at >= %s AND start_at < %s GROUP BY status
+                              ORDER BY status""", (lo, hi))
+        by_service = db.all("""SELECT s.name AS service, COUNT(*) AS count, SUM(a.price) AS revenue
                                FROM appointments a JOIN services s ON s.id=a.service_id
-                               WHERE a.status='completed' AND a.start_at BETWEEN ? AND ?
-                               GROUP BY s.id ORDER BY revenue DESC""", (lo, hi))
-        new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE substr(created_at,1,7)=?", (month,))["n"]
+                               WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s
+                               GROUP BY s.id, s.name ORDER BY revenue DESC""", (lo, hi))
+        # created_at is a timestamptz and the session zone is the spa's, so these are local calendar months
+        new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE created_at >= %s AND created_at < %s", (lo, hi))["n"]
         rev = sum(r["revenue"] for r in by_service)
         return {"month": month, "revenue": round(rev, 2), "new_customers": new_c,
                 "by_status": by_status, "by_service": by_service}
@@ -372,7 +391,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def incentives(month: str = Query(...), _=Depends(admin)):
         check_month(month)
         rows = [payroll.compute_payslip(db, t, month) for t in
-                db.all("SELECT * FROM therapists WHERE is_active=1 ORDER BY name")]
+                db.all("SELECT * FROM therapists WHERE is_active ORDER BY lower(name)")]
         for r in rows:
             r.pop("lines")
         return {"month": month, "therapists": rows,
@@ -381,7 +400,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     def payslip_for(tid: int, month: str):
         check_month(month)
-        t = db.one("SELECT * FROM therapists WHERE id=?", (tid,))
+        t = db.one("SELECT * FROM therapists WHERE id=%s", (tid,))
         if not t:
             raise HTTPException(404, "Therapist not found")
         return payroll.compute_payslip(db, t, month)
@@ -399,9 +418,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/api/health")
     def health():
+        db.one("SELECT 1")  # fails (500) if the database is unreachable, so the load balancer sees it
         return {"ok": True}
 
     return app
-
-
-

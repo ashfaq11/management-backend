@@ -1,61 +1,106 @@
 import os
-import sqlite3
-import threading
+import re
+from contextlib import contextmanager
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'admin', is_active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS sessions(
-  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-  expires_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS customers(
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE NOT NULL, email TEXT,
-  gender TEXT, dob TEXT, address TEXT, notes TEXT, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS therapists(
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT, fixed_salary REAL NOT NULL DEFAULT 0,
-  incentive_percent REAL NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1,
-  joined_on TEXT);
-CREATE TABLE IF NOT EXISTS services(
-  id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, price REAL NOT NULL,
-  duration_min INTEGER NOT NULL DEFAULT 60, is_active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS appointments(
-  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
-  therapist_id INTEGER NOT NULL REFERENCES therapists(id),
-  service_id INTEGER NOT NULL REFERENCES services(id),
-  start_at TEXT NOT NULL, duration_min INTEGER NOT NULL, price REAL NOT NULL,
-  status TEXT NOT NULL DEFAULT 'booked', notes TEXT, created_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS appt_start ON appointments(start_at);
-CREATE INDEX IF NOT EXISTS appt_ther ON appointments(therapist_id, start_at);
-"""
+import psycopg
+from psycopg.adapt import Loader
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from .migrate import migrate
+
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_TZ = re.compile(r"^[A-Za-z0-9_/+\-]{1,64}$")
 
 
-class Database:
-    """One shared SQLite connection guarded by a lock (small single-site app)."""
+# The JSON API speaks floats and ISO strings; make the driver return those instead of Decimal/datetime.
+class _Float(Loader):
+    def load(self, data):
+        return float(bytes(data))
 
-    def __init__(self, path: str):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.lock = threading.RLock()
-        with self.lock:
-            self.conn.executescript(SCHEMA)
+
+class _Text(Loader):
+    def load(self, data):
+        return bytes(data).decode()
+
+
+class _Local(Loader):  # timestamp (spa wall clock): "YYYY-MM-DDTHH:MM"
+    def load(self, data):
+        return bytes(data).decode().replace(" ", "T")[:16]
+
+
+class _Instant(Loader):  # timestamptz, rendered in the session zone: "YYYY-MM-DDTHH:MM:SS"
+    def load(self, data):
+        return bytes(data).decode().replace(" ", "T")[:19]
+
+
+for _oid, _cls in (("numeric", _Float), ("date", _Text), ("timestamp", _Local), ("timestamptz", _Instant)):
+    psycopg.adapters.register_loader(_oid, _cls)
+
+
+class Tx:
+    """Statements on one connection. Used directly inside `Database.tx()`."""
+
+    def __init__(self, conn):
+        self.conn = conn
 
     def all(self, sql, args=()):
-        with self.lock:
-            return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        return self.conn.execute(sql, args).fetchall()
 
     def one(self, sql, args=()):
-        with self.lock:
-            r = self.conn.execute(sql, args).fetchone()
-            return dict(r) if r else None
+        return self.conn.execute(sql, args).fetchone()
+
+    def run(self, sql, args=()) -> int:
+        return self.conn.execute(sql, args).rowcount
+
+    def insert(self, sql, args=()) -> int:
+        return self.conn.execute(sql + " RETURNING id", args).fetchone()["id"]
+
+
+class Database(Tx):
+    """Connection pool + migrations. Every table lives in one schema (default "spa")."""
+
+    def __init__(self, dsn: str, schema: str = "spa", tz: str = "Asia/Kolkata", pool_max: int = 10):
+        if not _IDENT.match(schema):
+            raise ValueError("schema must be lowercase letters, digits and underscores")
+        if not _TZ.match(tz):
+            raise ValueError("invalid time zone name")
+        self.schema = schema
+        migrate(dsn, schema)
+        self.pool = ConnectionPool(
+            dsn, min_size=1, max_size=pool_max, open=True,
+            kwargs={"row_factory": dict_row, "options": f"-c search_path={schema} -c TimeZone={tz}"})
+        self.pool.wait(timeout=15)
+
+    def _with(self, fn, sql, args):
+        with self.pool.connection() as conn:  # commits on success, rolls back on error
+            return fn(Tx(conn), sql, args)
+
+    def all(self, sql, args=()):
+        return self._with(lambda t, s, a: t.all(s, a), sql, args)
+
+    def one(self, sql, args=()):
+        return self._with(lambda t, s, a: t.one(s, a), sql, args)
 
     def run(self, sql, args=()):
-        with self.lock:
-            cur = self.conn.execute(sql, args)
-            self.conn.commit()
-            return cur.lastrowid
+        return self._with(lambda t, s, a: t.run(s, a), sql, args)
+
+    def insert(self, sql, args=()):
+        return self._with(lambda t, s, a: t.insert(s, a), sql, args)
+
+    @contextmanager
+    def tx(self):
+        """Several statements, one transaction: all commit together or none do."""
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                yield Tx(conn)
+
+    def close(self):
+        self.pool.close()
 
 
-def default_path():
-    return os.environ.get("SPA_DB", "spa.db")
+def default_dsn() -> str:
+    dsn = os.environ.get("PG_DSN")
+    if not dsn:
+        raise RuntimeError("PG_DSN is not set, e.g. postgresql://spa:secret@localhost:5432/spa")
+    return dsn

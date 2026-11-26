@@ -1,15 +1,29 @@
+import os
+import threading
 import unittest
+import uuid
 
+import psycopg
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 
+DSN = os.environ.get("TEST_PG_DSN")  # e.g. postgresql://spa:spa@localhost:5432/spa (needs CREATE SCHEMA rights)
 
+
+@unittest.skipUnless(DSN, "set TEST_PG_DSN to run the tests against a Postgres database")
 class Base(unittest.TestCase):
     def setUp(self):
-        self.c = TestClient(create_app(":memory:"))
+        self.schema = "t_" + uuid.uuid4().hex[:12]  # every test gets its own throwaway schema
+        self.app = create_app(DSN, self.schema)
+        self.c = TestClient(self.app)
         tok = self.c.post("/api/auth/login", json={"username": "admin", "password": "admin12345"}).json()["token"]
         self.h = {"Authorization": f"Bearer {tok}"}
+
+    def tearDown(self):
+        self.app.state.db.close()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP SCHEMA {self.schema} CASCADE")
 
     def post(self, url, **j):
         return self.c.post(url, json=j, headers=self.h)
@@ -251,6 +265,99 @@ class TestUsers(Base):
         self.assertEqual(self.c.get("/api/auth/me", headers=h1).status_code, 200)   # this device stays in
         self.assertEqual(self.c.get("/api/auth/me", headers=h2).status_code, 401)   # others signed out
         self.assertEqual(self.login("front", "newpass123")[0].status_code, 200)
+
+
+class TestPostgres(Base):
+    def booking(self, t, s, c, start="2026-11-10T10:00"):
+        return self.c.post("/api/appointments", headers=self.h,
+                           json=dict(customer_id=c, therapist_id=t, service_id=s, start_at=start))
+
+    def test_concurrent_bookings_only_one_wins(self):
+        """The database, not the app, refuses a double booking - so it holds across processes too."""
+        t, s, c = self.seed()
+        codes, gate = [], threading.Barrier(8)
+
+        def go():
+            gate.wait()
+            codes.append(self.booking(t, s, c).status_code)
+        th = [threading.Thread(target=go) for _ in range(8)]
+        [x.start() for x in th]; [x.join() for x in th]
+        self.assertEqual(sorted(codes), [201] + [409] * 7)
+
+    def test_reopening_a_cancelled_slot_someone_took_is_refused(self):
+        t, s, c = self.seed()
+        a = self.booking(t, s, c).json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "cancelled"}, headers=self.h)
+        self.assertEqual(self.booking(t, s, c).status_code, 201)  # someone else takes the freed slot
+        r = self.c.patch(f"/api/appointments/{a}/status", json={"status": "booked"}, headers=self.h)
+        self.assertEqual(r.status_code, 409)
+
+    def test_username_is_case_insensitive(self):
+        self.assertEqual(self.post("/api/users", username="ADMIN", password="whatever123").status_code, 409)
+        r = self.c.post("/api/auth/login", json={"username": "Admin", "password": "admin12345"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_service_name_unique_ignoring_case(self):
+        self.post("/api/services", name="Massage", price=1)
+        self.assertEqual(self.post("/api/services", name="massage", price=2).status_code, 409)
+
+    def test_bad_dates_are_422_not_500(self):
+        r = self.post("/api/customers", name="X", phone="5551234567", dob="31-12-1990")
+        self.assertEqual(r.status_code, 422)
+        ok = self.post("/api/customers", name="X", phone="5551234567", dob="1990-12-31")
+        self.assertEqual(ok.status_code, 201)
+        self.assertEqual(self.c.get(f"/api/customers/{ok.json()['id']}", headers=self.h).json()["dob"], "1990-12-31")
+
+    def test_search_is_case_insensitive_and_escapes_wildcards(self):
+        self.seed()
+        self.assertEqual(len(self.c.get("/api/customers?q=rav", headers=self.h).json()), 1)
+        self.assertEqual(len(self.c.get("/api/customers?q=%25", headers=self.h).json()), 0)
+
+    def test_money_roundtrips_exactly(self):
+        t, s, c = self.seed(pct=7.5)
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T09:00", price=333.33).json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        p = self.c.get(f"/api/payroll/{t}/2026-11", headers=self.h).json()
+        self.assertEqual((p["service_revenue"], p["incentive"]), (333.33, 25.0))  # 24.99975 -> 25.00
+
+    def test_month_boundaries_are_half_open(self):
+        t, s, c = self.seed()
+        for start in ("2026-10-31T23:00", "2026-11-01T00:00", "2026-11-30T23:00", "2026-12-01T00:00"):
+            a = self.booking(t, s, c, start).json()["id"]
+            self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        self.assertEqual(self.c.get(f"/api/payroll/{t}/2026-11", headers=self.h).json()["services_count"], 2)
+
+    def test_december_rolls_into_next_year(self):
+        t, s, c = self.seed()
+        a = self.booking(t, s, c, "2026-12-31T20:00").json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        self.assertEqual(self.c.get(f"/api/payroll/{t}/2026-12", headers=self.h).json()["services_count"], 1)
+
+    def test_timestamps_render_as_iso_strings(self):
+        _, _, c = self.seed()
+        row = self.c.get(f"/api/customers/{c}", headers=self.h).json()
+        self.assertRegex(row["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$")
+
+    def test_schemas_are_isolated_and_migrations_idempotent(self):
+        from app.migrate import migrate
+        self.assertEqual(migrate(DSN, self.schema), [])  # already applied
+        other = "t_" + uuid.uuid4().hex[:12]
+        app2 = create_app(DSN, other)
+        try:
+            self.seed()
+            self.assertEqual(app2.state.db.one("SELECT COUNT(*) AS n FROM customers")["n"], 0)
+        finally:
+            app2.state.db.close()
+            with psycopg.connect(DSN, autocommit=True) as c:
+                c.execute(f"DROP SCHEMA {other} CASCADE")
+
+    def test_health_checks_the_database(self):
+        self.assertEqual(self.c.get("/api/health").json(), {"ok": True})
+
+    def test_rejects_unsafe_schema_name(self):
+        with self.assertRaises(ValueError):
+            create_app(DSN, "x; drop table users")
 
 
 if __name__ == "__main__":

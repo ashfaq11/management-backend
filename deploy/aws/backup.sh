@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Nightly consistent SQLite backup (cron): keeps 14 copies in /var/lib/spa/backups.
+# Nightly logical backup of the spa schema (cron): keeps 14 compressed dumps in /var/lib/spa/backups.
+# Only for the Postgres container on this box; with an external/managed database use its own backups.
 set -euo pipefail
-docker exec spa-api python - <<'PY'
-import sqlite3, datetime, os
-os.makedirs("/data/backups", exist_ok=True)  # as the app user, so it can write there
-src = sqlite3.connect("/data/spa.db")
-dst = sqlite3.connect(f"/data/backups/spa-{datetime.date.today()}.db")
-src.backup(dst)
-PY
-ls -1t /var/lib/spa/backups/spa-*.db | tail -n +15 | xargs -r rm --
+docker inspect spa-pg >/dev/null 2>&1 || { echo "no local spa-pg container; skipping"; exit 0; }
+mkdir -p /var/lib/spa/backups
+f=/var/lib/spa/backups/spa-$(date +%F).sql.gz
+docker exec spa-pg pg_dump -U spa -d spa --schema=spa | gzip > "$f.tmp" && mv "$f.tmp" "$f"
+ls -1t /var/lib/spa/backups/spa-*.sql.gz | tail -n +15 | xargs -r rm --
+# restore: see restore.sh (it also reinstalls the btree_gist extension a schema-only dump omits)
