@@ -890,7 +890,7 @@ class TestPriorityOneOperations(Base):
         self.assertEqual(payment.status_code, 201, payment.text)
         self.assertEqual(self.c.post(f"/api/payments/{payment.json()['id']}/refunds",
                                      json={"amount": 10}, headers=h).status_code, 403)
-        self.assertEqual(self.c.get("/api/reports/payments", headers=h).status_code, 403)
+        self.assertEqual(self.c.get("/api/payments/settlement", headers=h).status_code, 200)
 
     def test_payment_receipt_is_available_to_spa_member(self):
         t, s, c = self.seed()
