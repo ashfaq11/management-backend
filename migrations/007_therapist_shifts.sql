@@ -29,3 +29,14 @@ COMMENT ON COLUMN shifts.start_time IS 'Local shift start time; shifts do not cr
 COMMENT ON COLUMN shifts.end_time IS 'Local shift end time; must be later than start_time.';
 COMMENT ON TABLE therapist_shift_assignments IS 'Weekly therapist roster; one shift per weekday. Monday=0 through Sunday=6.';
 COMMENT ON COLUMN therapist_shift_assignments.day_of_week IS 'ISO weekday number: Monday 0, Tuesday 1, ..., Sunday 6.';
+
+COMMENT ON COLUMN shifts.id IS 'Identity.';
+COMMENT ON COLUMN shifts.spa_id IS 'Owning spa; shift templates are tenant-scoped.';
+COMMENT ON COLUMN shifts.name IS 'Display name of the reusable work-time window.';
+COMMENT ON COLUMN shifts.is_active IS 'Inactive shifts cannot be assigned to therapists.';
+COMMENT ON COLUMN shifts.created_at IS 'When the shift template was created.';
+COMMENT ON COLUMN therapist_shift_assignments.id IS 'Identity.';
+COMMENT ON COLUMN therapist_shift_assignments.spa_id IS 'Owning spa; must match the therapist and shift.';
+COMMENT ON COLUMN therapist_shift_assignments.therapist_id IS 'Therapist assigned to this weekly shift.';
+COMMENT ON COLUMN therapist_shift_assignments.shift_id IS 'Reusable shift template assigned for this weekday.';
+COMMENT ON COLUMN therapist_shift_assignments.created_at IS 'When the weekly assignment was created.';
