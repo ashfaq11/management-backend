@@ -43,6 +43,29 @@ class TherapistIn(BaseModel):
     incentive_percent: float = Field(ge=0, le=100)
     is_active: bool = True
     joined_on: Optional[dt.date] = None
+    email: Optional[str] = None
+    gender: Optional[str] = None
+    dob: Optional[dt.date] = None
+    address: Optional[str] = None
+    specialities: Optional[str] = None
+    experience_years: Optional[float] = None
+    notes: Optional[str] = None
+    emergency_name: Optional[str] = None
+    emergency_phone: Optional[str] = None
+    id_proof_type: Optional[str] = None
+    id_proof_number: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    upi_id: Optional[str] = None
+
+
+THERAPIST_DETAILS = ("email", "gender", "dob", "address", "specialities", "experience_years", "notes", "emergency_name", "emergency_phone", "id_proof_type", "id_proof_number", "bank_name", "bank_account_name", "bank_account_number", "bank_ifsc", "upi_id")
+
+
+def details(b) -> tuple:
+    return tuple((v.strip() or None) if isinstance(v, str) else v for v in (getattr(b, n) for n in THERAPIST_DETAILS))
 
 
 class ServiceIn(BaseModel):
@@ -372,17 +395,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.post("/api/therapists", status_code=201)
     def add_therapist(b: TherapistIn, u=Depends(admin)):
-        return {"id": db.insert("""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on,spa_id)
-                                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+        cols = ",".join(THERAPIST_DETAILS)
+        marks = ",".join(["%s"] * len(THERAPIST_DETAILS))
+        return {"id": db.insert(f"""INSERT INTO therapists(name,phone,fixed_salary,incentive_percent,is_active,joined_on,spa_id,
+                                                         {cols}) VALUES(%s,%s,%s,%s,%s,%s,%s,{marks})""",
                                 (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on,
-                                 u["spa"]))}
+                                 u["spa"], *details(b)))}
 
     @app.put("/api/therapists/{tid}")
     def edit_therapist(tid: int, b: TherapistIn, u=Depends(admin)):
-        if not db.run("""UPDATE therapists SET name=%s,phone=%s,fixed_salary=%s,incentive_percent=%s,is_active=%s,
-                         joined_on=%s WHERE id=%s AND spa_id=%s""",
-                      (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on, tid,
-                       u["spa"])):
+        sets = ",".join(f"{n}=%s" for n in THERAPIST_DETAILS)
+        if not db.run(f"""UPDATE therapists SET name=%s,phone=%s,fixed_salary=%s,incentive_percent=%s,is_active=%s,
+                          joined_on=%s,{sets} WHERE id=%s AND spa_id=%s""",
+                      (b.name.strip(), b.phone, b.fixed_salary, b.incentive_percent, b.is_active, b.joined_on,
+                       *details(b), tid, u["spa"])):
             raise HTTPException(404, "Therapist not found")
         return {"id": tid}
 

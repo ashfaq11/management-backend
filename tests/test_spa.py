@@ -476,3 +476,15 @@ class TestTenancy(Base):
         self.assertEqual(self.c.put(f"/api/spas/{spa2}", json={"name": "Lotus", "is_active": False}, headers=sa).status_code, 200)
         r = self.c.post("/api/auth/login", json={"username": "lotus", "password": "lotus12345"})
         self.assertEqual(r.status_code, 401)
+
+
+class TestTherapistDetails(Base):
+    def test_details_saved_and_edited(self):
+        tid = self.post("/api/therapists", name="Asha", fixed_salary=1, incentive_percent=1,
+                        specialities="Thai", bank_ifsc="HDFC0001", experience_years=3.5).json()["id"]
+        row = next(t for t in self.c.get("/api/therapists", headers=self.h).json() if t["id"] == tid)
+        self.assertEqual((row["specialities"], row["bank_ifsc"], float(row["experience_years"])), ("Thai", "HDFC0001", 3.5))
+        self.c.put(f"/api/therapists/{tid}", json={"name": "Asha", "fixed_salary": 1, "incentive_percent": 1,
+                                                    "upi_id": "asha@upi", "specialities": " "}, headers=self.h)
+        row = next(t for t in self.c.get("/api/therapists", headers=self.h).json() if t["id"] == tid)
+        self.assertEqual((row["upi_id"], row["specialities"]), ("asha@upi", None))

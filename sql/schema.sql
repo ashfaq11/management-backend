@@ -238,6 +238,41 @@ COMMENT ON COLUMN appointments.spa_id IS 'The spa of the booking; always that of
 COMMENT ON COLUMN therapist_bonuses.spa_id IS 'The spa of the therapist.';
 COMMENT ON COLUMN users.role IS 'superadmin (every spa, creates spas and their admins), admin (one spa, creates its staff) or staff.';
 
+-- ======== 005_therapist_details.sql ========
+-- Profile details for therapists: personal, work, emergency/ID and salary bank.
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS gender TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS dob DATE;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS specialities TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS experience_years NUMERIC(4,1) CHECK (experience_years >= 0);
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS notes TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS emergency_name TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS emergency_phone TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS id_proof_type TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS id_proof_number TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS bank_name TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS bank_account_name TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS bank_account_number TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS bank_ifsc TEXT;
+ALTER TABLE therapists ADD COLUMN IF NOT EXISTS upi_id TEXT;
+COMMENT ON COLUMN therapists.email IS 'Email address';
+COMMENT ON COLUMN therapists.gender IS 'Gender, free text';
+COMMENT ON COLUMN therapists.dob IS 'Date of birth';
+COMMENT ON COLUMN therapists.address IS 'Home address';
+COMMENT ON COLUMN therapists.specialities IS 'Treatments the therapist is skilled in, free text';
+COMMENT ON COLUMN therapists.experience_years IS 'Years of experience before joining';
+COMMENT ON COLUMN therapists.notes IS 'Free notes';
+COMMENT ON COLUMN therapists.emergency_name IS 'Emergency contact person';
+COMMENT ON COLUMN therapists.emergency_phone IS 'Emergency contact phone';
+COMMENT ON COLUMN therapists.id_proof_type IS 'ID proof kind (Aadhaar, PAN, ...)';
+COMMENT ON COLUMN therapists.id_proof_number IS 'ID proof number';
+COMMENT ON COLUMN therapists.bank_name IS 'Salary bank name';
+COMMENT ON COLUMN therapists.bank_account_name IS 'Salary account holder name';
+COMMENT ON COLUMN therapists.bank_account_number IS 'Salary account number';
+COMMENT ON COLUMN therapists.bank_ifsc IS 'Salary account IFSC';
+COMMENT ON COLUMN therapists.upi_id IS 'UPI ID for salary';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -245,5 +280,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('001_init.sql'),
   ('002_comments.sql'),
   ('003_therapist_bonuses.sql'),
-  ('004_spas.sql')
+  ('004_spas.sql'),
+  ('005_therapist_details.sql')
 ON CONFLICT DO NOTHING;

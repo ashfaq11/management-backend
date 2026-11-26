@@ -215,9 +215,26 @@ Staff who perform services and are paid on payslips. Never deleted, only set ina
 | `joined_on` | date | yes |  | Optional joining date. |
 | `created_at` | timestamp with time zone | no | `now()` | When the record was added. |
 | `spa_id` | bigint | no |  | The spa this therapist works for. |
+| `email` | text | yes |  | Email address |
+| `gender` | text | yes |  | Gender, free text |
+| `dob` | date | yes |  | Date of birth |
+| `address` | text | yes |  | Home address |
+| `specialities` | text | yes |  | Treatments the therapist is skilled in, free text |
+| `experience_years` | numeric(4,1) | yes |  | Years of experience before joining |
+| `notes` | text | yes |  | Free notes |
+| `emergency_name` | text | yes |  | Emergency contact person |
+| `emergency_phone` | text | yes |  | Emergency contact phone |
+| `id_proof_type` | text | yes |  | ID proof kind (Aadhaar, PAN, ...) |
+| `id_proof_number` | text | yes |  | ID proof number |
+| `bank_name` | text | yes |  | Salary bank name |
+| `bank_account_name` | text | yes |  | Salary account holder name |
+| `bank_account_number` | text | yes |  | Salary account number |
+| `bank_ifsc` | text | yes |  | Salary account IFSC |
+| `upi_id` | text | yes |  | UPI ID for salary |
 
 **Constraints**
 
+- Check `therapists_experience_years_check`: `CHECK ((experience_years >= (0)::numeric))`
 - Check `therapists_fixed_salary_check`: `CHECK ((fixed_salary >= (0)::numeric))`
 - Check `therapists_incentive_percent_check`: `CHECK (((incentive_percent >= (0)::numeric) AND (incentive_percent <= (100)::numeric)))`
 - Check `therapists_name_check`: `CHECK ((length(btrim(name)) > 0))`
