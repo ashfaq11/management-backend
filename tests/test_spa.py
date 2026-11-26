@@ -62,6 +62,16 @@ class TestAuth(Base):
 
 
 class TestFlow(Base):
+    def test_spa_logo_is_scoped_and_validated(self):
+        logo = "data:image/png;base64,aGVsbG8="
+        saved = self.c.put("/api/spa/logo", json={"logo_data_url": logo}, headers=self.h)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(self.c.get("/api/spa/logo", headers=self.h).json()["logo_data_url"], logo)
+        bad = self.c.put("/api/spa/logo", json={"logo_data_url": "https://example.com/logo.png"}, headers=self.h)
+        self.assertEqual(bad.status_code, 422)
+        self.assertEqual(self.c.put("/api/spa/logo", json={"logo_data_url": None}, headers=self.h).status_code, 200)
+        self.assertIsNone(self.c.get("/api/spa/logo", headers=self.h).json()["logo_data_url"])
+
     def test_duplicate_phone(self):
         self.seed()
         self.assertEqual(self.post("/api/customers", name="X", phone="9990001111").status_code, 409)
