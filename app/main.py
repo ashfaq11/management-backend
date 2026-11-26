@@ -704,20 +704,113 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(409, SLOT_TAKEN)
 
     @app.get("/api/appointments")
-    def appointments(date: Optional[dt.date] = None, therapist_id: Optional[int] = None,
+    def appointments(date: Optional[dt.date] = None, date_from: Optional[dt.date] = Query(None, alias="from"),
+                     date_to: Optional[dt.date] = Query(None, alias="to"), therapist_id: Optional[int] = None,
                      status: Optional[Status] = None, u=Depends(member)):
-        sql = """SELECT a.*, c.name AS customer, c.phone, s.name AS service, t.name AS therapist
+        sql = """SELECT a.*, c.name AS customer, c.phone, c.preferred_payment_method,
+                         s.name AS service, t.name AS therapist,
+                         COALESCE(pay.paid_amount,0) AS paid_amount,
+                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                              THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                              THEN 'prepaid'
+                              WHEN a.price=0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                              WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                              ELSE 'pending' END AS payment_status,
+                         (SELECT r.unit FROM plan_redemptions r WHERE r.appointment_id=a.id AND r.spa_id=a.spa_id
+                           AND r.reversed_at IS NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS plan_unit
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
-                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE a.spa_id=%s"""
+                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
+                 LEFT JOIN LATERAL (
+                   SELECT SUM(p.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                  WHERE rf.payment_id=p.id AND rf.spa_id=p.spa_id),0)) AS paid_amount
+                   FROM payments p WHERE p.appointment_id=a.id AND p.spa_id=a.spa_id
+                 ) pay ON TRUE WHERE a.spa_id=%s"""
         args = [u["spa"]]
-        if date:
+        if date_from or date_to:
+            if not (date_from and date_to) or date_to < date_from:
+                raise HTTPException(422, "give a valid from and to date range")
+            if (date_to - date_from).days > 366:
+                raise HTTPException(422, "at most one year at a time")
+            sql += " AND a.start_at >= %s AND a.start_at < %s"
+            args += [date_from, date_to + dt.timedelta(days=1)]
+        elif date:
             sql += " AND a.start_at >= %s AND a.start_at < %s"
             args += [date, date + dt.timedelta(days=1)]
         if therapist_id:
             sql += " AND a.therapist_id=%s"; args.append(therapist_id)
         if status:
             sql += " AND a.status=%s"; args.append(status)
-        return db.all(sql + " ORDER BY a.start_at LIMIT 500", args)
+        return db.all(sql + " ORDER BY a.start_at, a.id LIMIT 1500", args)
+
+    @app.get("/api/dashboard")
+    def dashboard(u=Depends(member)):
+        today_row = db.one("""SELECT COUNT(*) AS total,
+                                      COUNT(*) FILTER (WHERE status='booked') AS booked,
+                                      COUNT(*) FILTER (WHERE status='completed') AS completed,
+                                      COUNT(*) FILTER (WHERE status='cancelled') AS cancelled,
+                                      COUNT(*) FILTER (WHERE status='no_show') AS no_show,
+                                      COALESCE(SUM(price) FILTER (WHERE status='completed'),0) AS completed_value
+                               FROM appointments WHERE spa_id=%s AND start_at::date=CURRENT_DATE""", (u["spa"],))
+        collections = db.one("""SELECT COALESCE(SUM(p.amount),0) AS gross,
+                                       COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                 WHERE r.spa_id=%s AND r.refunded_at::date=CURRENT_DATE),0) AS refunds
+                                FROM payments p WHERE p.spa_id=%s AND p.received_at::date=CURRENT_DATE""",
+                             (u["spa"], u["spa"]))
+        customers_today = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s AND created_at::date=CURRENT_DATE",
+                                 (u["spa"],))["n"]
+        total_customers = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s", (u["spa"],))["n"]
+        monthly = db.all("""WITH months AS (
+                               SELECT generate_series(date_trunc('month',CURRENT_DATE)-interval '5 months',
+                                                      date_trunc('month',CURRENT_DATE),interval '1 month') AS m),
+                             visits AS (
+                               SELECT date_trunc('month',start_at) AS m,
+                                      COUNT(*) FILTER (WHERE status='completed') AS completed,
+                                      COALESCE(SUM(price) FILTER (WHERE status='completed'),0) AS revenue
+                               FROM appointments WHERE spa_id=%s AND start_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND start_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1),
+                             customers_month AS (
+                               SELECT date_trunc('month',created_at AT TIME ZONE current_setting('TimeZone')) AS m, COUNT(*) AS new_customers
+                               FROM customers WHERE spa_id=%s AND created_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND created_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1)
+                             SELECT to_char(months.m,'YYYY-MM') AS month,
+                                    COALESCE(visits.completed,0) AS completed,
+                                    COALESCE(visits.revenue,0) AS revenue,
+                                    COALESCE(customers_month.new_customers,0) AS new_customers
+                             FROM months LEFT JOIN visits USING(m) LEFT JOIN customers_month USING(m)
+                             ORDER BY months.m""", (u["spa"],u["spa"]))
+        upcoming = db.all("""SELECT a.id, a.start_at, a.duration_min, a.price, a.status,
+                                    c.name AS customer, c.phone, s.name AS service, t.name AS therapist,
+                                    COALESCE(pay.paid_amount,0) AS paid_amount,
+                                    CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                                      AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                                         THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due
+                             FROM appointments a JOIN customers c ON c.id=a.customer_id
+                             JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
+                             LEFT JOIN LATERAL (SELECT SUM(p.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                WHERE rf.payment_id=p.id AND rf.spa_id=p.spa_id),0)) AS paid_amount
+                                FROM payments p WHERE p.appointment_id=a.id AND p.spa_id=a.spa_id) pay ON TRUE
+                             WHERE a.spa_id=%s AND a.status='booked' AND a.start_at::date=CURRENT_DATE
+                               AND a.start_at >= localtimestamp ORDER BY a.start_at LIMIT 10""", (u["spa"],))
+        on_shift = db.one("""SELECT COUNT(*) AS n FROM therapists t
+                             WHERE t.spa_id=%s AND t.is_active AND (
+                               (NOT EXISTS (SELECT 1 FROM therapist_shift_assignments a WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id)
+                                AND localtime >= TIME '09:00' AND localtime < TIME '21:00')
+                               OR EXISTS (SELECT 1 FROM therapist_shift_assignments a
+                                          JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id AND sh.is_active
+                                          WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id
+                                            AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
+                                            AND localtime >= sh.start_time AND localtime < sh.end_time)
+                             )""", (u["spa"],))["n"]
+        return {"date": db.one("SELECT CURRENT_DATE AS day")["day"], "today": today_row,
+                "collections": {"gross": float(collections["gross"]), "refunds": float(collections["refunds"]),
+                                "net": float(collections["gross"]-collections["refunds"])},
+                "customers_today": customers_today, "total_customers": total_customers,
+                "therapists_on_shift": on_shift, "monthly": monthly, "upcoming": upcoming}
 
     @app.post("/api/appointments", status_code=201)
     def add_appointment(b: AppointmentIn, u=Depends(member)):
@@ -738,6 +831,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
             # the same rule for the length
             minutes = b.duration_min or (sv["duration_min"] if sv["id"] != a["service_id"] else a["duration_min"])
+            collected = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                  WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS paid
+                                  FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""", (aid,u["spa"]))["paid"]
+            if float(collected) - float(price) > 0.005:
+                raise HTTPException(409, "Refund the excess payment before reducing this appointment price")
             try:
                 t.run("""UPDATE appointments SET customer_id=%s,therapist_id=%s,service_id=%s,start_at=%s,
                          duration_min=%s,price=%s,notes=%s,updated_at=now() WHERE id=%s""",
