@@ -426,6 +426,7 @@ Each spa (business) using the system. Its admins and staff see only its data; a 
 | `name` | text | no |  | Business name, shown in the app and on payslips and reports; unique ignoring case. |
 | `is_active` | boolean | no | `true` | False stops every login of this spa at once (superadmin only); data is kept. |
 | `created_at` | timestamp with time zone | no | `now()` | When the spa was added. |
+| `logo_data_url` | text | yes |  | Optional PNG, JPEG or WebP logo data URL for this spa; independent of other spas. |
 
 **Constraints**
 

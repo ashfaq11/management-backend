@@ -521,6 +521,11 @@ UPDATE plan_topups SET paid_at = created_at WHERE paid_at IS NULL;
 COMMENT ON COLUMN customer_plans.paid_at IS 'When the plan cost was received; NULL = payment pending. Plan sales count on this date.';
 COMMENT ON COLUMN plan_topups.paid_at IS 'When the top-up cost was received; NULL = payment pending. Plan sales count on this date.';
 
+-- ======== 014_spa_logo.sql ========
+-- Each spa owns its own optional brand logo. The UI stores a normalized image data URL.
+ALTER TABLE spas ADD COLUMN logo_data_url TEXT;
+COMMENT ON COLUMN spas.logo_data_url IS 'Optional PNG, JPEG or WebP logo data URL for this spa; independent of other spas.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -537,5 +542,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('010_expenses.sql'),
   ('011_appointment_payments.sql'),
   ('012_customer_payment_preference.sql'),
-  ('013_plan_paid_status.sql')
+  ('013_plan_paid_status.sql'),
+  ('014_spa_logo.sql')
 ON CONFLICT DO NOTHING;

@@ -222,6 +222,10 @@ class SpaUpdate(SpaIn):
     is_active: bool = True
 
 
+class SpaLogoUpdate(BaseModel):
+    logo_data_url: Optional[str] = Field(default=None, max_length=1500000)
+
+
 class PasswordReset(BaseModel):
     password: str = Field(min_length=8)
 
@@ -381,6 +385,22 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if not b.is_active:
                 t.run("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE spa_id=%s)", (sid,))
         return {"id": sid}
+
+    @app.get("/api/spa/logo")
+    def get_spa_logo(u=Depends(member)):
+        row = db.one("SELECT logo_data_url FROM spas WHERE id=%s", (u["spa"],))
+        if not row:
+            raise HTTPException(404, "Spa not found")
+        return {"logo_data_url": row["logo_data_url"]}
+
+    @app.put("/api/spa/logo")
+    def set_spa_logo(b: SpaLogoUpdate, u=Depends(admin)):
+        value = b.logo_data_url
+        if value is not None and not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", value):
+            raise HTTPException(422, "Logo must be a PNG, JPEG or WebP image")
+        if not db.run("UPDATE spas SET logo_data_url=%s WHERE id=%s", (value, u["spa"])):
+            raise HTTPException(404, "Spa not found")
+        return {"logo_data_url": value}
 
     # ---- users: superadmin manages everyone; an admin manages the staff of their own spa ----
     def user_in_scope(t, me, uid, lock=False):
