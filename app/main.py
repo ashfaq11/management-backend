@@ -433,7 +433,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         c["appointments"] = db.all(
             """SELECT a.*, s.name AS service, t.name AS therapist,
                       p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit,
-                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at
+                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at,
+                      COALESCE(pay.paid_amount,0) AS paid_amount,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 0
+                           ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 'prepaid'
+                           WHEN a.price = 0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                           WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                           ELSE 'pending' END AS payment_status
                FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                LEFT JOIN LATERAL (
@@ -442,6 +449,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                    ORDER BY x.created_at DESC, x.id DESC LIMIT 1
                ) r ON TRUE
                LEFT JOIN customer_plans p ON p.id=r.plan_id
+               LEFT JOIN LATERAL (
+                   SELECT SUM(pm.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                  WHERE rf.payment_id=pm.id AND rf.spa_id=pm.spa_id),0)) AS paid_amount
+                   FROM payments pm WHERE pm.appointment_id=a.id AND pm.spa_id=a.spa_id
+               ) pay ON TRUE
                WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
         c["plans"] = db.all(
             """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
@@ -653,7 +665,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                          CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
                                            AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
                               THEN 'prepaid'
-                              WHEN COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                              WHEN a.price = 0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
                               WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
                               ELSE 'pending' END AS payment_status,
                          (SELECT r.unit FROM plan_redemptions r WHERE r.appointment_id=a.id AND r.spa_id=a.spa_id
@@ -734,11 +746,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                 FROM payments p WHERE p.appointment_id=a.id AND p.spa_id=a.spa_id) pay ON TRUE
                              WHERE a.spa_id=%s AND a.status='booked' AND a.start_at::date=CURRENT_DATE
                                AND a.start_at >= localtimestamp ORDER BY a.start_at LIMIT 10""", (u["spa"],))
-        on_shift = db.one("""SELECT COUNT(DISTINCT a.therapist_id) AS n FROM therapist_shift_assignments a
-                             JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id AND sh.is_active
-                             JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id AND t.is_active
-                             WHERE a.spa_id=%s AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
-                               AND localtime >= sh.start_time AND localtime < sh.end_time""", (u["spa"],))["n"]
+        on_shift = db.one("""SELECT COUNT(*) AS n FROM therapists t
+                             WHERE t.spa_id=%s AND t.is_active AND (
+                               (NOT EXISTS (SELECT 1 FROM therapist_shift_assignments a WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id)
+                                AND localtime >= TIME '09:00' AND localtime < TIME '21:00')
+                               OR EXISTS (SELECT 1 FROM therapist_shift_assignments a
+                                          JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id AND sh.is_active
+                                          WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id
+                                            AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
+                                            AND localtime >= sh.start_time AND localtime < sh.end_time)
+                             )""", (u["spa"],))["n"]
         return {"date": db.one("SELECT CURRENT_DATE AS day")["day"], "today": today_row,
                 "collections": {"gross": float(collections["gross"]), "refunds": float(collections["refunds"]),
                                 "net": float(collections["gross"]-collections["refunds"])},
@@ -897,6 +914,25 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.get("/api/reports/payments")
     def payment_report(received_on: dt.date | None = None, u=Depends(admin)):
+        day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
+        gross_rows = db.all("""SELECT method, COUNT(*) AS count, COALESCE(SUM(amount),0) AS gross
+                               FROM payments WHERE spa_id=%s AND received_at::date=%s
+                               GROUP BY method ORDER BY method""", (u["spa"], day))
+        refund_rows = db.all("""SELECT p.method, COALESCE(SUM(r.amount),0) AS refunds
+                                FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                                WHERE r.spa_id=%s AND r.refunded_at::date=%s GROUP BY p.method""", (u["spa"], day))
+        by_method = {x["method"]: {"method": x["method"], "count": int(x["count"]),
+                                   "gross": float(x["gross"]), "refunds": 0.0} for x in gross_rows}
+        for x in refund_rows:
+            by_method.setdefault(x["method"], {"method": x["method"], "count": 0, "gross": 0.0, "refunds": 0.0})["refunds"] = float(x["refunds"])
+        gross = sum(x["gross"] for x in by_method.values())
+        refunds = sum(x["refunds"] for x in by_method.values())
+        return {"date": day, "methods": sorted(by_method.values(), key=lambda x: x["method"]),
+                "gross": round(gross,2), "refunds": round(refunds,2), "net": round(gross-refunds,2)}
+
+    @app.get("/api/payments/settlement")
+    def payment_settlement(received_on: dt.date | None = None, u=Depends(member)):
+        """Daily payment totals by method, accessible to front-desk staff as well as admins."""
         day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
         gross_rows = db.all("""SELECT method, COUNT(*) AS count, COALESCE(SUM(amount),0) AS gross
                                FROM payments WHERE spa_id=%s AND received_at::date=%s
