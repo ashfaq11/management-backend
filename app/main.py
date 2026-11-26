@@ -649,7 +649,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                          COALESCE(pay.paid_amount,0) AS paid_amount,
                          CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
                                            AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
-                              THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due
+                              THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                              THEN 'prepaid'
+                              WHEN COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                              WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                              ELSE 'unpaid' END AS payment_status
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
                  JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                  LEFT JOIN LATERAL (
