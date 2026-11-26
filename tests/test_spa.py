@@ -503,9 +503,9 @@ class TestCustomerPlans(Base):
     def add_plan(self, customer, **body):
         return self.c.post(f"/api/customers/{customer}/plans", json=body, headers=self.h)
 
-    def complete(self, appointment):
+    def complete(self, appointment, plan_type=None):
         return self.c.patch(f"/api/appointments/{appointment}/status",
-                            json={"status": "completed"}, headers=self.h)
+                            json={"status": "completed", "plan_type": plan_type}, headers=self.h)
 
     def customer(self, customer):
         return self.c.get(f"/api/customers/{customer}", headers=self.h).json()
@@ -516,7 +516,7 @@ class TestCustomerPlans(Base):
         self.assertEqual(plan.status_code, 201, plan.text)
         a = self.make_appointment(t, s, c, duration_min=90)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 10.0)
-        done = self.complete(a)
+        done = self.complete(a, "hours")
         self.assertEqual(done.status_code, 200, done.text)
         self.assertEqual(done.json()["plan_deduction"]["amount"], 1.5)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 8.5)
@@ -526,7 +526,7 @@ class TestCustomerPlans(Base):
         t, s, c = self.seed()
         self.add_plan(c, name="Rs 5000 wallet", plan_type="rupees", amount=5000)
         a = self.make_appointment(t, s, c, price=1250.50)
-        done = self.complete(a)
+        done = self.complete(a, "rupees")
         self.assertEqual(done.json()["plan_deduction"]["amount"], 1250.5)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 3749.5)
 
@@ -534,28 +534,28 @@ class TestCustomerPlans(Base):
         t, s, c = self.seed()
         self.add_plan(c, name="Small wallet", plan_type="rupees", amount=1000)
         a = self.make_appointment(t, s, c, price=1250)
-        done = self.complete(a)
-        self.assertIsNone(done.json()["plan_deduction"])
+        done = self.complete(a, "rupees")
+        self.assertEqual(done.status_code, 409, done.text)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 1000.0)
 
     def test_completion_is_idempotent_and_reopening_refunds_plan(self):
         t, s, c = self.seed()
         self.add_plan(c, name="Hours", plan_type="hours", amount=4)
         a = self.make_appointment(t, s, c, duration_min=60)
-        self.complete(a)
-        self.complete(a)
+        self.complete(a, "hours")
+        self.complete(a, "hours")
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 3.0)
         reopened = self.c.patch(f"/api/appointments/{a}/status", json={"status": "cancelled"}, headers=self.h)
         self.assertEqual(reopened.status_code, 200)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 4.0)
-        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed", "plan_type": "hours"}, headers=self.h)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 3.0)
 
     def test_expired_plan_is_not_redeemed(self):
         t, s, c = self.seed()
         self.add_plan(c, name="Expired", plan_type="hours", amount=5, expires_on="2020-01-01")
         a = self.make_appointment(t, s, c)
-        done = self.complete(a)
+        done = self.complete(a, "hours")
         self.assertIsNone(done.json()["plan_deduction"])
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 5.0)
 
