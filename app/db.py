@@ -69,6 +69,9 @@ class Database(Tx):
         migrate(dsn, schema)
         self.pool = ConnectionPool(
             dsn, min_size=1, max_size=pool_max, open=True,
+            # free/serverless Postgres hosts (Neon...) suspend idle databases and drop their connections:
+            # test a connection before handing it out and retire idle ones, instead of failing a user's request
+            check=ConnectionPool.check_connection, max_idle=240,
             kwargs={"row_factory": dict_row, "options": f"-c search_path={schema} -c TimeZone={tz}"})
         self.pool.wait(timeout=15)
 

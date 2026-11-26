@@ -39,6 +39,11 @@ API starts, and recorded in `<schema>.schema_migrations`. To change the schema a
   agreed at booking and is never changed by later price edits.
 - Onboarding creates the customer and the first appointment in one transaction.
 
+Details: [`docs/schema.md`](docs/schema.md) (every table, column, constraint, index and a relationship diagram - generated from the live
+catalog) and [`sql/schema.sql`](sql/schema.sql) (the whole DDL in one file, with descriptions as `COMMENT`s so `psql \d+` shows them).
+Both are generated, and `tests/test_schema_files.py` fails if they drift from `migrations/` or if a table/column has no description:
+after changing a migration run `python tools/build_schema.py` and `PG_DSN=... python tools/schema_doc.py`.
+
 ## Roles
 - **admin**: everything, incl. therapists/services, reports, payroll and user management (`GET/POST /api/users`, `PUT /api/users/{id}` role/active, `POST /api/users/{id}/password` reset).
 - **staff**: customers, onboarding, appointments.
@@ -48,6 +53,17 @@ API starts, and recorded in `<schema>.schema_migrations`. To change the schema a
 - `PUT /api/appointments/{id}` reschedules or changes a booking, only while it is `booked` (completed ones feed payroll). Price: explicit value wins; a changed service takes its list price; otherwise the agreed price is kept. Re-opening a cancelled slot that has since been taken returns 409.
 - **Payslip = fixed salary + incentive**; incentive = incentive % x price of the therapist's *completed* appointments in the month (half-open range, spa time zone).
 - Payslip PDF: `GET /api/payroll/{therapist_id}/{YYYY-MM}/pdf`.
+
+## Free hosting (no card needed for the first two)
+UI on **Cloudflare Pages** (see `management-ui`), database on **Neon** (free Postgres), API on **Render** (free web service, `render.yaml`).
+1. **Neon**: create a project, copy the *direct* connection string (the host **without** `-pooler`; the pooler cannot hold the
+   advisory lock and `search_path` this app uses) ending in `?sslmode=require`. The free database pauses after 5 idle minutes and
+   resumes on the next query; the connection pool re-tests connections, so that costs a second, not an error.
+2. **Render**: New -> Blueprint -> this repo. Set `PG_DSN` to the Neon string and `SPA_CORS_ORIGINS` to the Pages address. The free
+   service sleeps after ~15 minutes without traffic and the first request after that takes about a minute - fine for a trial,
+   not for a front desk; the paid instance, or the AWS box below, does not sleep.
+3. Put the service's `https://<name>.onrender.com/api` into the UI's `config.json` (`apiBase`).
+Free-tier limits change; check each provider's pricing page before relying on them.
 
 ## Deploy on AWS (one EC2 box, Postgres in Docker)
 `deploy/aws/bootstrap.sh` is EC2 user-data for Amazon Linux 2023: it installs Docker, starts Postgres 16 (data in the `spa-pgdata`
