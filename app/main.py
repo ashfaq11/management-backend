@@ -109,6 +109,7 @@ class CustomerPlanIn(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
     expires_on: Optional[dt.date] = None
     notes: Optional[str] = Field(default=None, max_length=500)
+    price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)  # INR; rupee plans default to amount
 
 
 class CustomerPlanUpdate(BaseModel):
@@ -117,8 +118,18 @@ class CustomerPlanUpdate(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=500)
 
 
+def paid_for(plan_type: str, amount: float, price_paid: Optional[float]) -> float:
+    """Money received for a plan or top-up: given, or the amount itself for a rupee plan."""
+    if price_paid is not None:
+        return price_paid
+    if plan_type == "rupees":
+        return amount
+    return 0.0  # an hours plan given free or with an unknown price
+
+
 class PlanTopUp(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
+    price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)
     note: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -199,6 +210,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],
                        allow_headers=["Authorization", "Content-Type", "X-Spa-Id"],
+                       expose_headers=["Content-Disposition"],
                        max_age=3600)  # browsers reuse the preflight answer, so a cross-origin UI pays it once an hour
 
     # ---- auth ---------------------------------------------------------
@@ -709,9 +721,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
                 raise HTTPException(404, "Customer not found")
             pid = t.insert(
-                """INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes))
+                """INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,
+                                               price_paid)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes,
+                 paid_for(b.plan_type, b.amount, b.price_paid)))
         return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
     @app.put("/api/customers/{cid}/plans/{pid}")
@@ -733,8 +747,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(404, "Plan not found")
             t.run("UPDATE customer_plans SET purchased_amount=purchased_amount+%s, balance=balance+%s WHERE id=%s",
                   (b.amount, b.amount, pid))
-            t.insert("INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by) VALUES(%s,%s,%s,%s,%s)",
-                     (pid, u["spa"], b.amount, (b.note or "").strip() or None, u["id"]))
+            t.insert("""INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by,price_paid)
+                        VALUES(%s,%s,%s,%s,%s,%s)""",
+                     (pid, u["spa"], b.amount, (b.note or "").strip() or None, u["id"],
+                      paid_for(p["plan_type"], b.amount, b.price_paid)))
         return {"id": pid, "balance": round(float(p["balance"]) + b.amount, 2),
                 "purchased_amount": round(float(p["purchased_amount"]) + b.amount, 2)}
 
@@ -873,8 +889,37 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s AND created_at >= %s AND created_at < %s",
                        (u["spa"], lo, hi))["n"]
         rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
+        # Money side: plan sales are cash in on the sale date; services later paid from a plan are not cash again.
+        cust = " AND p.customer_id=%s" if customer_id is not None else ""
+        cargs = (customer_id,) if customer_id is not None else ()
+        plan_rows = [] if (therapist_id is not None or service_id is not None) else db.all(
+            f"""SELECT 'plan' AS kind, p.created_at AS at, c.name AS customer, p.name AS plan, p.plan_type,
+                       p.purchased_amount - COALESCE((SELECT SUM(x.amount) FROM plan_topups x WHERE x.plan_id=p.id),0)
+                         AS amount, COALESCE(p.price_paid,0) AS price_paid
+                FROM customer_plans p JOIN customers c ON c.id=p.customer_id
+                WHERE p.spa_id=%s AND p.created_at >= %s AND p.created_at < %s{cust}
+                UNION ALL
+                SELECT 'topup', x.created_at, c.name, p.name, p.plan_type, x.amount, COALESCE(x.price_paid,0)
+                FROM plan_topups x JOIN customer_plans p ON p.id=x.plan_id JOIN customers c ON c.id=p.customer_id
+                WHERE x.spa_id=%s AND x.created_at >= %s AND x.created_at < %s{cust}
+                ORDER BY 2""", (u["spa"], lo, hi, *cargs, u["spa"], lo, hi, *cargs))
+        plan_sales = sum((payroll.money(x["price_paid"]) for x in plan_rows), payroll.money(0))
+        by_plan = db.one(f"""SELECT COALESCE(SUM(a.price),0) AS v FROM appointments a
+                              WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s{who}
+                                AND EXISTS (SELECT 1 FROM plan_redemptions r
+                                            WHERE r.appointment_id=a.id AND r.reversed_at IS NULL)""", args)["v"]
+        paid_by_plan = payroll.money(by_plan)
+        # profit only makes sense for a whole month of the whole spa: payroll is monthly
+        pay = None
+        if month and not (date_from or date_to) and therapist_id is None and customer_id is None and service_id is None:
+            pay = sum((payroll.money(payroll.compute_payslip(db, t, month)["net_pay"]) for t in
+                       db.all("SELECT * FROM therapists WHERE spa_id=%s AND is_active", (u["spa"],))), payroll.money(0))
         return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
                 "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
+                "plan_sales": float(plan_sales), "paid_by_plan": float(paid_by_plan),
+                "collected": float(rev - paid_by_plan + plan_sales), "plan_lines": plan_rows,
+                "payroll": None if pay is None else float(pay),
+                "profit": None if pay is None else float(rev - paid_by_plan + plan_sales - pay),
                 "services_count": len(lines), "minutes": sum(r["duration_min"] for r in lines), "new_customers": new_c, "by_status": by_status,
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
                 "by_therapist": therapists, "lines": lines}
@@ -891,7 +936,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 r[key] = row["name"]
                 parts.append(re.sub(r"[^A-Za-z0-9_-]", "_", row["name"]))
         period = month or f"{r['from']}_to_{r['to']}"
-        return r, f"report_{period}_{'_'.join(parts) or 'all'}"
+        return r, payroll.file_name(user["spa_name"], "Revenue-Report", period, *parts)
 
     @app.get("/api/reports/summary/pdf")
     def summary_pdf(month: str | None = Query(None), therapist_id: int | None = Query(None),
@@ -902,6 +947,17 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
         return Response(payroll.report_pdf(r, user["spa_name"]), media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+
+    @app.get("/api/reports/summary/xlsx")
+    def summary_xlsx(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                     date_from: dt.date | None = Query(None, alias="from"),
+                     date_to: dt.date | None = Query(None, alias="to"),
+                     customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
+        """The same report as an Excel workbook (Summary, Services done, By therapist, Plan sales)."""
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        return Response(payroll.report_xlsx(r, user["spa_name"]),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
 
     @app.get("/api/reports/summary/csv")
     def summary_csv(month: str | None = Query(None), therapist_id: int | None = Query(None),
@@ -919,6 +975,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             w.writerow([when[:10], when[11:16], x["customer"], x["service"], x["therapist"], x["duration_min"],
                         f"{float(x['price']):.2f}"])
         w.writerow(["Total", "", "", "", "", r["minutes"], f"{r['revenue']:.2f}"])
+        if r["plan_lines"]:
+            w.writerow([])
+            w.writerow(["Date", "Time", "Customer", "Plan", "Kind", "Amount", "Paid"])
+            for x in r["plan_lines"]:
+                at = str(x["at"]).replace(" ", "T")
+                w.writerow([at[:10], at[11:16], x["customer"], x["plan"], "Top-up" if x["kind"] == "topup" else "New",
+                            f"{float(x['amount']):g} {'hrs' if x['plan_type'] == 'hours' else 'Rs'}",
+                            f"{float(x['price_paid']):.2f}"])
+            w.writerow(["Plan sales", "", "", "", "", "", f"{r['plan_sales']:.2f}"])
+        w.writerow(["Money collected", "", "", "", "", "", f"{r['collected']:.2f}"])
         return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 
@@ -1079,7 +1145,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         p = payslip_for(tid, month, u["spa"])
         name = re.sub(r"[^A-Za-z0-9_-]", "_", p["therapist"])
         return Response(payroll.payslip_pdf(p, u["spa_name"]), media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="payslip_{name}_{month}.pdf"'})
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="{payroll.file_name(u["spa_name"], "Payslip", name, month)}.pdf"'})
 
     @app.get("/api/health")
     def health():

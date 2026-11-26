@@ -219,8 +219,8 @@ class TestPayroll(Base):
         self.assertEqual(csv_.status_code, 200)
         text = csv_.content.decode("utf-8-sig").splitlines()
         self.assertEqual(text[0], "Date,Time,Customer,Service,Therapist,Minutes,Price")
-        self.assertEqual(len(text), 5)
-        self.assertTrue(text[-1].startswith("Total,,,,,") and text[-1].endswith(",4800.00"))
+        self.assertEqual(len(text), 6)
+        self.assertTrue(text[-2].startswith("Total,,,,,") and text[-2].endswith(",4800.00"))
         rep = self.c.get(f"/api/reports/summary?month=2026-11&therapist_id={t}", headers=self.h).json()
         self.assertEqual(rep["minutes"], sum(x["duration_min"] for x in rep["lines"]))
         self.assertEqual(rep["by_therapist"][0]["minutes"], rep["minutes"])
@@ -700,3 +700,27 @@ class TestPlanUpdates(Base):
         self.assertEqual((rep["sold_hours"], rep["topped_up_hours"], rep["topups"]), (8.0, 3.0, 1))
         self.assertEqual(self.post(f"/api/customers/{c}/plans/999/topup", amount=1).status_code, 404)
         self.assertEqual(self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=0).status_code, 422)
+
+
+class TestPlanRevenue(Base):
+    def test_plan_sale_is_revenue_and_plan_paid_service_is_not_counted_twice(self):
+        import datetime as d
+        t, s, c = self.seed()
+        self.post(f"/api/customers/{c}/plans", name="Wallet", plan_type="rupees", amount=5000)
+        pid = self.post(f"/api/customers/{c}/plans", name="5 hrs", plan_type="hours", amount=5, price_paid=6000).json()["id"]
+        self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=2, price_paid=2000)
+        day = d.date.today()
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at=f"{day}T10:00").json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed", "plan_type": "rupees"}, headers=self.h)
+        r = self.c.get(f"/api/reports/summary?month={day:%Y-%m}", headers=self.h).json()
+        self.assertEqual((r["revenue"], r["plan_sales"], r["paid_by_plan"], r["collected"]), (2000.0, 13000.0, 2000.0, 13000.0))
+        self.assertEqual(len(r["plan_lines"]), 3)
+        self.assertEqual(r["profit"], 13000.0 - r["payroll"])
+        self.assertTrue(self.c.get(f"/api/reports/summary/pdf?month={day:%Y-%m}", headers=self.h).content.startswith(b"%PDF"))
+        x = self.c.get(f"/api/reports/summary/xlsx?month={day:%Y-%m}", headers=self.h)
+        self.assertEqual(x.status_code, 200)
+        import io, openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(x.content))
+        self.assertEqual(wb.sheetnames, ["Summary", "Services done", "By therapist", "Plan sales"])
+        self.assertEqual(wb["Plan sales"].max_row, 5)

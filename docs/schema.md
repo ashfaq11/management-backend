@@ -106,12 +106,14 @@ Prepaid package owned by one customer in one spa. A balance is measured in hours
 | `expires_on` | date | yes |  | Optional last date on which this plan can be redeemed. |
 | `notes` | text | yes |  | Optional purchase or package notes. |
 | `created_at` | timestamp with time zone | no | `now()` | When the plan was added to the customer. |
+| `price_paid` | numeric(12,2) | yes |  | Money received when the plan was sold (INR); counted as revenue on the sale date. |
 
 **Constraints**
 
 - Check `customer_plans_check`: `CHECK (((balance >= (0)::numeric) AND (balance <= purchased_amount)))`
 - Check `customer_plans_name_check`: `CHECK ((length(btrim(name)) > 0))`
 - Check `customer_plans_plan_type_check`: `CHECK ((plan_type = ANY (ARRAY['hours'::text, 'rupees'::text])))`
+- Check `customer_plans_price_paid_check`: `CHECK ((price_paid >= (0)::numeric))`
 - Check `customer_plans_purchased_amount_check`: `CHECK ((purchased_amount > (0)::numeric))`
 - Foreign key `customer_plans_customer_id_fkey`: `FOREIGN KEY (customer_id) REFERENCES customers(id)`
 - Foreign key `customer_plans_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
@@ -194,10 +196,12 @@ Amounts added to an existing prepaid plan after it was sold.
 | `note` | text | yes |  | Optional note, e.g. payment details. |
 | `created_by` | bigint | yes |  | Login that added the top-up. |
 | `created_at` | timestamp with time zone | no | `now()` | When the top-up was added. |
+| `price_paid` | numeric(12,2) | yes |  | Money received for this top-up (INR); counted as revenue on the top-up date. |
 
 **Constraints**
 
 - Check `plan_topups_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `plan_topups_price_paid_check`: `CHECK ((price_paid >= (0)::numeric))`
 - Foreign key `plan_topups_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
 - Foreign key `plan_topups_plan_id_fkey`: `FOREIGN KEY (plan_id) REFERENCES customer_plans(id)`
 - Foreign key `plan_topups_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
