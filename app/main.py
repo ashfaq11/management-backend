@@ -883,7 +883,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def payments(received_on: dt.date | None = None, u=Depends(member)):
         """Payment and refund activity for the selected settlement day."""
         day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
-        return db.all("""SELECT * FROM (
+        return db.all("""SELECT activity.*, activity.activity_at AS received_at FROM (
                            SELECT 'payment'::text AS event_type, p.id AS id, p.id AS payment_id,
                                   p.appointment_id, p.customer_id, p.amount, p.method, p.reference, p.note,
                                   p.received_at AS activity_at, c.name AS customer, c.phone, a.start_at,
