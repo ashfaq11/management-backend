@@ -273,7 +273,6 @@ COMMENT ON COLUMN therapists.bank_account_number IS 'Salary account number';
 COMMENT ON COLUMN therapists.bank_ifsc IS 'Salary account IFSC';
 COMMENT ON COLUMN therapists.upi_id IS 'UPI ID for salary';
 
-
 -- ======== 006_customer_plans.sql ========
 -- Prepaid customer plans: one balance is either hours or INR, never both.
 CREATE TABLE customer_plans (
