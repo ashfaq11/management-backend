@@ -87,6 +87,15 @@ class AppointmentIn(BaseModel):
 
 class StatusIn(BaseModel):
     status: Status
+    plan_type: Optional[Literal["hours", "rupees"]] = None
+
+
+class CustomerPlanIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    plan_type: Literal["hours", "rupees"]
+    amount: float = Field(gt=0, le=1_000_000)
+    expires_on: Optional[dt.date] = None
+    notes: Optional[str] = Field(default=None, max_length=500)
 
 
 class OnboardIn(CustomerIn):
@@ -371,9 +380,23 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not c:
             raise HTTPException(404, "Customer not found")
         c["appointments"] = db.all(
-            """SELECT a.*, s.name AS service, t.name AS therapist FROM appointments a
+            """SELECT a.*, s.name AS service, t.name AS therapist,
+                      p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit,
+                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at
+               FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
-               WHERE a.customer_id=%s ORDER BY a.start_at DESC""", (cid,))
+               LEFT JOIN LATERAL (
+                   SELECT * FROM plan_redemptions x
+                   WHERE x.appointment_id=a.id AND x.spa_id=a.spa_id
+                   ORDER BY x.created_at DESC, x.id DESC LIMIT 1
+               ) r ON TRUE
+               LEFT JOIN customer_plans p ON p.id=r.plan_id
+               WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
+        c["plans"] = db.all(
+            """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
+                                      WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
+               FROM customer_plans p WHERE p.customer_id=%s AND p.spa_id=%s
+               ORDER BY p.created_at DESC, p.id DESC""", (cid, u["spa"]))
         return c
 
     @app.put("/api/customers/{cid}")
@@ -508,14 +531,63 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.patch("/api/appointments/{aid}/status")
     def set_status(aid: int, b: StatusIn, u=Depends(member)):
-        try:  # re-opening a cancelled slot someone else has since taken is refused by the constraint
-            n = db.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s AND spa_id=%s",
-                       (b.status, aid, u["spa"]))
+        try:
+            with db.tx() as t:
+                a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
+                if not a:
+                    raise HTTPException(404, "Appointment not found")
+                if a["status"] == b.status:
+                    return {"id": aid, "status": b.status, "plan_deduction": None}
+
+                deduction = None
+                if b.status == "completed" and b.plan_type:
+                    # Staff explicitly chooses hours or rupees; never auto-select a balance type.
+                    amount = (round(a["duration_min"] / 60.0, 2)
+                              if b.plan_type == "hours" else round(float(a["price"]), 2))
+                    plan = t.one(
+                        """SELECT * FROM customer_plans
+                           WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
+                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
+                           ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
+                        (a["customer_id"], u["spa"], b.plan_type, amount))
+                    if not plan:
+                        unit_label = "hours" if b.plan_type == "hours" else "rupees"
+                        raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
+                    t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
+                    t.insert(
+                        """INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit)
+                           VALUES(%s,%s,%s,%s,%s)""",
+                        (plan["id"], aid, u["spa"], amount, b.plan_type))
+                    remaining = round(float(plan["balance"]) - amount, 2)
+                    deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
+                                 "amount": amount, "unit": b.plan_type, "remaining_balance": remaining}
+                elif a["status"] == "completed":
+                    # Re-open/cancel a completed booking: refund its active package deduction.
+                    redemption = t.one(
+                        """SELECT r.*, p.name FROM plan_redemptions r
+                           JOIN customer_plans p ON p.id=r.plan_id
+                           WHERE r.appointment_id=%s AND r.spa_id=%s AND r.reversed_at IS NULL
+                           FOR UPDATE OF r, p""", (aid, u["spa"]))
+                    if redemption:
+                        t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s",
+                              (redemption["amount"], redemption["plan_id"]))
+                        t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (redemption["id"],))
+                t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s",
+                      (b.status, aid))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
-        if not n:
-            raise HTTPException(404, "Appointment not found")
-        return {"id": aid, "status": b.status}
+        return {"id": aid, "status": b.status, "plan_deduction": deduction}
+
+    @app.post("/api/customers/{cid}/plans", status_code=201)
+    def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(member)):
+        with db.tx() as t:
+            if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
+                raise HTTPException(404, "Customer not found")
+            pid = t.insert(
+                """INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes))
+        return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)

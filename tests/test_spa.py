@@ -492,3 +492,81 @@ class TestTherapistDetails(Base):
                                                     "upi_id": "asha@upi", "specialities": " "}, headers=self.h)
         row = next(t for t in self.c.get("/api/therapists", headers=self.h).json() if t["id"] == tid)
         self.assertEqual((row["upi_id"], row["specialities"]), ("asha@upi", None))
+
+
+class TestCustomerPlans(Base):
+    def make_appointment(self, therapist, service, customer, **extra):
+        body = dict(customer_id=customer, therapist_id=therapist, service_id=service,
+                    start_at="2026-11-20T10:00", **extra)
+        return self.post("/api/appointments", **body).json()["id"]
+
+    def add_plan(self, customer, **body):
+        return self.c.post(f"/api/customers/{customer}/plans", json=body, headers=self.h)
+
+    def complete(self, appointment, plan_type=None):
+        return self.c.patch(f"/api/appointments/{appointment}/status",
+                            json={"status": "completed", "plan_type": plan_type}, headers=self.h)
+
+    def customer(self, customer):
+        return self.c.get(f"/api/customers/{customer}", headers=self.h).json()
+
+    def test_hours_plan_deducted_only_when_completed(self):
+        t, s, c = self.seed()
+        plan = self.add_plan(c, name="10 hour package", plan_type="hours", amount=10)
+        self.assertEqual(plan.status_code, 201, plan.text)
+        a = self.make_appointment(t, s, c, duration_min=90)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 10.0)
+        done = self.complete(a, "hours")
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.json()["plan_deduction"]["amount"], 1.5)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 8.5)
+        self.assertEqual(self.customer(c)["appointments"][0]["plan_unit"], "hours")
+
+    def test_rupee_plan_deducts_agreed_appointment_price(self):
+        t, s, c = self.seed()
+        self.add_plan(c, name="Rs 5000 wallet", plan_type="rupees", amount=5000)
+        a = self.make_appointment(t, s, c, price=1250.50)
+        done = self.complete(a, "rupees")
+        self.assertEqual(done.json()["plan_deduction"]["amount"], 1250.5)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 3749.5)
+
+    def test_no_partial_deduction_when_plan_balance_is_insufficient(self):
+        t, s, c = self.seed()
+        self.add_plan(c, name="Small wallet", plan_type="rupees", amount=1000)
+        a = self.make_appointment(t, s, c, price=1250)
+        done = self.complete(a, "rupees")
+        self.assertEqual(done.status_code, 409, done.text)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 1000.0)
+
+    def test_completion_is_idempotent_and_reopening_refunds_plan(self):
+        t, s, c = self.seed()
+        self.add_plan(c, name="Hours", plan_type="hours", amount=4)
+        a = self.make_appointment(t, s, c, duration_min=60)
+        self.complete(a, "hours")
+        self.complete(a, "hours")
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 3.0)
+        reopened = self.c.patch(f"/api/appointments/{a}/status", json={"status": "cancelled"}, headers=self.h)
+        self.assertEqual(reopened.status_code, 200)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 4.0)
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed", "plan_type": "hours"}, headers=self.h)
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 3.0)
+
+    def test_expired_plan_is_not_redeemed(self):
+        t, s, c = self.seed()
+        self.add_plan(c, name="Expired", plan_type="hours", amount=5, expires_on="2020-01-01")
+        a = self.make_appointment(t, s, c)
+        done = self.complete(a, "hours")
+        self.assertIsNone(done.json()["plan_deduction"])
+        self.assertEqual(self.customer(c)["plans"][0]["balance"], 5.0)
+
+    def test_plan_is_tenant_scoped(self):
+        sa = self.c.post("/api/auth/login", json={"username": "superadmin", "password": "superadmin123"}).json()["token"]
+        sa_headers = {"Authorization": f"Bearer {sa}"}
+        _, _, c = self.seed()
+        r = self.c.post("/api/spas", json={"name": "Lotus", "admin_username": "lotus", "admin_password": "lotus12345"},
+                        headers=sa_headers)
+        spa2 = r.json()["id"]
+        tok = self.c.post("/api/auth/login", json={"username": "lotus", "password": "lotus12345"}).json()["token"]
+        h2 = {"Authorization": f"Bearer {tok}"}
+        self.assertEqual(self.c.post(f"/api/customers/{c}/plans",
+                         json={"name": "Wrong spa", "plan_type": "hours", "amount": 2}, headers=h2).status_code, 404)
