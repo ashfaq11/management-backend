@@ -881,16 +881,29 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.get("/api/payments")
     def payments(received_on: dt.date | None = None, u=Depends(member)):
+        """Payment and refund activity for the selected settlement day."""
         day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
-        return db.all("""SELECT p.id, p.appointment_id, p.customer_id, p.amount, p.method, p.reference, p.note,
-                                p.received_at, c.name AS customer, c.phone, a.start_at,
-                                COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
-                         FROM payments p JOIN customers c ON c.id=p.customer_id
-                         JOIN appointments a ON a.id=p.appointment_id
-                         LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
-                            WHERE payment_id=p.id AND spa_id=p.spa_id) r ON TRUE
-                         WHERE p.spa_id=%s AND p.received_at::date=%s ORDER BY p.received_at DESC,p.id DESC LIMIT 500""",
-                        (u["spa"], day))
+        return db.all("""SELECT * FROM (
+                           SELECT 'payment'::text AS event_type, p.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, p.amount, p.method, p.reference, p.note,
+                                  p.received_at AS activity_at, c.name AS customer, c.phone, a.start_at,
+                                  COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
+                           FROM payments p JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
+                              WHERE payment_id=p.id AND spa_id=p.spa_id) r ON TRUE
+                           WHERE p.spa_id=%s AND p.received_at::date=%s
+                           UNION ALL
+                           SELECT 'refund'::text AS event_type, r.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, r.amount, p.method, p.reference,
+                                  r.reason AS note, r.refunded_at AS activity_at, c.name AS customer, c.phone,
+                                  a.start_at, 0::numeric AS refunded_amount, -r.amount AS net_amount
+                           FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                           JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           WHERE r.spa_id=%s AND r.refunded_at::date=%s
+                         ) activity ORDER BY activity_at DESC, event_type DESC, id DESC LIMIT 1000""",
+                        (u["spa"], day, u["spa"], day))
 
     @app.post("/api/payments/{pid}/refunds", status_code=201)
     def refund_payment(pid: int, b: RefundIn, u=Depends(admin)):
