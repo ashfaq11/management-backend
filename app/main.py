@@ -455,6 +455,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.post("/api/shifts", status_code=201)
     def add_shift(b: ShiftIn, u=Depends(admin)):
+        if not b.name.strip():
+            raise HTTPException(422, "Shift name cannot be blank")
+        if b.start_time.tzinfo is not None or b.end_time.tzinfo is not None:
+            raise HTTPException(422, "Shift times must be local times without a timezone")
         if b.end_time <= b.start_time:
             raise HTTPException(422, "Shift end time must be later than start time")
         try:
@@ -466,6 +470,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.put("/api/shifts/{sid}")
     def edit_shift(sid: int, b: ShiftIn, u=Depends(admin)):
+        if not b.name.strip():
+            raise HTTPException(422, "Shift name cannot be blank")
+        if b.start_time.tzinfo is not None or b.end_time.tzinfo is not None:
+            raise HTTPException(422, "Shift times must be local times without a timezone")
         if b.end_time <= b.start_time:
             raise HTTPException(422, "Shift end time must be later than start time")
         try:
