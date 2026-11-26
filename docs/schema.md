@@ -20,6 +20,13 @@ erDiagram
   users ||--o{ plan_topups : has
   customer_plans ||--o{ plan_topups : has
   spas ||--o{ plan_topups : has
+  payments ||--o{ payment_refunds : has
+  users ||--o{ payment_refunds : has
+  spas ||--o{ payment_refunds : has
+  appointments ||--o{ payments : has
+  customers ||--o{ payments : has
+  users ||--o{ payments : has
+  spas ||--o{ payments : has
   spas ||--o{ services : has
   users ||--o{ sessions : has
   spas ||--o{ shifts : has
@@ -140,6 +147,7 @@ Spa clients, created by onboarding or by hand.
 | `created_at` | timestamp with time zone | no | `now()` | Onboarding time; the "new customers" report counts by it in the spa time zone. |
 | `updated_at` | timestamp with time zone | no | `now()` | Last edit. |
 | `spa_id` | bigint | no |  | The spa this customer belongs to; phone is unique within it (customers_phone_key). |
+| `preferred_payment_method` | text | yes |  | Optional default payment method preference; each payment records its actual method independently. |
 
 **Constraints**
 
