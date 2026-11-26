@@ -1,3 +1,5 @@
+import csv
+import io
 import datetime as dt
 import os
 import re
@@ -374,15 +376,37 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not MONTH.match(month):
             raise HTTPException(422, "month must be YYYY-MM")
 
+    def period(month: str | None, date_from: dt.date | None, date_to: dt.date | None):
+        """[lo, hi) for a report: a from/to date range (both days included) wins over the month."""
+        if date_from or date_to:
+            if not (date_from and date_to):
+                raise HTTPException(422, "give both from and to")
+            if date_to < date_from:
+                raise HTTPException(422, "to must not be before from")
+            if (date_to - date_from).days > 366:
+                raise HTTPException(422, "at most one year at a time")
+            return date_from, date_to + dt.timedelta(days=1)
+        if not month:
+            raise HTTPException(422, "give month (YYYY-MM) or from and to")
+        check_month(month)
+        return payroll.month_bounds(month)
+
     @app.get("/api/reports/summary")
-    def summary(month: str = Query(...), therapist_id: int | None = Query(None), _=Depends(admin)):
+    def summary(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
+                customer_id: int | None = Query(None), service_id: int | None = Query(None),
+                _=Depends(admin)):
         """The month's figures. Revenue counts COMPLETED appointments only, at the price agreed at booking.
         `lines` is every completed service (who, what, for whom, how much); `by_therapist` gives each
         therapist's count and amount with a per-service breakdown. `therapist_id` narrows everything but
         new_customers to one therapist."""
-        check_month(month)
-        lo, hi = payroll.month_bounds(month)
-        who, args = ("", (lo, hi)) if therapist_id is None else (" AND a.therapist_id = %s", (lo, hi, therapist_id))
+        lo, hi = period(month, date_from, date_to)
+        who, extra = "", []
+        for col, val in (("therapist_id", therapist_id), ("customer_id", customer_id), ("service_id", service_id)):
+            if val is not None:
+                who += f" AND a.{col} = %s"
+                extra.append(val)
+        args = (lo, hi, *extra)
         by_status = db.all(f"""SELECT a.status, COUNT(*) AS count, COALESCE(SUM(a.price),0) AS amount
                                FROM appointments a WHERE a.start_at >= %s AND a.start_at < %s{who}
                                GROUP BY a.status ORDER BY a.status""", args)
@@ -418,24 +442,53 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         # created_at is a timestamptz and the session zone is the spa's, so these are local calendar months
         new_c = db.one("SELECT COUNT(*) AS n FROM customers WHERE created_at >= %s AND created_at < %s", (lo, hi))["n"]
         rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
-        return {"month": month, "therapist_id": therapist_id, "revenue": float(rev),
+        return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
+                "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
                 "services_count": len(lines), "new_customers": new_c, "by_status": by_status,
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
                 "by_therapist": therapists, "lines": lines}
 
+    def report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user):
+        r = summary(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        parts = []
+        for key, table, val in (("therapist", "therapists", therapist_id), ("customer", "customers", customer_id),
+                                ("service", "services", service_id)):
+            if val is not None:
+                row = db.one(f"SELECT name FROM {table} WHERE id=%s", (val,))
+                if not row:
+                    raise HTTPException(404, f"{key.title()} not found")
+                r[key] = row["name"]
+                parts.append(re.sub(r"[^A-Za-z0-9_-]", "_", row["name"]))
+        period = month or f"{r['from']}_to_{r['to']}"
+        return r, f"report_{period}_{'_'.join(parts) or 'all'}"
+
     @app.get("/api/reports/summary/pdf")
-    def summary_pdf(month: str = Query(...), therapist_id: int | None = Query(None), user=Depends(admin)):
+    def summary_pdf(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                    date_from: dt.date | None = Query(None, alias="from"),
+                    date_to: dt.date | None = Query(None, alias="to"),
+                    customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
         """The same report as /api/reports/summary (same filters), as a PDF to download or print."""
-        r = summary(month, therapist_id, user)
-        label = "all-therapists"
-        if therapist_id is not None:
-            t = db.one("SELECT name FROM therapists WHERE id=%s", (therapist_id,))
-            if not t:
-                raise HTTPException(404, "Therapist not found")
-            r["therapist"] = t["name"]
-            label = re.sub(r"[^A-Za-z0-9_-]", "_", t["name"])
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
         return Response(payroll.report_pdf(r, business), media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="report_{month}_{label}.pdf"'})
+                        headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+
+    @app.get("/api/reports/summary/csv")
+    def summary_csv(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                    date_from: dt.date | None = Query(None, alias="from"),
+                    date_to: dt.date | None = Query(None, alias="to"),
+                    customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
+        """Every completed service in the report (same filters), one row each, for Excel. UTF-8 with BOM
+        so Excel shows names correctly."""
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Date", "Time", "Customer", "Service", "Therapist", "Price"])
+        for x in r["lines"]:
+            when = str(x["start_at"]).replace(" ", "T")
+            w.writerow([when[:10], when[11:16], x["customer"], x["service"], x["therapist"], f"{float(x['price']):.2f}"])
+        w.writerow(["Total", "", "", "", "", f"{r['revenue']:.2f}"])
+        return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 
     @app.get("/api/reports/incentives")
     def incentives(month: str = Query(...), _=Depends(admin)):

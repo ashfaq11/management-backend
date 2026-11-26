@@ -185,6 +185,22 @@ class TestPayroll(Base):
             self.assertTrue(pdf.content.startswith(b"%PDF"))
         self.assertIn("Meena", self.c.get(f"/api/reports/summary/pdf?month=2026-11&therapist_id={t2}",
                                           headers=self.h).headers["content-disposition"])
+        rng = self.c.get("/api/reports/summary?from=2026-11-12&to=2026-11-12", headers=self.h).json()
+        self.assertEqual((rng["revenue"], rng["from"], rng["to"]), (6800.0, "2026-11-12", "2026-11-12"))
+        self.assertEqual(self.c.get("/api/reports/summary?from=2026-11-13&to=2026-11-30", headers=self.h).json()["revenue"], 0.0)
+        self.assertEqual(self.c.get("/api/reports/summary?from=2026-11-13", headers=self.h).status_code, 422)
+        self.assertEqual(self.c.get("/api/reports/summary?from=2026-11-13&to=2026-11-01", headers=self.h).status_code, 422)
+        self.assertTrue(self.c.get("/api/reports/summary/pdf?from=2026-11-01&to=2026-11-15", headers=self.h).content.startswith(b"%PDF"))
+        by_svc = self.c.get(f"/api/reports/summary?month=2026-11&service_id={s2}", headers=self.h).json()
+        self.assertEqual((by_svc["revenue"], by_svc["services_count"]), (800.0, 1))
+        by_cust = self.c.get(f"/api/reports/summary?month=2026-11&customer_id={c}&therapist_id={t}", headers=self.h).json()
+        self.assertEqual(by_cust["services_count"], 3)
+        csv_ = self.c.get(f"/api/reports/summary/csv?month=2026-11&therapist_id={t}", headers=self.h)
+        self.assertEqual(csv_.status_code, 200)
+        text = csv_.content.decode("utf-8-sig").splitlines()
+        self.assertEqual(text[0], "Date,Time,Customer,Service,Therapist,Price")
+        self.assertEqual((len(text), text[-1]), (5, "Total,,,,,4800.00"))
+        self.assertIn("Asha", csv_.headers["content-disposition"])
         self.assertEqual(self.c.get("/api/reports/summary/pdf?month=2026-11&therapist_id=99999",
                                     headers=self.h).status_code, 404)
 

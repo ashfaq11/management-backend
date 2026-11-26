@@ -88,9 +88,13 @@ def report_pdf(r: dict, business: str) -> bytes:
 
     st = getSampleStyleSheet()
     buf = io.BytesIO()
-    y, m = r["month"].split("-")
-    label = f"{calendar.month_name[int(m)]} {y}"
+    if r.get("month"):
+        y, m = r["month"].split("-")
+        label = f"{calendar.month_name[int(m)]} {y}"
+    else:
+        label = f"{r['from']} to {r['to']}"
     who = r.get("therapist") or "All therapists"
+    more = [f"{k.title()}: <b>{r[k]}</b>" for k in ("customer", "service") if r.get(k)]
     doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Report {label} {who}")
     head = colors.HexColor("#2f5d50")
 
@@ -108,7 +112,7 @@ def report_pdf(r: dict, business: str) -> bytes:
         return f"{v:,.2f}"
 
     f = [Paragraph(business, st["Title"]), Paragraph(f"Revenue report - {label}", st["Heading2"]),
-         Paragraph(f"Therapist: <b>{who}</b>", st["Normal"]),
+         Paragraph(f"Therapist: <b>{who}</b>" + "".join(" &middot; " + m for m in more), st["Normal"]),
          Paragraph(f"Revenue (completed services): <b>Rs {amt(r['revenue'])}</b> from "
                    f"<b>{r['services_count']}</b> services", st["Normal"])]
     if r.get("therapist_id") is None:
