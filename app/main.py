@@ -742,7 +742,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id
                LEFT JOIN appointments ap ON ap.therapist_id=t.id AND ap.spa_id=a.spa_id
                     AND ap.start_at >= %s AND ap.start_at < %s
-                    AND ((EXTRACT(DOW FROM ap.start_at)::int + 6) %% 7)=a.day_of_week
+                    AND ((EXTRACT(DOW FROM ap.start_at)::int + 6) % 7)=a.day_of_week
                     AND ap.start_at::time >= sh.start_time AND ap.end_at::time <= sh.end_time
                WHERE a.spa_id=%s
                GROUP BY sh.id, sh.name, sh.start_time, sh.end_time, a.day_of_week, t.id, t.name
