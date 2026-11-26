@@ -1,6 +1,7 @@
 import csv
 import io
 import datetime as dt
+from decimal import Decimal
 import os
 import re
 from contextlib import asynccontextmanager
@@ -38,14 +39,14 @@ class CustomerIn(BaseModel):
 
 
 class PaymentIn(BaseModel):
-    amount: float = Field(gt=0, le=1_000_000)
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     method: Literal["cash", "upi", "card", "bank_transfer", "other"]
     reference: Optional[str] = Field(default=None, max_length=120)
     note: Optional[str] = Field(default=None, max_length=500)
 
 
 class RefundIn(BaseModel):
-    amount: float = Field(gt=0, le=1_000_000)
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     reason: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -947,6 +948,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
     def onboard(b: OnboardIn, u=Depends(member)):
+        if b.plan and u["role"] not in ("admin", "superadmin"):
+            raise HTTPException(403, "Only admins can add prepaid plans during onboarding")
         with db.tx() as t:  # a clashing first appointment rolls the new customer back too
             cid = insert_customer(t, b, u["spa"])
             aid = None
