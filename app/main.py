@@ -579,7 +579,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"id": aid, "status": b.status, "plan_deduction": deduction}
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
-    def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(member)):
+    def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
         with db.tx() as t:
             if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
                 raise HTTPException(404, "Customer not found")
@@ -770,10 +770,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
         activity = db.one(
             f"""SELECT
-                  COALESCE(SUM(amount) FILTER (WHERE unit='hours' AND created_at >= %s AND created_at < %s),0) AS deducted_hours,
-                  COALESCE(SUM(amount) FILTER (WHERE unit='rupees' AND created_at >= %s AND created_at < %s),0) AS deducted_rupees,
-                  COALESCE(SUM(amount) FILTER (WHERE unit='hours' AND reversed_at >= %s AND reversed_at < %s),0) AS reversed_hours,
-                  COALESCE(SUM(amount) FILTER (WHERE unit='rupees' AND reversed_at >= %s AND reversed_at < %s),0) AS reversed_rupees
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='hours' AND r.created_at >= %s AND r.created_at < %s),0) AS deducted_hours,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='rupees' AND r.created_at >= %s AND r.created_at < %s),0) AS deducted_rupees,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='hours' AND r.reversed_at >= %s AND r.reversed_at < %s),0) AS reversed_hours,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='rupees' AND r.reversed_at >= %s AND r.reversed_at < %s),0) AS reversed_rupees
                 FROM plan_redemptions r JOIN customer_plans p ON p.id=r.plan_id
                 WHERE r.spa_id=%s
                   AND ((r.created_at >= %s AND r.created_at < %s)
