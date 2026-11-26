@@ -512,8 +512,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 """INSERT INTO therapist_shift_assignments(spa_id,therapist_id,shift_id,day_of_week)
                    VALUES(%s,%s,%s,%s)
                    ON CONFLICT (spa_id,therapist_id,day_of_week)
-                   DO UPDATE SET shift_id=EXCLUDED.shift_id
-                   RETURNING id""",
+                   DO UPDATE SET shift_id=EXCLUDED.shift_id""",
                 (u["spa"], b.therapist_id, b.shift_id, b.day_of_week))
         return {"id": aid}
 
@@ -649,7 +648,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 if a["status"] == b.status:
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
-                deduction = None
+                deduction = plan = has_active = None
                 if b.status == "completed" and b.plan_type:
                     # Staff explicitly chooses hours or rupees; never auto-select a balance type.
                     amount = (round(a["duration_min"] / 60.0, 2)
@@ -660,6 +659,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
                            ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
                         (a["customer_id"], u["spa"], b.plan_type, amount))
+                    has_active = plan or t.one(
+                        """SELECT 1 FROM customer_plans WHERE customer_id=%s AND spa_id=%s AND plan_type=%s
+                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)""",
+                        (a["customer_id"], u["spa"], b.plan_type))
+                if b.status == "completed" and b.plan_type and has_active:
                     if not plan:
                         unit_label = "hours" if b.plan_type == "hours" else "rupees"
                         raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
@@ -755,7 +759,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id
                 LEFT JOIN appointments ap ON ap.therapist_id=t.id AND ap.spa_id=a.spa_id
                      AND ap.start_at >= %s AND ap.start_at < %s
-                     AND ((EXTRACT(DOW FROM ap.start_at)::int + 6) % 7)=a.day_of_week
+                     AND ((EXTRACT(DOW FROM ap.start_at)::int + 6) %% 7)=a.day_of_week
                      AND ap.start_at::time >= sh.start_time AND (ap.start_at + make_interval(mins => ap.duration_min))::time <= sh.end_time
                 WHERE a.spa_id=%s{therapist_filter}
                 GROUP BY sh.id, sh.name, sh.start_time, sh.end_time, sh.is_active,

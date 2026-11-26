@@ -11,13 +11,22 @@ erDiagram
   services ||--o{ appointments : has
   spas ||--o{ appointments : has
   therapists ||--o{ appointments : has
+  customers ||--o{ customer_plans : has
+  spas ||--o{ customer_plans : has
   spas ||--o{ customers : has
+  appointments ||--o{ plan_redemptions : has
+  customer_plans ||--o{ plan_redemptions : has
+  spas ||--o{ plan_redemptions : has
   spas ||--o{ services : has
   users ||--o{ sessions : has
+  spas ||--o{ shifts : has
   appointments ||--o{ therapist_bonuses : has
   users ||--o{ therapist_bonuses : has
   spas ||--o{ therapist_bonuses : has
   therapists ||--o{ therapist_bonuses : has
+  shifts ||--o{ therapist_shift_assignments : has
+  spas ||--o{ therapist_shift_assignments : has
+  therapists ||--o{ therapist_shift_assignments : has
   spas ||--o{ therapists : has
   spas ||--o{ users : has
 ```
@@ -25,11 +34,15 @@ erDiagram
 | Table | Purpose |
 |---|---|
 | [`appointments`](#appointments) | One booking of one customer with one therapist for one service. Completed appointments drive revenue and incentive. |
+| [`customer_plans`](#customer_plans) | Prepaid package owned by one customer in one spa. A balance is measured in hours or INR. |
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
+| [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
+| [`shifts`](#shifts) | Reusable daily work-time window for a spa. |
 | [`spas`](#spas) | Each spa (business) using the system. Its admins and staff see only its data; a superadmin sees every spa. |
 | [`therapist_bonuses`](#therapist_bonuses) | Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive. |
+| [`therapist_shift_assignments`](#therapist_shift_assignments) | Weekly therapist roster; one shift per weekday. Monday=0 through Sunday=6. |
 | [`therapists`](#therapists) | Staff who perform services and are paid on payslips. Never deleted, only set inactive, so past payslips stay reproducible. |
 | [`users`](#users) | Staff logins. Role admin = everything; staff = customers, onboarding, appointments. |
 
@@ -73,6 +86,37 @@ One booking of one customer with one therapist for one service. Completed appoin
 - `appointments_start_idx`: `CREATE INDEX appointments_start_idx ON appointments USING btree (start_at)`
 - `appointments_therapist_idx`: `CREATE INDEX appointments_therapist_idx ON appointments USING btree (therapist_id, start_at)`
 
+## customer_plans
+
+Prepaid package owned by one customer in one spa. A balance is measured in hours or INR.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `customer_id` | bigint | no |  | Customer who purchased this plan. |
+| `spa_id` | bigint | no |  | Owning spa; must match the customer and appointment. |
+| `name` | text | no |  | Display name of the prepaid package. |
+| `plan_type` | text | no |  | Balance unit: hours for service time, or rupees for service value. |
+| `purchased_amount` | numeric(12,2) | no |  | Original amount purchased, in the plan unit. |
+| `balance` | numeric(12,2) | no |  | Remaining amount, in the plan unit; reduced only when an appointment is completed. |
+| `expires_on` | date | yes |  | Optional last date on which this plan can be redeemed. |
+| `notes` | text | yes |  | Optional purchase or package notes. |
+| `created_at` | timestamp with time zone | no | `now()` | When the plan was added to the customer. |
+
+**Constraints**
+
+- Check `customer_plans_check`: `CHECK (((balance >= (0)::numeric) AND (balance <= purchased_amount)))`
+- Check `customer_plans_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `customer_plans_plan_type_check`: `CHECK ((plan_type = ANY (ARRAY['hours'::text, 'rupees'::text])))`
+- Check `customer_plans_purchased_amount_check`: `CHECK ((purchased_amount > (0)::numeric))`
+- Foreign key `customer_plans_customer_id_fkey`: `FOREIGN KEY (customer_id) REFERENCES customers(id)`
+- Foreign key `customer_plans_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `customer_plans_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `customer_plans_customer_idx`: `CREATE INDEX customer_plans_customer_idx ON customer_plans USING btree (spa_id, customer_id, created_at)`
+
 ## customers
 
 Spa clients, created by onboarding or by hand.
@@ -103,6 +147,35 @@ Spa clients, created by onboarding or by hand.
 - `customers_name_idx`: `CREATE INDEX customers_name_idx ON customers USING btree (lower(name))`
 - `customers_phone_key`: `CREATE UNIQUE INDEX customers_phone_key ON customers USING btree (spa_id, phone)`
 - `customers_spa_idx`: `CREATE INDEX customers_spa_idx ON customers USING btree (spa_id, lower(name))`
+
+## plan_redemptions
+
+Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `plan_id` | bigint | no |  | The prepaid plan that paid for the appointment. |
+| `appointment_id` | bigint | no |  | The completed appointment; only one active plan deduction per appointment. |
+| `spa_id` | bigint | no |  | Owning spa for tenant isolation. |
+| `amount` | numeric(12,2) | no |  | Amount deducted in the unit recorded alongside it. |
+| `unit` | text | no |  | hours or rupees, matching the plan type. |
+| `created_at` | timestamp with time zone | no | `now()` | When the appointment consumed the plan. |
+| `reversed_at` | timestamp with time zone | yes |  | When a deduction was reversed because the appointment left completed status. |
+
+**Constraints**
+
+- Check `plan_redemptions_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `plan_redemptions_unit_check`: `CHECK ((unit = ANY (ARRAY['hours'::text, 'rupees'::text])))`
+- Foreign key `plan_redemptions_appointment_id_fkey`: `FOREIGN KEY (appointment_id) REFERENCES appointments(id)`
+- Foreign key `plan_redemptions_plan_id_fkey`: `FOREIGN KEY (plan_id) REFERENCES customer_plans(id)`
+- Foreign key `plan_redemptions_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `plan_redemptions_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `plan_redemptions_one_active_appointment`: `CREATE UNIQUE INDEX plan_redemptions_one_active_appointment ON plan_redemptions USING btree (appointment_id) WHERE (reversed_at IS NULL)`
+- `plan_redemptions_plan_idx`: `CREATE INDEX plan_redemptions_plan_idx ON plan_redemptions USING btree (plan_id, created_at)`
 
 ## services
 
@@ -149,6 +222,31 @@ Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token 
 
 - `sessions_expires_idx`: `CREATE INDEX sessions_expires_idx ON sessions USING btree (expires_at)`
 - `sessions_user_idx`: `CREATE INDEX sessions_user_idx ON sessions USING btree (user_id)`
+
+## shifts
+
+Reusable daily work-time window for a spa.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa; shift templates are tenant-scoped. |
+| `name` | text | no |  | Display name of the reusable work-time window. |
+| `start_time` | time without time zone | no |  | Local shift start time; shifts do not cross midnight. |
+| `end_time` | time without time zone | no |  | Local shift end time; must be later than start_time. |
+| `is_active` | boolean | no | `true` | Inactive shifts cannot be assigned to therapists. |
+| `created_at` | timestamp with time zone | no | `now()` | When the shift template was created. |
+
+**Constraints**
+
+- Check `shifts_check`: `CHECK ((start_time < end_time))`
+- Check `shifts_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Foreign key `shifts_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `shifts_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `shifts_spa_name_idx`: `CREATE UNIQUE INDEX shifts_spa_name_idx ON shifts USING btree (spa_id, lower(name))`
 
 ## spas
 
@@ -199,6 +297,33 @@ Extra incentives for a therapist on a date, added to that month's payslip on top
 
 - `therapist_bonuses_spa_idx`: `CREATE INDEX therapist_bonuses_spa_idx ON therapist_bonuses USING btree (spa_id, on_date)`
 - `therapist_bonuses_therapist_idx`: `CREATE INDEX therapist_bonuses_therapist_idx ON therapist_bonuses USING btree (therapist_id, on_date)`
+
+## therapist_shift_assignments
+
+Weekly therapist roster; one shift per weekday. Monday=0 through Sunday=6.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa; must match the therapist and shift. |
+| `therapist_id` | bigint | no |  | Therapist assigned to this weekly shift. |
+| `shift_id` | bigint | no |  | Reusable shift template assigned for this weekday. |
+| `day_of_week` | smallint | no |  | ISO weekday number: Monday 0, Tuesday 1, ..., Sunday 6. |
+| `created_at` | timestamp with time zone | no | `now()` | When the weekly assignment was created. |
+
+**Constraints**
+
+- Check `therapist_shift_assignments_day_of_week_check`: `CHECK (((day_of_week >= 0) AND (day_of_week <= 6)))`
+- Foreign key `therapist_shift_assignments_shift_id_fkey`: `FOREIGN KEY (shift_id) REFERENCES shifts(id)`
+- Foreign key `therapist_shift_assignments_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Foreign key `therapist_shift_assignments_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
+- Primary key `therapist_shift_assignments_pkey`: `PRIMARY KEY (id)`
+- Unique `therapist_shift_assignments_spa_id_therapist_id_day_of_week_key`: `UNIQUE (spa_id, therapist_id, day_of_week)`
+
+**Indexes**
+
+- `therapist_shift_assignments_spa_id_therapist_id_day_of_week_key`: `CREATE UNIQUE INDEX therapist_shift_assignments_spa_id_therapist_id_day_of_week_key ON therapist_shift_assignments USING btree (spa_id, therapist_id, day_of_week)`
+- `therapist_shift_assignments_therapist_idx`: `CREATE INDEX therapist_shift_assignments_therapist_idx ON therapist_shift_assignments USING btree (spa_id, therapist_id, day_of_week)`
 
 ## therapists
 
