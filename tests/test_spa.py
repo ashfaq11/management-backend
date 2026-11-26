@@ -745,6 +745,19 @@ class TestPriorityOneOperations(Base):
         self.assertIn("collections", body)
         self.assertIn("therapists_on_shift", body)
         self.assertIn("upcoming", body)
+        self.assertEqual(len(body["monthly"]), 6)
+        self.assertTrue(all({"month","completed","revenue","new_customers"} <= set(x) for x in body["monthly"]))
+
+    def test_staff_cannot_add_prepaid_plan_during_onboarding(self):
+        self.post("/api/users", username="planstaff", password="planstaff1", role="staff")
+        token = self.c.post("/api/auth/login", json={"username":"planstaff","password":"planstaff1"}).json()["token"]
+        h = {"Authorization": f"Bearer {token}"}
+        response = self.c.post("/api/onboarding", headers=h, json={
+            "name":"Staff attempt","phone":"9991000010",
+            "plan":{"name":"Hidden wallet","plan_type":"hours","amount":5}
+        })
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(self.c.get("/api/customers?q=9991000010",headers=self.h).json(), [])
 
     def test_partial_payments_and_refund_respect_outstanding_balance(self):
         t, s, c = self.seed()
@@ -760,6 +773,9 @@ class TestPriorityOneOperations(Base):
         over = self.c.post(f"/api/appointments/{a}/payments",
                            json={"amount": 1, "method": "cash"}, headers=self.h)
         self.assertEqual(over.status_code, 409)
+        fractional_cent = self.c.post(f"/api/appointments/{a}/payments",
+                                      json={"amount": 0.001, "method": "cash"}, headers=self.h)
+        self.assertEqual(fractional_cent.status_code, 422)
 
         refund = self.c.post(f"/api/payments/{first.json()['id']}/refunds",
                              json={"amount": 100, "reason": "Customer overpayment"}, headers=self.h)
@@ -808,3 +824,22 @@ class TestPriorityOneOperations(Base):
         receipt = self.c.get(f"/api/payments/{payment['id']}/receipt", headers=self.h)
         self.assertEqual(receipt.status_code, 200)
         self.assertEqual(receipt.headers["content-type"], "application/pdf")
+
+
+    def test_paid_amount_cannot_exceed_new_appointment_price(self):
+        t, s, c = self.seed()
+        a = self.booking(t,s,c,"2026-11-20T10:00").json()["id"]
+        payment = self.c.post(f"/api/appointments/{a}/payments",
+                              json={"amount":500,"method":"cash"},headers=self.h)
+        self.assertEqual(payment.status_code,201,payment.text)
+        update = self.c.put(f"/api/appointments/{a}",headers=self.h,json={
+            "customer_id":c,"therapist_id":t,"service_id":s,
+            "start_at":"2026-11-20T10:00","price":400
+        })
+        self.assertEqual(update.status_code,409,update.text)
+
+    def test_customer_payment_preference_defaults_to_none(self):
+        response=self.post("/api/customers",name="No preference",phone="9991000011")
+        self.assertEqual(response.status_code,201,response.text)
+        detail=self.c.get(f"/api/customers/{response.json()['id']}",headers=self.h).json()
+        self.assertIsNone(detail["preferred_payment_method"])
