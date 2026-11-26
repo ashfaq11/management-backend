@@ -68,6 +68,19 @@ def details(b) -> tuple:
     return tuple((v.strip() or None) if isinstance(v, str) else v for v in (getattr(b, n) for n in THERAPIST_DETAILS))
 
 
+class ShiftIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    start_time: dt.time
+    end_time: dt.time
+    is_active: bool = True
+
+
+class ShiftAssignmentIn(BaseModel):
+    therapist_id: int
+    shift_id: int
+    day_of_week: int = Field(ge=0, le=6)  # Monday=0 through Sunday=6
+
+
 class ServiceIn(BaseModel):
     name: str = Field(min_length=1)
     price: float = Field(ge=0)
@@ -435,6 +448,74 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Therapist not found")
         return {"id": tid}
 
+    # ---- weekly therapist shifts (admin-managed) -------------------------
+    @app.get("/api/shifts")
+    def shifts(u=Depends(member)):
+        return db.all("SELECT * FROM shifts WHERE spa_id=%s ORDER BY start_time, lower(name)", (u["spa"],))
+
+    @app.post("/api/shifts", status_code=201)
+    def add_shift(b: ShiftIn, u=Depends(admin)):
+        if b.end_time <= b.start_time:
+            raise HTTPException(422, "Shift end time must be later than start time")
+        try:
+            return {"id": db.insert(
+                "INSERT INTO shifts(spa_id,name,start_time,end_time,is_active) VALUES(%s,%s,%s,%s,%s)",
+                (u["spa"], b.name.strip(), b.start_time, b.end_time, b.is_active))}
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, "A shift with this name already exists")
+
+    @app.put("/api/shifts/{sid}")
+    def edit_shift(sid: int, b: ShiftIn, u=Depends(admin)):
+        if b.end_time <= b.start_time:
+            raise HTTPException(422, "Shift end time must be later than start time")
+        try:
+            n = db.run(
+                "UPDATE shifts SET name=%s,start_time=%s,end_time=%s,is_active=%s WHERE id=%s AND spa_id=%s",
+                (b.name.strip(), b.start_time, b.end_time, b.is_active, sid, u["spa"]))
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, "A shift with this name already exists")
+        if not n:
+            raise HTTPException(404, "Shift not found")
+        return {"id": sid}
+
+    @app.get("/api/shift-assignments")
+    def shift_assignments(therapist_id: int | None = Query(None), u=Depends(member)):
+        sql = """SELECT a.id, a.therapist_id, t.name AS therapist, a.shift_id, s.name AS shift_name,
+                        s.start_time, s.end_time, s.is_active AS shift_is_active, a.day_of_week
+                 FROM therapist_shift_assignments a
+                 JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id
+                 JOIN shifts s ON s.id=a.shift_id AND s.spa_id=a.spa_id
+                 WHERE a.spa_id=%s"""
+        args: list = [u["spa"]]
+        if therapist_id is not None:
+            sql += " AND a.therapist_id=%s"; args.append(therapist_id)
+        return db.all(sql + " ORDER BY t.name, a.day_of_week", args)
+
+    @app.post("/api/shift-assignments", status_code=201)
+    def assign_shift(b: ShiftAssignmentIn, u=Depends(admin)):
+        with db.tx() as t:
+            if not t.one("SELECT 1 FROM therapists WHERE id=%s AND spa_id=%s",
+                         (b.therapist_id, u["spa"])):
+                raise HTTPException(404, "Therapist not found")
+            if not t.one("SELECT 1 FROM shifts WHERE id=%s AND spa_id=%s AND is_active",
+                         (b.shift_id, u["spa"])):
+                raise HTTPException(404, "Active shift not found")
+            aid = t.insert(
+                """INSERT INTO therapist_shift_assignments(spa_id,therapist_id,shift_id,day_of_week)
+                   VALUES(%s,%s,%s,%s)
+                   ON CONFLICT (spa_id,therapist_id,day_of_week)
+                   DO UPDATE SET shift_id=EXCLUDED.shift_id
+                   RETURNING id""",
+                (u["spa"], b.therapist_id, b.shift_id, b.day_of_week))
+        return {"id": aid}
+
+    @app.delete("/api/shift-assignments/{aid}", status_code=204)
+    def remove_shift_assignment(aid: int, u=Depends(admin)):
+        if not db.run("DELETE FROM therapist_shift_assignments WHERE id=%s AND spa_id=%s",
+                      (aid, u["spa"])):
+            raise HTTPException(404, "Shift assignment not found")
+        return Response(status_code=204)
+
     @app.get("/api/services")
     def services(u=Depends(member)):
         return db.all("SELECT * FROM services WHERE spa_id=%s ORDER BY lower(name)", (u["spa"],))
@@ -473,6 +554,27 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         sv = t.one("SELECT * FROM services WHERE id=%s AND spa_id=%s AND is_active", (b.service_id, spa))
         if not th or not sv:
             raise HTTPException(404, "Therapist or service not found (or inactive)")
+
+        # Once a weekly roster exists, the date must have an active shift and the
+        # full appointment (including its duration override) must fit within it.
+        has_roster = t.one(
+            "SELECT 1 FROM therapist_shift_assignments WHERE spa_id=%s AND therapist_id=%s LIMIT 1",
+            (spa, th["id"]))
+        if has_roster:
+            assignment = t.one(
+                """SELECT s.start_time, s.end_time, s.name FROM therapist_shift_assignments a
+                   JOIN shifts s ON s.id=a.shift_id AND s.spa_id=a.spa_id
+                   WHERE a.spa_id=%s AND a.therapist_id=%s AND a.day_of_week=%s AND s.is_active""",
+                (spa, th["id"], start.weekday()))
+            if not assignment:
+                raise HTTPException(409, "Therapist is not assigned to a shift on this weekday")
+            duration = b.duration_min or sv["duration_min"]
+            finish = start + dt.timedelta(minutes=duration)
+            if (start.date() != finish.date() or start.time() < assignment["start_time"]
+                    or finish.time() > assignment["end_time"]):
+                raise HTTPException(
+                    409, f"Appointment must fit within {assignment['name']} "
+                         f"({assignment['start_time']:%H:%M}-{assignment['end_time']:%H:%M})")
         return th, sv, start
 
     def insert_appointment(t, b: AppointmentIn, spa: int) -> int:
@@ -618,6 +720,56 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(422, "give month (YYYY-MM) or from and to")
         check_month(month)
         return payroll.month_bounds(month)
+
+    @app.get("/api/reports/shifts")
+    def shift_report(month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                     date_to: dt.date | None = Query(None, alias="to"),
+                     therapist_id: int | None = Query(None), u=Depends(admin)):
+        """Weekly roster plus appointment and completed-work statistics for the chosen period."""
+        lo, hi = period(month, date_from, date_to)
+        therapist_filter = " AND t.id=%s" if therapist_id is not None else ""
+        args: list = [lo, hi, u["spa"]]
+        if therapist_id is not None:
+            args.append(therapist_id)
+        rows = db.all(
+            f"""SELECT sh.id AS shift_id, sh.name AS shift_name, sh.start_time, sh.end_time,
+                       sh.is_active AS shift_is_active, a.day_of_week,
+                       CASE a.day_of_week WHEN 0 THEN 'Monday' WHEN 1 THEN 'Tuesday'
+                            WHEN 2 THEN 'Wednesday' WHEN 3 THEN 'Thursday'
+                            WHEN 4 THEN 'Friday' WHEN 5 THEN 'Saturday' ELSE 'Sunday' END AS day_name,
+                       t.id AS therapist_id, t.name AS therapist,
+                       COUNT(ap.id) FILTER (WHERE ap.status IN ('booked','completed')) AS appointment_count,
+                       COUNT(ap.id) FILTER (WHERE ap.status='completed') AS completed_count,
+                       COALESCE(SUM(ap.duration_min) FILTER (WHERE ap.status='completed'),0) AS completed_minutes,
+                       COALESCE(SUM(ap.price) FILTER (WHERE ap.status='completed'),0) AS completed_revenue
+                FROM therapist_shift_assignments a
+                JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id
+                JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id
+                LEFT JOIN appointments ap ON ap.therapist_id=t.id AND ap.spa_id=a.spa_id
+                     AND ap.start_at >= %s AND ap.start_at < %s
+                     AND ((EXTRACT(DOW FROM ap.start_at)::int + 6) % 7)=a.day_of_week
+                     AND ap.start_at::time >= sh.start_time AND (ap.start_at + make_interval(mins => ap.duration_min))::time <= sh.end_time
+                WHERE a.spa_id=%s{therapist_filter}
+                GROUP BY sh.id, sh.name, sh.start_time, sh.end_time, sh.is_active,
+                         a.day_of_week, t.id, t.name
+                ORDER BY sh.start_time, sh.name, a.day_of_week, t.name""",
+            tuple(args))
+        templates = db.all(
+            "SELECT id, name, start_time, end_time, is_active FROM shifts WHERE spa_id=%s ORDER BY start_time,name",
+            (u["spa"],))
+        return {
+            "month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
+            "shifts": templates, "assignments": rows,
+            "summary": {
+                "shift_templates": len(templates),
+                "assigned_therapists": len({x["therapist_id"] for x in rows}),
+                "shift_assignments": len(rows),
+                "appointments": sum(int(x["appointment_count"] or 0) for x in rows),
+                "completed": sum(int(x["completed_count"] or 0) for x in rows),
+                "completed_minutes": sum(int(x["completed_minutes"] or 0) for x in rows),
+                "completed_revenue": round(sum(float(x["completed_revenue"] or 0) for x in rows), 2),
+            },
+        }
 
     @app.get("/api/reports/summary")
     def summary(month: str | None = Query(None), therapist_id: int | None = Query(None),
