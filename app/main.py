@@ -703,7 +703,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                  AND start_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
                                GROUP BY 1),
                              customers_month AS (
-                               SELECT date_trunc('month',created_at) AS m, COUNT(*) AS new_customers
+                               SELECT date_trunc('month',created_at AT TIME ZONE current_setting('TimeZone')) AS m, COUNT(*) AS new_customers
                                FROM customers WHERE spa_id=%s AND created_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
                                  AND created_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
                                GROUP BY 1)
@@ -756,6 +756,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
             # the same rule for the length
             minutes = b.duration_min or (sv["duration_min"] if sv["id"] != a["service_id"] else a["duration_min"])
+            collected = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                  WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS paid
+                                  FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""", (aid,u["spa"]))["paid"]
+            if float(collected) - float(price) > 0.005:
+                raise HTTPException(409, "Refund the excess payment before reducing this appointment price")
             try:
                 t.run("""UPDATE appointments SET customer_id=%s,therapist_id=%s,service_id=%s,start_at=%s,
                          duration_min=%s,price=%s,notes=%s,updated_at=now() WHERE id=%s""",
