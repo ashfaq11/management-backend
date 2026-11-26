@@ -1056,12 +1056,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
     def onboard(b: OnboardIn, u=Depends(member)):
-        with db.tx() as t:  # a clashing first appointment rolls the new customer back too
+        if b.plan and u["role"] not in ("admin", "superadmin"):
+            raise HTTPException(403, "Only admins can add prepaid plans during onboarding")
+        with db.tx() as t:  # customer, first appointment and optional plan either all commit or all roll back
             cid = insert_customer(t, b, u["spa"])
             aid = None
             if b.first_appointment:
                 aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
-        return {"customer_id": cid, "appointment_id": aid}
+            pid = None
+            if b.plan:
+                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid)
+                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
+                                b.plan.expires_on, b.plan.notes, paid_for(b.plan.plan_type,b.plan.amount,b.plan.price_paid)))
+        return {"customer_id": cid, "appointment_id": aid, "plan_id": pid}
 
     # ---- reports & payroll (admin) --------------------------------------
     def check_month(month: str):
