@@ -692,6 +692,27 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         customers_today = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s AND created_at::date=CURRENT_DATE",
                                  (u["spa"],))["n"]
         total_customers = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s", (u["spa"],))["n"]
+        monthly = db.all("""WITH months AS (
+                               SELECT generate_series(date_trunc('month',CURRENT_DATE)-interval '5 months',
+                                                      date_trunc('month',CURRENT_DATE),interval '1 month') AS m),
+                             visits AS (
+                               SELECT date_trunc('month',start_at) AS m,
+                                      COUNT(*) FILTER (WHERE status='completed') AS completed,
+                                      COALESCE(SUM(price) FILTER (WHERE status='completed'),0) AS revenue
+                               FROM appointments WHERE spa_id=%s AND start_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND start_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1),
+                             customers_month AS (
+                               SELECT date_trunc('month',created_at) AS m, COUNT(*) AS new_customers
+                               FROM customers WHERE spa_id=%s AND created_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND created_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1)
+                             SELECT to_char(months.m,'YYYY-MM') AS month,
+                                    COALESCE(visits.completed,0) AS completed,
+                                    COALESCE(visits.revenue,0) AS revenue,
+                                    COALESCE(customers_month.new_customers,0) AS new_customers
+                             FROM months LEFT JOIN visits USING(m) LEFT JOIN customers_month USING(m)
+                             ORDER BY months.m""", (u["spa"],u["spa"]))
         upcoming = db.all("""SELECT a.id, a.start_at, a.duration_min, a.price, a.status,
                                     c.name AS customer, c.phone, s.name AS service, t.name AS therapist,
                                     COALESCE(pay.paid_amount,0) AS paid_amount,
@@ -714,7 +735,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 "collections": {"gross": float(collections["gross"]), "refunds": float(collections["refunds"]),
                                 "net": float(collections["gross"]-collections["refunds"])},
                 "customers_today": customers_today, "total_customers": total_customers,
-                "therapists_on_shift": on_shift, "upcoming": upcoming}
+                "therapists_on_shift": on_shift, "monthly": monthly, "upcoming": upcoming}
 
     @app.post("/api/appointments", status_code=201)
     def add_appointment(b: AppointmentIn, u=Depends(member)):
