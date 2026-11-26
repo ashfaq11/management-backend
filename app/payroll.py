@@ -74,7 +74,7 @@ def period_label(month: str | None, date_from: str | None = None, date_to: str |
 class _Pdf:
     """The house style for every PDF: a sage header band with the spa name, title, period and generated
     time; KPI tiles; striped tables; and a footer with page numbers."""
-    ACC, GOLD, INK, MUT, LINE, SOFT = "#2f5d50", "#b8915a", "#1f2a27", "#6c7a75", "#e6e1d7", "#f5f2ec"
+    ACC, GOLD, INK, MUT, LINE, SOFT = "#0e6e6a", "#b7791f", "#0f1c2e", "#5b6b7f", "#e3e8ee", "#f4f6f8"
 
     def __init__(self, business: str, title: str, period: str, subtitle: str = ""):
         from reportlab.lib import colors
@@ -156,9 +156,9 @@ class _Pdf:
                  ("ALIGN", (-numeric, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]
         for i in range(1, len(rows)):
             if i % 2 == 0:
-                style.append(("BACKGROUND", (0, i), (-1, i), c.HexColor("#fafaf7")))
+                style.append(("BACKGROUND", (0, i), (-1, i), c.HexColor("#f8fafc")))
         for i in bold_rows:
-            style += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("BACKGROUND", (0, i), (-1, i), c.HexColor("#e4efe9"))]
+            style += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("BACKGROUND", (0, i), (-1, i), c.HexColor("#e3f3f1"))]
         if total:
             style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), c.HexColor(self.SOFT)),
                       ("LINEABOVE", (0, -1), (-1, -1), 1, c.HexColor(self.ACC))]
@@ -271,7 +271,7 @@ def report_xlsx(r: dict, business: str) -> bytes:
 
     wb = Workbook()
     head = Font(bold=True, color="FFFFFF")
-    fill = PatternFill("solid", fgColor="2F5D50")
+    fill = PatternFill("solid", fgColor="0E6E6A")
     money = "#,##0.00"
 
     def sheet(ws, title, header, rows, money_cols=(), total=None):
