@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import threading
 import unittest
 import uuid
@@ -9,6 +11,10 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 
 DSN = os.environ.get("TEST_PG_DSN")  # e.g. postgresql://spa:spa@localhost:5432/spa (needs CREATE SCHEMA rights)
+
+
+def spa_today() -> str:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
 
 
 @unittest.skipUnless(DSN, "set TEST_PG_DSN to run the tests against a Postgres database")
@@ -663,13 +669,14 @@ class TestCustomerPlans(Base):
         report = self.c.get("/api/reports/plans?month=2026-11", headers=headers)
         self.assertEqual(report.status_code, 403)
 
-    def test_expired_plan_is_not_redeemed(self):
+    def test_expired_plan_cannot_be_redeemed(self):
         t, s, c = self.seed()
         self.add_plan(c, name="Expired", plan_type="hours", amount=5, expires_on="2020-01-01")
         a = self.make_appointment(t, s, c)
         done = self.complete(a, "hours")
-        self.assertIsNone(done.json()["plan_deduction"])
+        self.assertEqual(done.status_code, 409, done.text)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 5.0)
+        self.assertEqual(self.customer(c)["appointments"][0]["status"], "booked")
 
     def test_plan_is_tenant_scoped(self):
         sa = self.c.post("/api/auth/login", json={"username": "superadmin", "password": "superadmin123"}).json()["token"]
@@ -847,9 +854,9 @@ class TestPriorityOneOperations(Base):
         self.assertEqual(rows[0]["paid_amount"], 1900.0)
         self.assertEqual(rows[0]["balance_due"], 100.0)
         self.assertEqual(rows[0]["payment_status"],"partial")
-        settlement = self.c.get("/api/payments/settlement?received_on="+__import__("datetime").date.today().isoformat(),headers=self.h).json()
+        settlement = self.c.get("/api/payments/settlement?received_on="+spa_today(),headers=self.h).json()
         self.assertEqual((settlement["gross"],settlement["refunds"],settlement["net"]),(2000.0,100.0,1900.0))
-        activity=self.c.get("/api/payments?received_on="+__import__("datetime").date.today().isoformat(),headers=self.h).json()
+        activity=self.c.get("/api/payments?received_on="+spa_today(),headers=self.h).json()
         self.assertEqual(sum(1 for x in activity if x["event_type"]=="payment"),2)
         self.assertEqual(sum(1 for x in activity if x["event_type"]=="refund"),1)
         self.assertTrue(all(x["payment_id"] for x in activity))
@@ -936,7 +943,7 @@ class TestPriorityOneOperations(Base):
         self.c.post(f"/api/appointments/{a}/payments",json={"amount":300,"method":"upi"},headers=self.h)
         self.post("/api/users",username="summaryuser",password="summary123",role="staff")
         token=self.c.post("/api/auth/login",json={"username":"summaryuser","password":"summary123"}).json()["token"]
-        response=self.c.get("/api/payments/settlement?received_on="+__import__("datetime").date.today().isoformat(),headers={"Authorization":f"Bearer {token}"})
+        response=self.c.get("/api/payments/settlement?received_on="+spa_today(),headers={"Authorization":f"Bearer {token}"})
         self.assertEqual(response.status_code,200,response.text)
         self.assertEqual(response.json()["gross"],300.0)
 
