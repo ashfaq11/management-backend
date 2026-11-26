@@ -551,6 +551,39 @@ class TestCustomerPlans(Base):
         self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed", "plan_type": "hours"}, headers=self.h)
         self.assertEqual(self.customer(c)["plans"][0]["balance"], 3.0)
 
+    def test_prepaid_plan_report_splits_sales_balances_and_redemptions(self):
+        t, s, c = self.seed()
+        self.assertEqual(self.add_plan(c, name="Hours package", plan_type="hours", amount=3).status_code, 201)
+        self.assertEqual(self.add_plan(c, name="Rupee wallet", plan_type="rupees", amount=5000).status_code, 201)
+        a = self.make_appointment(t, s, c, duration_min=60, price=1250)
+        done = self.complete(a, "hours")
+        self.assertEqual(done.status_code, 200, done.text)
+
+        r = self.c.get("/api/reports/plans?month=2026-11", headers=self.h)
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        summary = data["summary"]
+        self.assertEqual(summary["plans_added"], 2)
+        self.assertEqual(summary["sold_hours"], 3.0)
+        self.assertEqual(summary["sold_rupees"], 5000.0)
+        self.assertEqual(summary["available_hours"], 2.0)
+        self.assertEqual(summary["available_rupees"], 5000.0)
+        self.assertEqual(summary["deducted_hours"], 1.0)
+        self.assertEqual(summary["deducted_rupees"], 0.0)
+        self.assertEqual(len(data["redemptions"]), 1)
+        self.assertEqual(data["redemptions"][0]["unit"], "hours")
+
+    def test_staff_cannot_create_plans_or_view_plan_reports(self):
+        t, s, c = self.seed()
+        self.post("/api/users", username="frontdesk", password="frontdesk1", role="staff")
+        tok = self.c.post("/api/auth/login", json={"username": "frontdesk", "password": "frontdesk1"}).json()["token"]
+        headers = {"Authorization": f"Bearer {tok}"}
+        created = self.c.post(f"/api/customers/{c}/plans",
+                              json={"name": "Hours", "plan_type": "hours", "amount": 3}, headers=headers)
+        self.assertEqual(created.status_code, 403)
+        report = self.c.get("/api/reports/plans?month=2026-11", headers=headers)
+        self.assertEqual(report.status_code, 403)
+
     def test_expired_plan_is_not_redeemed(self):
         t, s, c = self.seed()
         self.add_plan(c, name="Expired", plan_type="hours", amount=5, expires_on="2020-01-01")

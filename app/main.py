@@ -579,7 +579,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"id": aid, "status": b.status, "plan_deduction": deduction}
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
-    def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(member)):
+    def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
         with db.tx() as t:
             if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
                 raise HTTPException(404, "Customer not found")
@@ -722,6 +722,86 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         w.writerow(["Total", "", "", "", "", r["minutes"], f"{r['revenue']:.2f}"])
         return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
+
+    @app.get("/api/reports/plans")
+    def plan_report(month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                    date_to: dt.date | None = Query(None, alias="to"), customer_id: int | None = Query(None),
+                    u=Depends(admin)):
+        """Prepaid plan sales, current available balances, and deduction/reversal activity for a period."""
+        lo, hi = period(month, date_from, date_to)
+        customer_filter = " AND p.customer_id=%s" if customer_id is not None else ""
+        customer_args = (customer_id,) if customer_id is not None else ()
+
+        plans = db.all(
+            f"""SELECT p.id, p.customer_id, c.name AS customer, c.phone, p.name, p.plan_type,
+                       p.purchased_amount, p.balance, p.expires_on, p.created_at,
+                       COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
+                                 WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
+                FROM customer_plans p JOIN customers c ON c.id=p.customer_id
+                WHERE p.spa_id=%s AND p.created_at >= %s AND p.created_at < %s{customer_filter}
+                ORDER BY p.created_at DESC, p.id DESC""",
+            (u["spa"], lo, hi, *customer_args))
+
+        balance_filter = " AND customer_id=%s" if customer_id is not None else ""
+        available = db.all(
+            f"""SELECT plan_type, COALESCE(SUM(balance),0) AS balance
+                FROM customer_plans
+                WHERE spa_id=%s AND (expires_on IS NULL OR expires_on >= CURRENT_DATE){balance_filter}
+                GROUP BY plan_type""",
+            (u["spa"], *customer_args))
+
+        redemption_customer_filter = " AND p.customer_id=%s" if customer_id is not None else ""
+        redemptions = db.all(
+            f"""SELECT r.id, r.appointment_id, r.amount, r.unit, r.created_at AS deducted_at,
+                       r.reversed_at, p.id AS plan_id, p.name AS plan_name,
+                       c.id AS customer_id, c.name AS customer, c.phone,
+                       a.start_at, a.duration_min, a.price, s.name AS service, t.name AS therapist
+                FROM plan_redemptions r
+                JOIN customer_plans p ON p.id=r.plan_id
+                JOIN customers c ON c.id=p.customer_id
+                JOIN appointments a ON a.id=r.appointment_id
+                JOIN services s ON s.id=a.service_id
+                JOIN therapists t ON t.id=a.therapist_id
+                WHERE r.spa_id=%s
+                  AND ((r.created_at >= %s AND r.created_at < %s)
+                    OR (r.reversed_at >= %s AND r.reversed_at < %s)){redemption_customer_filter}
+                ORDER BY GREATEST(r.created_at, COALESCE(r.reversed_at, r.created_at)) DESC, r.id DESC""",
+            (u["spa"], lo, hi, lo, hi, *customer_args))
+
+        activity = db.one(
+            f"""SELECT
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='hours' AND r.created_at >= %s AND r.created_at < %s),0) AS deducted_hours,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='rupees' AND r.created_at >= %s AND r.created_at < %s),0) AS deducted_rupees,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='hours' AND r.reversed_at >= %s AND r.reversed_at < %s),0) AS reversed_hours,
+                  COALESCE(SUM(r.amount) FILTER (WHERE r.unit='rupees' AND r.reversed_at >= %s AND r.reversed_at < %s),0) AS reversed_rupees
+                FROM plan_redemptions r JOIN customer_plans p ON p.id=r.plan_id
+                WHERE r.spa_id=%s
+                  AND ((r.created_at >= %s AND r.created_at < %s)
+                    OR (r.reversed_at >= %s AND r.reversed_at < %s)){redemption_customer_filter}""",
+            (lo, hi, lo, hi, lo, hi, lo, hi, u["spa"], lo, hi, lo, hi, *customer_args)) or {}
+
+        def total(items, key):
+            return round(sum(float(x.get(key) or 0) for x in items), 2)
+
+        balance_by_type = {x["plan_type"]: float(x["balance"] or 0) for x in available}
+        return {
+            "month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
+            "customer_id": customer_id,
+            "summary": {
+                "plans_added": len(plans),
+                "sold_hours": total([p for p in plans if p["plan_type"] == "hours"], "purchased_amount"),
+                "sold_rupees": total([p for p in plans if p["plan_type"] == "rupees"], "purchased_amount"),
+                "available_hours": round(balance_by_type.get("hours", 0), 2),
+                "available_rupees": round(balance_by_type.get("rupees", 0), 2),
+                "deducted_hours": round(float(activity.get("deducted_hours") or 0), 2),
+                "deducted_rupees": round(float(activity.get("deducted_rupees") or 0), 2),
+                "reversed_hours": round(float(activity.get("reversed_hours") or 0), 2),
+                "reversed_rupees": round(float(activity.get("reversed_rupees") or 0), 2),
+                "redemptions": len(redemptions),
+            },
+            "plans": plans,
+            "redemptions": redemptions,
+        }
 
     @app.get("/api/reports/incentives")
     def incentives(month: str = Query(...), u=Depends(admin)):
