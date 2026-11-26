@@ -14,12 +14,15 @@ erDiagram
   customers ||--o{ customer_plans : has
   spas ||--o{ customer_plans : has
   spas ||--o{ customers : has
+  users ||--o{ expenses : has
+  spas ||--o{ expenses : has
   appointments ||--o{ plan_redemptions : has
   customer_plans ||--o{ plan_redemptions : has
   spas ||--o{ plan_redemptions : has
   users ||--o{ plan_topups : has
   customer_plans ||--o{ plan_topups : has
   spas ||--o{ plan_topups : has
+  spas ||--o{ recurring_expenses : has
   spas ||--o{ services : has
   users ||--o{ sessions : has
   spas ||--o{ shifts : has
@@ -39,8 +42,10 @@ erDiagram
 | [`appointments`](#appointments) | One booking of one customer with one therapist for one service. Completed appointments drive revenue and incentive. |
 | [`customer_plans`](#customer_plans) | Prepaid package owned by one customer in one spa. A balance is measured in hours or INR. |
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
+| [`expenses`](#expenses) | One-off spa costs on a given date. |
 | [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
 | [`plan_topups`](#plan_topups) | Amounts added to an existing prepaid plan after it was sold. |
+| [`recurring_expenses`](#recurring_expenses) | A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
 | [`shifts`](#shifts) | Reusable daily work-time window for a spa. |
@@ -154,6 +159,32 @@ Spa clients, created by onboarding or by hand.
 - `customers_phone_key`: `CREATE UNIQUE INDEX customers_phone_key ON customers USING btree (spa_id, phone)`
 - `customers_spa_idx`: `CREATE INDEX customers_spa_idx ON customers USING btree (spa_id, lower(name))`
 
+## expenses
+
+One-off spa costs on a given date.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa. |
+| `on_date` | date | no |  | Date the money was spent. |
+| `category` | text | no | `'Other'::text` | Grouping for reports, e.g. Supplies, Repairs, Marketing. |
+| `amount` | numeric(12,2) | no |  | Amount in INR. |
+| `note` | text | yes |  | What it was for. |
+| `created_by` | bigint | yes |  | Login that recorded it. |
+| `created_at` | timestamp with time zone | no | `now()` | When it was recorded. |
+
+**Constraints**
+
+- Check `expenses_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Foreign key `expenses_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `expenses_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `expenses_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `expenses_spa_date_idx`: `CREATE INDEX expenses_spa_date_idx ON expenses USING btree (spa_id, on_date)`
+
 ## plan_redemptions
 
 Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance.
@@ -211,6 +242,36 @@ Amounts added to an existing prepaid plan after it was sold.
 
 - `plan_topups_plan_idx`: `CREATE INDEX plan_topups_plan_idx ON plan_topups USING btree (plan_id, created_at)`
 - `plan_topups_spa_time_idx`: `CREATE INDEX plan_topups_spa_time_idx ON plan_topups USING btree (spa_id, created_at)`
+
+## recurring_expenses
+
+A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa. |
+| `name` | text | no |  | What the cost is, e.g. Shop rent. |
+| `category` | text | no | `'Other'::text` | Grouping for reports, e.g. Rent, Utilities, Supplies. |
+| `amount` | numeric(12,2) | no |  | Monthly amount in INR. |
+| `day_of_month` | smallint | no | `1` | Day (1-28) it falls due each month. |
+| `starts_on` | date | no |  | First date it applies; months before are not charged. |
+| `ends_on` | date | yes |  | Last date it applies; NULL = ongoing. |
+| `notes` | text | yes |  | Optional notes. |
+| `created_at` | timestamp with time zone | no | `now()` | When it was added. |
+
+**Constraints**
+
+- Check `recurring_expenses_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `recurring_expenses_check`: `CHECK (((ends_on IS NULL) OR (ends_on >= starts_on)))`
+- Check `recurring_expenses_day_of_month_check`: `CHECK (((day_of_month >= 1) AND (day_of_month <= 28)))`
+- Check `recurring_expenses_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Foreign key `recurring_expenses_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `recurring_expenses_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `recurring_expenses_spa_idx`: `CREATE INDEX recurring_expenses_spa_idx ON recurring_expenses USING btree (spa_id, starts_on)`
 
 ## services
 

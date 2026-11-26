@@ -716,7 +716,7 @@ class TestPlanRevenue(Base):
         r = self.c.get(f"/api/reports/summary?month={day:%Y-%m}", headers=self.h).json()
         self.assertEqual((r["revenue"], r["plan_sales"], r["paid_by_plan"], r["collected"]), (2000.0, 13000.0, 2000.0, 13000.0))
         self.assertEqual(len(r["plan_lines"]), 3)
-        self.assertEqual(r["profit"], 13000.0 - r["payroll"])
+        self.assertEqual(r["profit"], 13000.0 - r["payroll"] - r["expenses"])
         self.assertTrue(self.c.get(f"/api/reports/summary/pdf?month={day:%Y-%m}", headers=self.h).content.startswith(b"%PDF"))
         x = self.c.get(f"/api/reports/summary/xlsx?month={day:%Y-%m}", headers=self.h)
         self.assertEqual(x.status_code, 200)
@@ -724,3 +724,32 @@ class TestPlanRevenue(Base):
         wb = openpyxl.load_workbook(io.BytesIO(x.content))
         self.assertEqual(wb.sheetnames, ["Summary", "Services done", "By therapist", "Plan sales"])
         self.assertEqual(wb["Plan sales"].max_row, 5)
+
+
+class TestExpenses(Base):
+    def test_regular_and_one_off_expenses(self):
+        rent = self.post("/api/expenses/recurring", name="Shop rent", category="Rent", amount=15000, day_of_month=5,
+                         starts_on="2026-10-01").json()["id"]
+        self.post("/api/expenses/recurring", name="Wifi", category="Utilities", amount=800, starts_on="2026-11-10")
+        self.post("/api/expenses", on_date="2026-11-12", category="Supplies", amount=2500, note="Oils")
+        nov = self.c.get("/api/expenses?month=2026-11", headers=self.h).json()
+        self.assertEqual(nov["total"], 17500.0)  # wifi starts after its due day (1st) in November
+        self.assertEqual([c["category"] for c in nov["by_category"]], ["Rent", "Supplies"])
+        dec = self.c.get("/api/expenses?month=2026-12", headers=self.h).json()
+        self.assertEqual(dec["total"], 15800.0)
+        q = self.c.get("/api/expenses?from=2026-10-01&to=2026-12-31", headers=self.h).json()
+        self.assertEqual(q["total"], 15000 * 3 + 2500 + 800)
+        # stop the rent after November: December drops it, November keeps it
+        self.c.put(f"/api/expenses/recurring/{rent}", json={"name": "Shop rent", "category": "Rent", "amount": 15000,
+                   "day_of_month": 5, "starts_on": "2026-10-01", "ends_on": "2026-11-30"}, headers=self.h)
+        self.assertEqual(self.c.get("/api/expenses?month=2026-12", headers=self.h).json()["total"], 800.0)
+        rep = self.c.get("/api/reports/summary?month=2026-11", headers=self.h).json()
+        self.assertEqual(rep["expenses"], 17500.0)
+        self.assertEqual(rep["profit"], rep["collected"] - rep["payroll"] - 17500.0)
+        _, h = self.login_staff()
+        self.assertEqual(self.c.get("/api/expenses?month=2026-11", headers=h).status_code, 403)
+
+    def login_staff(self):
+        self.post("/api/users", username="front", password="frontdesk1", role="staff")
+        tok = self.c.post("/api/auth/login", json={"username": "front", "password": "frontdesk1"}).json()["token"]
+        return None, {"Authorization": f"Bearer {tok}"}

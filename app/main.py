@@ -1,6 +1,7 @@
 import csv
 import io
 import datetime as dt
+from decimal import Decimal
 import os
 import re
 from contextlib import asynccontextmanager
@@ -131,6 +132,43 @@ class PlanTopUp(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
     price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)
     note: Optional[str] = Field(default=None, max_length=500)
+
+
+class ExpenseIn(BaseModel):
+    on_date: dt.date
+    category: str = Field(default="Other", min_length=1, max_length=60)
+    amount: float = Field(gt=0, le=100_000_000)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RecurringExpenseIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="Other", min_length=1, max_length=60)
+    amount: float = Field(gt=0, le=100_000_000)
+    day_of_month: int = Field(default=1, ge=1, le=28)
+    starts_on: dt.date
+    ends_on: Optional[dt.date] = None
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
+    """Every cost falling in [lo, hi): one-off expenses on their date, and each regular expense once per month on
+    its due day while it is active."""
+    rows = [{**r, "kind": "one-off"} for r in db.all(
+        """SELECT id, on_date, category, note AS name, amount FROM expenses
+           WHERE spa_id=%s AND on_date >= %s AND on_date < %s""", (spa, lo, hi))]
+    for r in db.all("SELECT * FROM recurring_expenses WHERE spa_id=%s AND starts_on < %s AND (ends_on IS NULL OR ends_on >= %s)",
+                    (spa, hi, lo)):
+        start = dt.date.fromisoformat(str(r["starts_on"])[:10])
+        end = dt.date.fromisoformat(str(r["ends_on"])[:10]) if r["ends_on"] else None
+        y, m = lo.year, lo.month
+        while dt.date(y, m, 1) < hi:
+            due = dt.date(y, m, r["day_of_month"])
+            if lo <= due < hi and start <= due and (end is None or due <= end):
+                rows.append({"id": r["id"], "on_date": due.isoformat(), "category": r["category"], "name": r["name"],
+                             "amount": r["amount"], "kind": "regular"})
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return sorted(rows, key=lambda x: (str(x["on_date"]), x["kind"], x["id"]))
 
 
 class OnboardIn(CustomerIn):
@@ -910,6 +948,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                             WHERE r.appointment_id=a.id AND r.reversed_at IS NULL)""", args)["v"]
         paid_by_plan = payroll.money(by_plan)
         # profit only makes sense for a whole month of the whole spa: payroll is monthly
+        exp_rows = [] if (therapist_id is not None or customer_id is not None or service_id is not None) \
+            else expenses_in(db, u["spa"], lo, hi)
+        exp_total = sum((payroll.money(x["amount"]) for x in exp_rows), payroll.money(0))
         pay = None
         if month and not (date_from or date_to) and therapist_id is None and customer_id is None and service_id is None:
             pay = sum((payroll.money(payroll.compute_payslip(db, t, month)["net_pay"]) for t in
@@ -919,7 +960,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 "plan_sales": float(plan_sales), "paid_by_plan": float(paid_by_plan),
                 "collected": float(rev - paid_by_plan + plan_sales), "plan_lines": plan_rows,
                 "payroll": None if pay is None else float(pay),
-                "profit": None if pay is None else float(rev - paid_by_plan + plan_sales - pay),
+                "expenses": float(exp_total), "expense_lines": exp_rows,
+                "profit": None if pay is None else float(rev - paid_by_plan + plan_sales - pay - exp_total),
                 "services_count": len(lines), "minutes": sum(r["duration_min"] for r in lines), "new_customers": new_c, "by_status": by_status,
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
                 "by_therapist": therapists, "lines": lines}
@@ -1129,6 +1171,69 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         (b.therapist_id, b.on_date, b.amount, (b.note or "").strip() or None, b.appointment_id, u["id"],
                          u["spa"]))
         return {"id": bid}
+
+    # ---- expenses (admin) ------------------------------------------------
+    @app.get("/api/expenses")
+    def list_expenses(month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                      date_to: dt.date | None = Query(None, alias="to"), u=Depends(admin)):
+        """The period's costs (one-off + regular as they fall due), totals by category, and the regular list."""
+        lo, hi = period(month, date_from, date_to)
+        rows = expenses_in(db, u["spa"], lo, hi)
+        cats: dict[str, Decimal] = {}
+        for x in rows:
+            cats[x["category"]] = cats.get(x["category"], Decimal(0)) + payroll.money(x["amount"])
+        return {"from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(), "lines": rows,
+                "total": float(sum(cats.values(), Decimal(0))),
+                "by_category": [{"category": k, "amount": float(v)} for k, v in sorted(cats.items(), key=lambda kv: -kv[1])],
+                "regular": db.all("SELECT * FROM recurring_expenses WHERE spa_id=%s ORDER BY ends_on NULLS FIRST, lower(name)",
+                                  (u["spa"],))}
+
+    @app.post("/api/expenses", status_code=201)
+    def add_expense(b: ExpenseIn, u=Depends(admin)):
+        return {"id": db.insert("""INSERT INTO expenses(spa_id,on_date,category,amount,note,created_by)
+                                   VALUES(%s,%s,%s,%s,%s,%s)""",
+                                (u["spa"], b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, u["id"]))}
+
+    @app.put("/api/expenses/{eid}")
+    def edit_expense(eid: int, b: ExpenseIn, u=Depends(admin)):
+        if not db.run("UPDATE expenses SET on_date=%s,category=%s,amount=%s,note=%s WHERE id=%s AND spa_id=%s",
+                      (b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, eid, u["spa"])):
+            raise HTTPException(404, "Expense not found")
+        return {"id": eid}
+
+    @app.delete("/api/expenses/{eid}", status_code=204)
+    def delete_expense(eid: int, u=Depends(admin)):
+        if not db.run("DELETE FROM expenses WHERE id=%s AND spa_id=%s", (eid, u["spa"])):
+            raise HTTPException(404, "Expense not found")
+
+    def check_recurring(b: RecurringExpenseIn):
+        if b.ends_on and b.ends_on < b.starts_on:
+            raise HTTPException(422, "End date must not be before the start date")
+
+    @app.post("/api/expenses/recurring", status_code=201)
+    def add_recurring(b: RecurringExpenseIn, u=Depends(admin)):
+        check_recurring(b)
+        return {"id": db.insert("""INSERT INTO recurring_expenses(spa_id,name,category,amount,day_of_month,starts_on,ends_on,notes)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                (u["spa"], b.name.strip(), b.category.strip(), b.amount, b.day_of_month, b.starts_on,
+                                 b.ends_on, (b.notes or "").strip() or None))}
+
+    @app.put("/api/expenses/recurring/{rid}")
+    def edit_recurring(rid: int, b: RecurringExpenseIn, u=Depends(admin)):
+        """Change a regular cost. To stop it, set ends_on: past months keep counting it."""
+        check_recurring(b)
+        if not db.run("""UPDATE recurring_expenses SET name=%s,category=%s,amount=%s,day_of_month=%s,starts_on=%s,
+                         ends_on=%s,notes=%s WHERE id=%s AND spa_id=%s""",
+                      (b.name.strip(), b.category.strip(), b.amount, b.day_of_month, b.starts_on, b.ends_on,
+                       (b.notes or "").strip() or None, rid, u["spa"])):
+            raise HTTPException(404, "Regular expense not found")
+        return {"id": rid}
+
+    @app.delete("/api/expenses/recurring/{rid}", status_code=204)
+    def delete_recurring(rid: int, u=Depends(admin)):
+        """Remove a regular cost entirely (also from past months). Prefer an end date to stop it."""
+        if not db.run("DELETE FROM recurring_expenses WHERE id=%s AND spa_id=%s", (rid, u["spa"])):
+            raise HTTPException(404, "Regular expense not found")
 
     @app.delete("/api/bonuses/{bid}", status_code=204)
     def delete_bonus(bid: int, u=Depends(admin)):

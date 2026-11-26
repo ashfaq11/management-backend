@@ -212,11 +212,14 @@ def report_pdf(r: dict, business: str) -> bytes:
     if "plan_sales" in r:
         tiles += [("Plan sales", f"Rs {amt(r['plan_sales'])}"), ("Paid from plans", f"Rs {amt(r['paid_by_plan'])}"),
                   ("Money collected", f"Rs {amt(r['collected'])}")]
+    if r.get("expenses") is not None and "expense_lines" in r:
+        tiles.append(("Expenses", f"Rs {amt(r['expenses'])}"))
     if r.get("profit") is not None:
-        tiles += [("Payroll", f"Rs {amt(r['payroll'])}"), ("Profit after payroll", f"Rs {amt(r['profit'])}")]
+        tiles += [("Payroll", f"Rs {amt(r['payroll'])}"), ("Net profit", f"Rs {amt(r['profit'])}")]
     d.kpis(tiles)
     if "plan_sales" in r:
-        d.text("Money collected = service revenue - services paid from prepaid plans + plan sales.", muted=True)
+        d.text("Money collected = service revenue - services paid from prepaid plans + plan sales. "
+               "Net profit = money collected - payroll - expenses.", muted=True)
 
     d.heading("By service")
     rows = [["Service", "Done", "Minutes", "Revenue (Rs)"]]
@@ -240,6 +243,14 @@ def report_pdf(r: dict, business: str) -> bytes:
               x.get("duration_min", ""), amt(x["price"])] for x in r["lines"]] or [["-"] * 6]
     rows.append(["Total", "", "", "", r.get("minutes", ""), amt(r["revenue"])])
     d.table(rows, [88, 115, 115, 95, 35, 75], numeric=2, total=True)
+
+    if r.get("expense_lines"):
+        d.heading("Expenses")
+        rows = [["Date", "Category", "Item", "Type", "Amount (Rs)"]]
+        rows += [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(), amt(x["amount"])]
+                 for x in r["expense_lines"]]
+        rows.append(["Total", "", "", "", amt(r["expenses"])])
+        d.table(rows, [80, 100, 200, 60, 83], total=True)
 
     if r.get("plan_lines"):
         d.heading("Prepaid plan sales")
@@ -294,8 +305,10 @@ def report_xlsx(r: dict, business: str) -> bytes:
     if "plan_sales" in r:
         rows += [["Plan sales", r["plan_sales"]], ["Services paid from plans", r["paid_by_plan"]],
                  ["Money collected", r["collected"]]]
+    if "expense_lines" in r:
+        rows.append(["Expenses", r["expenses"]])
     if r.get("profit") is not None:
-        rows += [["Payroll", r["payroll"]], ["Profit after payroll", r["profit"]]]
+        rows += [["Payroll", r["payroll"]], ["Net profit (after payroll and expenses)", r["profit"]]]
     sheet(ws, "Summary", ["Item", "Value"], rows)
     for (c,) in ws.iter_rows(min_row=2, min_col=2, max_col=2):
         if isinstance(c.value, float):
@@ -318,6 +331,12 @@ def report_xlsx(r: dict, business: str) -> bytes:
               for x in r["plan_lines"]]
         sheet(wb.create_sheet(), "Plan sales", ["Date", "Customer", "Plan", "Kind", "Amount", "Unit", "Paid"], pl,
               money_cols=(7,), total=["Total", "", "", "", "", "", float(r["plan_sales"])])
+
+    if r.get("expense_lines"):
+        ex = [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(), float(x["amount"])]
+              for x in r["expense_lines"]]
+        sheet(wb.create_sheet(), "Expenses", ["Date", "Category", "Item", "Type", "Amount"], ex, money_cols=(5,),
+              total=["Total", "", "", "", float(r["expenses"])])
 
     out = io.BytesIO()
     wb.save(out)
