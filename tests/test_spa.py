@@ -135,5 +135,123 @@ class TestCors(Base):
         self.assertEqual(r.headers.get("access-control-allow-origin"), "http://localhost:4200")
 
 
+class TestEdits(Base):
+    def put(self, url, **j):
+        return self.c.put(url, json=j, headers=self.h)
+
+    def test_edit_customer_and_phone_conflict(self):
+        _, _, c = self.seed()
+        d = self.post("/api/customers", name="Other", phone="7770001111").json()["id"]
+        self.assertEqual(self.put(f"/api/customers/{c}", name="Ravi K", phone="9990001111").status_code, 200)
+        self.assertEqual(self.c.get(f"/api/customers/{c}", headers=self.h).json()["name"], "Ravi K")
+        self.assertEqual(self.put(f"/api/customers/{d}", name="Other", phone="9990001111").status_code, 409)
+
+    def test_edit_therapist_changes_future_pay_rule(self):
+        t, *_ = self.seed()
+        self.put(f"/api/therapists/{t}", name="Asha", fixed_salary=25000, incentive_percent=12, is_active=True)
+        p = self.c.get(f"/api/payroll/{t}/2026-11", headers=self.h).json()
+        self.assertEqual((p["fixed_salary"], p["incentive_percent"]), (25000.0, 12.0))
+
+    def test_edit_appointment_reschedule_keeps_price_and_ignores_self_clash(self):
+        t, s, c = self.seed()
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T10:00", price=1500).json()["id"]
+        body = dict(customer_id=c, therapist_id=t, service_id=s, notes="moved")
+        # overlaps its own old slot: must be allowed
+        self.assertEqual(self.put(f"/api/appointments/{a}", start_at="2026-11-10T10:30", **body).status_code, 200)
+        row = self.c.get("/api/appointments?date=2026-11-10", headers=self.h).json()[0]
+        self.assertEqual((row["start_at"], row["price"], row["notes"]), ("2026-11-10T10:30", 1500.0, "moved"))
+
+    def test_edit_appointment_clash_and_service_price(self):
+        t, s, c = self.seed()
+        s2 = self.post("/api/services", name="Facial", price=800, duration_min=30).json()["id"]
+        self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s, start_at="2026-11-10T10:00")
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T12:00").json()["id"]
+        body = dict(customer_id=c, therapist_id=t, service_id=s)
+        self.assertEqual(self.put(f"/api/appointments/{a}", start_at="2026-11-10T10:30", **body).status_code, 409)
+        body["service_id"] = s2  # new service -> its list price
+        self.assertEqual(self.put(f"/api/appointments/{a}", start_at="2026-11-10T12:00", **body).status_code, 200)
+        rows = self.c.get("/api/appointments?date=2026-11-10", headers=self.h).json()
+        self.assertEqual([r["price"] for r in rows if r["id"] == a], [800.0])
+
+    def test_completed_appointment_cannot_be_edited(self):
+        t, s, c = self.seed()
+        a = self.post("/api/appointments", customer_id=c, therapist_id=t, service_id=s,
+                      start_at="2026-11-10T10:00").json()["id"]
+        self.c.patch(f"/api/appointments/{a}/status", json={"status": "completed"}, headers=self.h)
+        r = self.put(f"/api/appointments/{a}", customer_id=c, therapist_id=t, service_id=s, start_at="2026-11-10T11:00")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.put("/api/appointments/999", customer_id=c, therapist_id=t, service_id=s,
+                                  start_at="2026-11-10T11:00").status_code, 404)
+
+
+class TestUsers(Base):
+    def login(self, u, p):
+        r = self.c.post("/api/auth/login", json={"username": u, "password": p})
+        return r, {"Authorization": f"Bearer {r.json().get('token', '')}"}
+
+    def make_staff(self, name="front", pw="frontdesk1"):
+        return self.post("/api/users", username=name, password=pw, role="staff").json()["id"]
+
+    def test_list_users_admin_only_and_hides_hashes(self):
+        self.make_staff()
+        rows = self.c.get("/api/users", headers=self.h).json()
+        self.assertEqual({r["username"] for r in rows}, {"admin", "front"})
+        self.assertTrue(all(set(r) == {"id", "username", "role", "is_active"} for r in rows))
+        _, h = self.login("front", "frontdesk1")
+        self.assertEqual(self.c.get("/api/users", headers=h).status_code, 403)
+
+    def test_deactivate_user_blocks_login_and_kills_session(self):
+        uid = self.make_staff()
+        _, h = self.login("front", "frontdesk1")
+        self.assertEqual(self.c.get("/api/customers", headers=h).status_code, 200)
+        r = self.c.put(f"/api/users/{uid}", json={"role": "staff", "is_active": False}, headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.c.get("/api/customers", headers=h).status_code, 401)
+        self.assertEqual(self.login("front", "frontdesk1")[0].status_code, 401)
+
+    def test_promote_staff_to_admin(self):
+        uid = self.make_staff()
+        self.c.put(f"/api/users/{uid}", json={"role": "admin", "is_active": True}, headers=self.h)
+        _, h = self.login("front", "frontdesk1")
+        self.assertEqual(self.c.get("/api/reports/incentives?month=2026-11", headers=h).status_code, 200)
+
+    def test_cannot_lock_yourself_or_last_admin_out(self):
+        me = self.c.get("/api/auth/me", headers=self.h).json()["id"]
+        for body in ({"role": "staff", "is_active": True}, {"role": "admin", "is_active": False}):
+            self.assertEqual(self.c.put(f"/api/users/{me}", json=body, headers=self.h).status_code, 400)
+        # a second admin may demote the first, but not the very last admin
+        uid = self.make_staff()
+        self.c.put(f"/api/users/{uid}", json={"role": "admin", "is_active": True}, headers=self.h)
+        _, h2 = self.login("front", "frontdesk1")
+        self.assertEqual(self.c.put(f"/api/users/{me}", json={"role": "staff", "is_active": True}, headers=h2).status_code, 200)
+        self.assertEqual(self.c.put(f"/api/users/{uid}", json={"role": "staff", "is_active": True}, headers=h2).status_code, 400)
+
+    def test_admin_reset_password_revokes_sessions(self):
+        uid = self.make_staff()
+        _, h = self.login("front", "frontdesk1")
+        r = self.c.post(f"/api/users/{uid}/password", json={"password": "brandnew99"}, headers=self.h)
+        self.assertEqual(r.status_code, 204)
+        self.assertEqual(self.c.get("/api/customers", headers=h).status_code, 401)
+        self.assertEqual(self.login("front", "frontdesk1")[0].status_code, 401)
+        self.assertEqual(self.login("front", "brandnew99")[0].status_code, 200)
+        self.assertEqual(self.c.post("/api/users/999/password", json={"password": "brandnew99"}, headers=self.h).status_code, 404)
+
+    def test_change_own_password(self):
+        self.make_staff()
+        _, h1 = self.login("front", "frontdesk1")
+        _, h2 = self.login("front", "frontdesk1")  # another device
+        bad = self.c.post("/api/auth/password", json={"current_password": "x", "new_password": "newpass123"}, headers=h1)
+        self.assertEqual(bad.status_code, 400)
+        short = self.c.post("/api/auth/password", json={"current_password": "frontdesk1", "new_password": "short"}, headers=h1)
+        self.assertEqual(short.status_code, 422)
+        ok = self.c.post("/api/auth/password", json={"current_password": "frontdesk1", "new_password": "newpass123"}, headers=h1)
+        self.assertEqual(ok.status_code, 204)
+        self.assertEqual(self.c.get("/api/auth/me", headers=h1).status_code, 200)   # this device stays in
+        self.assertEqual(self.c.get("/api/auth/me", headers=h2).status_code, 401)   # others signed out
+        self.assertEqual(self.login("front", "newpass123")[0].status_code, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

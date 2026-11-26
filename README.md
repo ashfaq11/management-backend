@@ -20,10 +20,12 @@ python -m unittest discover -s tests -t .
 Interactive docs at `/docs`.
 
 ## Roles
-- **admin**: everything, incl. therapists/services, reports, payroll, `POST /api/users`.
+- **admin**: everything, incl. therapists/services, reports, payroll and user management (`GET/POST /api/users`, `PUT /api/users/{id}` role/active, `POST /api/users/{id}/password` reset).
 - **staff**: customers, onboarding, appointments.
 
 ## Rules
+- Users can change their own password (`POST /api/auth/password`); other devices are signed out. Deactivating a user or resetting their password signs them out at once. You cannot deactivate/demote yourself or the last active admin.
+- `PUT /api/appointments/{id}` reschedules or changes a booking, only while it is `booked` (completed ones feed payroll). Price: explicit value wins; a changed service takes its list price; otherwise the agreed price is kept.
 - Opaque bearer token (12 h, stored hashed, revoked on logout).
 - Price is snapshotted on the appointment (override allowed); a therapist cannot be double-booked.
 - **Payslip = fixed salary + incentive**; incentive = incentive % x price of the therapist's *completed* appointments in the month.

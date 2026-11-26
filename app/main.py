@@ -68,6 +68,20 @@ class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
 
 
+class UserUpdate(BaseModel):
+    role: Literal["admin", "staff"]
+    is_active: bool
+
+
+class PasswordReset(BaseModel):
+    password: str = Field(min_length=8)
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=3)
     password: str = Field(min_length=8)
@@ -120,12 +134,49 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def me(u=Depends(current_user)):
         return u
 
+    @app.post("/api/auth/password", status_code=204)
+    def change_password(b: PasswordChange, authorization: str = Header(default=""), u=Depends(current_user)):
+        row = db.one("SELECT password_hash FROM users WHERE id=?", (u["id"],))
+        if not security.verify_password(b.current_password, row["password_hash"]):
+            raise HTTPException(400, "Current password is wrong")
+        db.run("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(b.new_password), u["id"]))
+        # sign out every other device, keep this one
+        db.run("DELETE FROM sessions WHERE user_id=? AND token_hash<>?",
+               (u["id"], security.fingerprint(authorization[7:])))
+
+    @app.get("/api/users")
+    def users(_=Depends(admin)):
+        return db.all("SELECT id,username,role,is_active FROM users ORDER BY username")
+
     @app.post("/api/users", status_code=201)
     def add_user(b: UserIn, _=Depends(admin)):
         if db.one("SELECT 1 FROM users WHERE username=?", (b.username,)):
             raise HTTPException(409, "Username taken")
         return {"id": db.run("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
                              (b.username, security.hash_password(b.password), b.role))}
+
+    @app.put("/api/users/{uid}")
+    def edit_user(uid: int, b: UserUpdate, me=Depends(admin)):
+        target = db.one("SELECT * FROM users WHERE id=?", (uid,))
+        if not target:
+            raise HTTPException(404, "User not found")
+        with db.lock:  # check + write atomically so two admins cannot both demote each other
+            if uid == me["id"] and (not b.is_active or b.role != "admin"):
+                raise HTTPException(400, "You cannot deactivate or demote your own account")
+            others = db.one("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND is_active=1 AND id<>?", (uid,))["n"]
+            if others == 0 and (not b.is_active or b.role != "admin"):
+                raise HTTPException(400, "At least one active admin is required")
+            db.run("UPDATE users SET role=?, is_active=? WHERE id=?", (b.role, int(b.is_active), uid))
+            if not b.is_active:
+                db.run("DELETE FROM sessions WHERE user_id=?", (uid,))
+        return {"id": uid, "role": b.role, "is_active": b.is_active}
+
+    @app.post("/api/users/{uid}/password", status_code=204)
+    def reset_password(uid: int, b: PasswordReset, _=Depends(admin)):
+        if not db.one("SELECT 1 FROM users WHERE id=?", (uid,)):
+            raise HTTPException(404, "User not found")
+        db.run("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(b.password), uid))
+        db.run("DELETE FROM sessions WHERE user_id=?", (uid,))
 
     # ---- customers ----------------------------------------------------
     def insert_customer(b: CustomerIn) -> int:
@@ -206,7 +257,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return {"id": sid}
 
     # ---- appointments ---------------------------------------------------
-    def insert_appointment(b: AppointmentIn) -> int:
+    def resolve_slot(b: AppointmentIn, exclude_id: Optional[int] = None):
+        """Validate a booking request; returns (therapist, service, start_s). Shared by create and edit."""
         try:
             start = dt.datetime.fromisoformat(b.start_at)
         except ValueError:
@@ -220,15 +272,36 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, "Therapist or service not found (or inactive)")
         end = (start + dt.timedelta(minutes=s["duration_min"])).strftime("%Y-%m-%dT%H:%M")
         clash = db.one(
-            """SELECT 1 FROM appointments WHERE therapist_id=? AND status IN('booked','completed')
+            """SELECT 1 FROM appointments WHERE therapist_id=? AND status IN('booked','completed') AND id<>?
                AND start_at<? AND strftime('%Y-%m-%dT%H:%M', start_at, '+'||duration_min||' minutes')>?""",
-            (t["id"], end, start_s))
+            (t["id"], exclude_id or 0, end, start_s))
         if clash:
             raise HTTPException(409, "Therapist already has an appointment at that time")
+        return t, s, start_s
+
+    def insert_appointment(b: AppointmentIn) -> int:
+        t, s, start_s = resolve_slot(b)
         price = s["price"] if b.price is None else b.price
         return db.run("""INSERT INTO appointments(customer_id,therapist_id,service_id,start_at,duration_min,
                          price,status,notes,created_at) VALUES(?,?,?,?,?,?,'booked',?,?)""",
                       (b.customer_id, t["id"], s["id"], start_s, s["duration_min"], price, b.notes, now()))
+
+    @app.put("/api/appointments/{aid}")
+    def edit_appointment(aid: int, b: AppointmentIn, _=Depends(current_user)):
+        """Reschedule / change an appointment. Only while still 'booked': completed ones feed payroll."""
+        with db.lock:
+            a = db.one("SELECT * FROM appointments WHERE id=?", (aid,))
+            if not a:
+                raise HTTPException(404, "Appointment not found")
+            if a["status"] != "booked":
+                raise HTTPException(409, "Only booked appointments can be edited; change the status first")
+            t, s, start_s = resolve_slot(b, exclude_id=aid)
+            # explicit price wins; a different service takes its list price; otherwise keep what was agreed
+            price = b.price if b.price is not None else (s["price"] if s["id"] != a["service_id"] else a["price"])
+            db.run("""UPDATE appointments SET customer_id=?,therapist_id=?,service_id=?,start_at=?,duration_min=?,
+                      price=?,notes=? WHERE id=?""",
+                   (b.customer_id, t["id"], s["id"], start_s, s["duration_min"], price, b.notes, aid))
+        return {"id": aid}
 
     @app.get("/api/appointments")
     def appointments(date: Optional[str] = None, therapist_id: Optional[int] = None,
