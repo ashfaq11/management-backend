@@ -31,3 +31,12 @@ Interactive docs at `/docs`.
 - **Payslip = fixed salary + incentive**; incentive = incentive % x price of the therapist's *completed* appointments in the month.
 - `POST /api/onboarding` creates a customer and optionally their first appointment atomically.
 - Payslip PDF: `GET /api/payroll/{therapist_id}/{YYYY-MM}/pdf`.
+
+## Deploy on AWS (single EC2 box)
+SQLite lives on the instance disk, so run exactly one instance. `Dockerfile` builds the API; `deploy/aws/bootstrap.sh`
+is EC2 user-data for Amazon Linux 2023: it installs Docker, builds this repo, generates a random admin password into
+`/opt/spa/env` (read it with `sudo cat /opt/spa/env`), mounts `/var/lib/spa` as the data volume, and fronts the API with
+Caddy on `https://<public-ip>.sslip.io` (free Let's Encrypt cert). Open ports 80 and 443 only; SSH via SSM Session Manager.
+
+- Redeploy: `sudo bash /opt/spa/src/deploy/aws/update.sh`
+- Backup (cron, nightly): `deploy/aws/backup.sh` keeps 14 consistent copies in `/var/lib/spa/backups`
