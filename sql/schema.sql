@@ -6,7 +6,9 @@
 -- It also records the migrations as applied, so the API will not try to run them again.
 -- Needs the btree_gist extension (bundled with PostgreSQL; creating it needs the database owner).
 -- Column-by-column documentation: docs/schema.md
-\n-- ======== migrations/001_init.sql ========\n-- Spa Manager schema. Applied once by app/migrate.py inside the configured schema (default "spa").
+
+-- ======== 001_init.sql ========
+-- Spa Manager schema. Applied once by app/migrate.py inside the configured schema (default "spa").
 -- Needed so the database itself can refuse a therapist being booked twice at the same time.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
@@ -86,7 +88,10 @@ CREATE TABLE appointments (
 );
 CREATE INDEX appointments_start_idx     ON appointments (start_at);
 CREATE INDEX appointments_therapist_idx ON appointments (therapist_id, start_at);
-CREATE INDEX appointments_customer_idx  ON appointments (customer_id, start_at DESC);\n\n-- ======== migrations/002_comments.sql ========\n-- Descriptions stored in the database itself (visible in psql \d+, pgAdmin, DBeaver) and used to build docs/schema.md.
+CREATE INDEX appointments_customer_idx  ON appointments (customer_id, start_at DESC);
+
+-- ======== 002_comments.sql ========
+-- Descriptions stored in the database itself (visible in psql \d+, pgAdmin, DBeaver) and used to build docs/schema.md.
 COMMENT ON TABLE users IS 'Staff logins. Role admin = everything; staff = customers, onboarding, appointments.';
 COMMENT ON COLUMN users.username IS 'Login name, at least 3 characters; unique ignoring case (users_username_key).';
 COMMENT ON COLUMN users.password_hash IS 'PBKDF2-SHA256 hash "pbkdf2$iterations$salt$hash"; the password itself is never stored.';
@@ -145,7 +150,10 @@ COMMENT ON COLUMN appointments.therapist_id IS 'Who performs it; also the key of
 COMMENT ON COLUMN appointments.service_id IS 'What is performed.';
 COMMENT ON COLUMN appointments.notes IS 'Free-text note for this visit.';
 COMMENT ON COLUMN appointments.created_at IS 'When it was booked.';
-COMMENT ON COLUMN appointments.updated_at IS 'Last reschedule or status change.';\n\n-- ======== migrations/003_therapist_bonuses.sql ========\n-- Extra incentives paid to a therapist on a given day (festival bonus, extra hours, a tip passed on, ...),
+COMMENT ON COLUMN appointments.updated_at IS 'Last reschedule or status change.';
+
+-- ======== 003_therapist_bonuses.sql ========
+-- Extra incentives paid to a therapist on a given day (festival bonus, extra hours, a tip passed on, ...),
 -- on top of the percentage incentive. They land on the payslip of the month of on_date.
 CREATE TABLE therapist_bonuses (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -167,7 +175,10 @@ COMMENT ON COLUMN therapist_bonuses.on_date IS 'The day the incentive is for; de
 COMMENT ON COLUMN therapist_bonuses.amount IS 'INR, more than 0.';
 COMMENT ON COLUMN therapist_bonuses.note IS 'Why, e.g. Festival bonus, Extra hours.';
 COMMENT ON COLUMN therapist_bonuses.appointment_id IS 'The appointment it was given for, when it was given from the appointments list (optional).';
-COMMENT ON COLUMN therapist_bonuses.created_by IS 'The user who added it.';\n\n-- ======== migrations/004_spas.sql ========\n-- Many spas in one system. Every business row belongs to exactly one spa; admins and staff belong to one
+COMMENT ON COLUMN therapist_bonuses.created_by IS 'The user who added it.';
+
+-- ======== 004_spas.sql ========
+-- Many spas in one system. Every business row belongs to exactly one spa; admins and staff belong to one
 -- spa and see only its data; a superadmin belongs to none and can open any spa. Existing data becomes spa 1.
 CREATE TABLE spas (
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -225,7 +236,10 @@ COMMENT ON COLUMN therapists.spa_id IS 'The spa this therapist works for.';
 COMMENT ON COLUMN services.spa_id IS 'The spa offering this service; name is unique within it.';
 COMMENT ON COLUMN appointments.spa_id IS 'The spa of the booking; always that of its customer, therapist and service.';
 COMMENT ON COLUMN therapist_bonuses.spa_id IS 'The spa of the therapist.';
-COMMENT ON COLUMN users.role IS 'superadmin (every spa, creates spas and their admins), admin (one spa, creates its staff) or staff.';\n\n-- ======== migrations/005_therapist_details.sql ========\n-- Profile details for therapists: personal, work, emergency/ID and salary bank.
+COMMENT ON COLUMN users.role IS 'superadmin (every spa, creates spas and their admins), admin (one spa, creates its staff) or staff.';
+
+-- ======== 005_therapist_details.sql ========
+-- Profile details for therapists: personal, work, emergency/ID and salary bank.
 ALTER TABLE therapists ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE therapists ADD COLUMN IF NOT EXISTS gender TEXT;
 ALTER TABLE therapists ADD COLUMN IF NOT EXISTS dob DATE;
@@ -257,7 +271,10 @@ COMMENT ON COLUMN therapists.bank_name IS 'Salary bank name';
 COMMENT ON COLUMN therapists.bank_account_name IS 'Salary account holder name';
 COMMENT ON COLUMN therapists.bank_account_number IS 'Salary account number';
 COMMENT ON COLUMN therapists.bank_ifsc IS 'Salary account IFSC';
-COMMENT ON COLUMN therapists.upi_id IS 'UPI ID for salary';\n\n-- ======== migrations/006_customer_plans.sql ========\n-- Prepaid customer plans: one balance is either hours or INR, never both.
+COMMENT ON COLUMN therapists.upi_id IS 'UPI ID for salary';
+
+-- ======== 006_customer_plans.sql ========
+-- Prepaid customer plans: one balance is either hours or INR, never both.
 CREATE TABLE customer_plans (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   customer_id BIGINT NOT NULL REFERENCES customers(id),
@@ -306,7 +323,10 @@ COMMENT ON COLUMN plan_redemptions.spa_id IS 'Owning spa for tenant isolation.';
 COMMENT ON COLUMN plan_redemptions.amount IS 'Amount deducted in the unit recorded alongside it.';
 COMMENT ON COLUMN plan_redemptions.unit IS 'hours or rupees, matching the plan type.';
 COMMENT ON COLUMN plan_redemptions.created_at IS 'When the appointment consumed the plan.';
-COMMENT ON COLUMN plan_redemptions.reversed_at IS 'When a deduction was reversed because the appointment left completed status.';\n\n-- ======== migrations/007_therapist_shifts.sql ========\n-- Reusable shift templates and a therapist's weekly shift assignment.
+COMMENT ON COLUMN plan_redemptions.reversed_at IS 'When a deduction was reversed because the appointment left completed status.';
+
+-- ======== 007_therapist_shifts.sql ========
+-- Reusable shift templates and a therapist's weekly shift assignment.
 -- day_of_week uses ISO numbering: Monday=0 through Sunday=6.
 CREATE TABLE shifts (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -347,7 +367,10 @@ COMMENT ON COLUMN therapist_shift_assignments.id IS 'Identity.';
 COMMENT ON COLUMN therapist_shift_assignments.spa_id IS 'Owning spa; must match the therapist and shift.';
 COMMENT ON COLUMN therapist_shift_assignments.therapist_id IS 'Therapist assigned to this weekly shift.';
 COMMENT ON COLUMN therapist_shift_assignments.shift_id IS 'Reusable shift template assigned for this weekday.';
-COMMENT ON COLUMN therapist_shift_assignments.created_at IS 'When the weekly assignment was created.';\n\n-- ======== migrations/008_plan_topups.sql ========\n-- Top-ups add to an existing prepaid plan; each one is kept so sales reports count it in its own period.
+COMMENT ON COLUMN therapist_shift_assignments.created_at IS 'When the weekly assignment was created.';
+
+-- ======== 008_plan_topups.sql ========
+-- Top-ups add to an existing prepaid plan; each one is kept so sales reports count it in its own period.
 CREATE TABLE plan_topups (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   plan_id BIGINT NOT NULL REFERENCES customer_plans(id),
@@ -366,7 +389,10 @@ COMMENT ON COLUMN plan_topups.spa_id IS 'Owning spa; same as the plan.';
 COMMENT ON COLUMN plan_topups.amount IS 'Amount added, in the plan unit (hours or rupees).';
 COMMENT ON COLUMN plan_topups.note IS 'Optional note, e.g. payment details.';
 COMMENT ON COLUMN plan_topups.created_by IS 'Login that added the top-up.';
-COMMENT ON COLUMN plan_topups.created_at IS 'When the top-up was added.';\n\n-- ======== migrations/009_appointment_payments.sql ========\n-- Payments received against appointments and immutable refund records.
+COMMENT ON COLUMN plan_topups.created_at IS 'When the top-up was added.';
+
+-- ======== 009_appointment_payments.sql ========
+-- Payments received against appointments and immutable refund records.
 CREATE TABLE payments (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   spa_id BIGINT NOT NULL REFERENCES spas(id),
@@ -413,12 +439,16 @@ COMMENT ON COLUMN payment_refunds.payment_id IS 'Original payment being refunded
 COMMENT ON COLUMN payment_refunds.amount IS 'Refunded amount in INR; cumulative refunds cannot exceed the payment.';
 COMMENT ON COLUMN payment_refunds.reason IS 'Optional reason for the refund.';
 COMMENT ON COLUMN payment_refunds.refunded_by IS 'Admin login that authorised the refund.';
-COMMENT ON COLUMN payment_refunds.refunded_at IS 'When the refund was recorded.';\n\n-- ======== migrations/010_customer_payment_preference.sql ========\n-- Optional preferred payment method shown as a default at checkout; transaction methods remain independent.
+COMMENT ON COLUMN payment_refunds.refunded_at IS 'When the refund was recorded.';
+
+-- ======== 010_customer_payment_preference.sql ========
+-- Optional preferred payment method shown as a default at checkout; transaction methods remain independent.
 ALTER TABLE customers ADD COLUMN preferred_payment_method TEXT;
 ALTER TABLE customers ADD CONSTRAINT customers_preferred_payment_method_check
   CHECK (preferred_payment_method IS NULL OR preferred_payment_method IN ('cash','upi','card','bank_transfer','other'));
 
-COMMENT ON COLUMN customers.preferred_payment_method IS 'Optional default payment method preference; each payment records its actual method independently.';\n
+COMMENT ON COLUMN customers.preferred_payment_method IS 'Optional default payment method preference; each payment records its actual method independently.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
