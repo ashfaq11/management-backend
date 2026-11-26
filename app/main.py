@@ -804,7 +804,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 if a["status"] == b.status:
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
-                deduction = plan = has_active = None
+                deduction = plan = None
                 if b.status == "completed" and b.plan_type:
                     # A booking cannot be settled twice: collected money and prepaid redemption are alternatives.
                     already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
@@ -822,14 +822,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
                            ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
                         (a["customer_id"], u["spa"], b.plan_type, amount))
-                    has_active = plan or t.one(
-                        """SELECT 1 FROM customer_plans WHERE customer_id=%s AND spa_id=%s AND plan_type=%s
-                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)""",
-                        (a["customer_id"], u["spa"], b.plan_type))
-                if b.status == "completed" and b.plan_type and has_active:
                     if not plan:
                         unit_label = "hours" if b.plan_type == "hours" else "rupees"
                         raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
+                if b.status == "completed" and b.plan_type:
                     t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
                     t.insert(
                         """INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit)
