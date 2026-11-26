@@ -754,6 +754,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
                 deduction = plan = has_active = None
                 if b.status == "completed" and b.plan_type:
+                    # A booking cannot be settled twice: collected money and prepaid redemption are alternatives.
+                    already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
+                                             AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                                      WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)
+                                             LIMIT 1""", (aid, u["spa"]))
+                    if already_paid:
+                        raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
                     # Staff explicitly chooses hours or rupees; never auto-select a balance type.
                     amount = (round(a["duration_min"] / 60.0, 2)
                               if b.plan_type == "hours" else round(float(a["price"]), 2))
@@ -812,6 +819,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
             if not a:
                 raise HTTPException(404, "Appointment not found")
+            if a["status"] in ("cancelled", "no_show"):
+                raise HTTPException(409, "Payments cannot be collected for a cancelled or no-show appointment")
             due = payment_due(t, a, u["spa"])
             if float(b.amount) - due > 0.005:
                 raise HTTPException(409, f"Payment exceeds the outstanding balance of Rs {due:.2f}")
@@ -879,21 +888,22 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                       WHERE p.id=%s AND p.spa_id=%s""", (pid, u["spa"]))
         if not p:
             raise HTTPException(404, "Receipt not found")
+        from xml.sax.saxutils import escape
         from reportlab.lib.pagesizes import A5
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
         buf = io.BytesIO()
         styles = getSampleStyleSheet()
         doc = SimpleDocTemplate(buf, pagesize=A5, title=f"Receipt SP-{pid:06d}")
-        story = [Paragraph(p["spa_name"], styles["Title"]), Paragraph("Payment receipt", styles["Heading2"]),
+        story = [Paragraph(escape(p["spa_name"]), styles["Title"]), Paragraph("Payment receipt", styles["Heading2"]),
                  Paragraph(f"Receipt: <b>SP-{pid:06d}</b>", styles["Normal"]),
-                 Paragraph(f"Customer: {p['customer']} ({p['phone']})", styles["Normal"]),
-                 Paragraph(f"Appointment: {str(p['start_at']).replace('T',' ')[:16]} · {p['service']}", styles["Normal"]),
-                 Paragraph(f"Therapist: {p['therapist']}", styles["Normal"]), Spacer(1,10),
+                 Paragraph(f"Customer: {escape(p['customer'])} ({escape(p['phone'])})", styles["Normal"]),
+                 Paragraph(f"Appointment: {escape(str(p['start_at']).replace('T',' ')[:16])} · {escape(p['service'])}", styles["Normal"]),
+                 Paragraph(f"Therapist: {escape(p['therapist'])}", styles["Normal"]), Spacer(1,10),
                  Table([["Amount received", f"Rs {float(p['amount']):,.2f}"],
                         ["Payment method", p["method"].replace("_"," ").title()],
-                        ["Reference", p["reference"] or "—"],
-                        ["Note", p["note"] or "—"]], colWidths=[100,180])]
+                        ["Reference", escape(p["reference"] or "—")],
+                        ["Note", escape(p["note"] or "—")]], colWidths=[100,180])]
         doc.build(story)
         return Response(buf.getvalue(), media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="receipt_SP-{pid:06d}.pdf"'})
