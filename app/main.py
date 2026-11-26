@@ -854,9 +854,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 if a["status"] == b.status:
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
-                deduction = plan = has_active = None
+                deduction = plan = None
                 if b.status == "completed" and b.plan_type:
-                    # Staff explicitly chooses hours or rupees; never auto-select a balance type.
+                    already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
+                                             AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                                      WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)
+                                             LIMIT 1""", (aid, u["spa"]))
+                    if already_paid:
+                        raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
                     amount = (round(a["duration_min"] / 60.0, 2)
                               if b.plan_type == "hours" else round(float(a["price"]), 2))
                     plan = t.one(
@@ -865,11 +870,6 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
                            ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
                         (a["customer_id"], u["spa"], b.plan_type, amount))
-                    has_active = plan or t.one(
-                        """SELECT 1 FROM customer_plans WHERE customer_id=%s AND spa_id=%s AND plan_type=%s
-                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)""",
-                        (a["customer_id"], u["spa"], b.plan_type))
-                if b.status == "completed" and b.plan_type and has_active:
                     if not plan:
                         unit_label = "hours" if b.plan_type == "hours" else "rupees"
                         raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
@@ -882,7 +882,6 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
                                  "amount": amount, "unit": b.plan_type, "remaining_balance": remaining}
                 elif a["status"] == "completed":
-                    # Re-open/cancel a completed booking: refund its active package deduction.
                     redemption = t.one(
                         """SELECT r.*, p.name FROM plan_redemptions r
                            JOIN customer_plans p ON p.id=r.plan_id
@@ -892,11 +891,128 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s",
                               (redemption["amount"], redemption["plan_id"]))
                         t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (redemption["id"],))
-                t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s",
-                      (b.status, aid))
+                t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
         return {"id": aid, "status": b.status, "plan_deduction": deduction}
+
+    # ---- appointment payments ------------------------------------------
+    def payment_due(t, appointment: dict, spa: int) -> float:
+        prepaid = t.one("SELECT 1 FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
+                        (appointment["id"], spa))
+        paid = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                              WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS total
+                         FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""",
+                     (appointment["id"], spa))["total"]
+        return 0.0 if prepaid else max(round(float(appointment["price"])-float(paid), 2), 0.0)
+
+    @app.post("/api/appointments/{aid}/payments", status_code=201)
+    def collect_payment(aid: int, b: PaymentIn, u=Depends(member)):
+        with db.tx() as t:
+            a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
+            if not a:
+                raise HTTPException(404, "Appointment not found")
+            if a["status"] in ("cancelled", "no_show"):
+                raise HTTPException(409, "Payments cannot be collected for a cancelled or no-show appointment")
+            due = payment_due(t, a, u["spa"])
+            if float(b.amount) - due > 0.005:
+                raise HTTPException(409, f"Payment exceeds the outstanding balance of Rs {due:.2f}")
+            pid = t.insert("""INSERT INTO payments(spa_id,appointment_id,customer_id,amount,method,reference,note,received_by)
+                              VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           (u["spa"], aid, a["customer_id"], b.amount, b.method,
+                            (b.reference or "").strip() or None, (b.note or "").strip() or None, u["id"]))
+            remaining = round(due - float(b.amount), 2)
+        return {"id": pid, "receipt_number": f"SP-{pid:06d}", "balance_due": remaining}
+
+    @app.get("/api/payments")
+    def payments(received_on: dt.date | None = None, u=Depends(member)):
+        """Payment and refund activity for the selected settlement day."""
+        day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
+        return db.all("""SELECT activity.*, activity.activity_at AS received_at FROM (
+                           SELECT 'payment'::text AS event_type, p.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, p.amount, p.method, p.reference, p.note,
+                                  p.received_at AS activity_at, c.name AS customer, c.phone, a.start_at,
+                                  COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
+                           FROM payments p JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
+                              WHERE payment_id=p.id AND spa_id=p.spa_id) r ON TRUE
+                           WHERE p.spa_id=%s AND p.received_at::date=%s
+                           UNION ALL
+                           SELECT 'refund'::text AS event_type, r.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, r.amount, p.method, p.reference,
+                                  r.reason AS note, r.refunded_at AS activity_at, c.name AS customer, c.phone,
+                                  a.start_at, 0::numeric AS refunded_amount, -r.amount AS net_amount
+                           FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                           JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           WHERE r.spa_id=%s AND r.refunded_at::date=%s
+                         ) activity ORDER BY activity_at DESC, event_type DESC, id DESC LIMIT 1000""",
+                        (u["spa"], day, u["spa"], day))
+
+    @app.post("/api/payments/{pid}/refunds", status_code=201)
+    def refund_payment(pid: int, b: RefundIn, u=Depends(admin)):
+        with db.tx() as t:
+            p = t.one("SELECT * FROM payments WHERE id=%s AND spa_id=%s FOR UPDATE", (pid, u["spa"]))
+            if not p:
+                raise HTTPException(404, "Payment not found")
+            refunded = t.one("SELECT COALESCE(SUM(amount),0) AS total FROM payment_refunds WHERE payment_id=%s AND spa_id=%s",
+                             (pid, u["spa"]))["total"]
+            remaining = round(float(p["amount"])-float(refunded), 2)
+            if float(b.amount) - remaining > 0.005:
+                raise HTTPException(409, f"Refund exceeds the refundable balance of Rs {remaining:.2f}")
+            rid = t.insert("""INSERT INTO payment_refunds(spa_id,payment_id,amount,reason,refunded_by)
+                              VALUES(%s,%s,%s,%s,%s)""",
+                           (u["spa"], pid, b.amount, (b.reason or "").strip() or None, u["id"]))
+        return {"id": rid, "refundable_balance": round(remaining-float(b.amount),2)}
+
+    @app.get("/api/payments/settlement")
+    def payment_settlement(received_on: dt.date | None = None, u=Depends(member)):
+        day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
+        gross_rows = db.all("""SELECT method, COUNT(*) AS count, COALESCE(SUM(amount),0) AS gross
+                               FROM payments WHERE spa_id=%s AND received_at::date=%s
+                               GROUP BY method ORDER BY method""", (u["spa"], day))
+        refund_rows = db.all("""SELECT p.method, COALESCE(SUM(r.amount),0) AS refunds
+                                FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                                WHERE r.spa_id=%s AND r.refunded_at::date=%s GROUP BY p.method""", (u["spa"], day))
+        by_method = {x["method"]: {"method": x["method"], "count": int(x["count"]),
+                                   "gross": float(x["gross"]), "refunds": 0.0} for x in gross_rows}
+        for x in refund_rows:
+            by_method.setdefault(x["method"], {"method": x["method"], "count": 0, "gross": 0.0, "refunds": 0.0})["refunds"] = float(x["refunds"])
+        gross = sum(x["gross"] for x in by_method.values())
+        refunds = sum(x["refunds"] for x in by_method.values())
+        return {"date": day, "methods": sorted(by_method.values(), key=lambda x: x["method"]),
+                "gross": round(gross,2), "refunds": round(refunds,2), "net": round(gross-refunds,2)}
+
+    @app.get("/api/payments/{pid}/receipt")
+    def payment_receipt(pid: int, u=Depends(member)):
+        p = db.one("""SELECT p.*, c.name AS customer, c.phone, a.start_at, s.name AS service,
+                             t.name AS therapist, sp.name AS spa_name
+                      FROM payments p JOIN customers c ON c.id=p.customer_id
+                      JOIN appointments a ON a.id=p.appointment_id JOIN services s ON s.id=a.service_id
+                      JOIN therapists t ON t.id=a.therapist_id JOIN spas sp ON sp.id=p.spa_id
+                      WHERE p.id=%s AND p.spa_id=%s""", (pid, u["spa"]))
+        if not p:
+            raise HTTPException(404, "Receipt not found")
+        from xml.sax.saxutils import escape
+        from reportlab.lib.pagesizes import A5
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
+        buf = io.BytesIO()
+        styles = getSampleStyleSheet()
+        doc = SimpleDocTemplate(buf, pagesize=A5, title=f"Receipt SP-{pid:06d}")
+        story = [Paragraph(escape(p["spa_name"]), styles["Title"]), Paragraph("Payment receipt", styles["Heading2"]),
+                 Paragraph(f"Receipt: <b>SP-{pid:06d}</b>", styles["Normal"]),
+                 Paragraph(f"Customer: {escape(p['customer'])} ({escape(p['phone'])})", styles["Normal"]),
+                 Paragraph(f"Appointment: {escape(str(p['start_at']).replace('T',' ')[:16])} · {escape(p['service'])}", styles["Normal"]),
+                 Paragraph(f"Therapist: {escape(p['therapist'])}", styles["Normal"]), Spacer(1,10),
+                 Table([["Amount received", f"Rs {float(p['amount']):,.2f}"],
+                        ["Payment method", p["method"].replace("_"," ").title()],
+                        ["Reference", escape(p["reference"] or "—")],
+                        ["Note", escape(p["note"] or "—")]], colWidths=[100,180])]
+        doc.build(story)
+        return Response(buf.getvalue(), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="receipt_SP-{pid:06d}.pdf"'})
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
     def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
