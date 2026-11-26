@@ -566,7 +566,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         by_status = db.all(f"""SELECT a.status, COUNT(*) AS count, COALESCE(SUM(a.price),0) AS amount
                                FROM appointments a WHERE a.start_at >= %s AND a.start_at < %s{who}
                                GROUP BY a.status ORDER BY a.status""", args)
-        lines = db.all(f"""SELECT a.id, a.start_at, a.price, c.name AS customer, s.name AS service,
+        lines = db.all(f"""SELECT a.id, a.start_at, a.duration_min, a.price, c.name AS customer, s.name AS service,
                                   t.id AS therapist_id, t.name AS therapist
                            FROM appointments a JOIN customers c ON c.id=a.customer_id
                            JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
@@ -576,16 +576,19 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         by_therapist: dict[int, dict] = {}
         for r in lines:
             price = payroll.money(r["price"])
-            sv = by_service.setdefault(r["service"], {"service": r["service"], "count": 0, "revenue": 0})
+            sv = by_service.setdefault(r["service"], {"service": r["service"], "count": 0, "minutes": 0, "revenue": 0})
             sv["count"] += 1
+            sv["minutes"] += r["duration_min"]
             sv["revenue"] = payroll.money(sv["revenue"]) + price
             th = by_therapist.setdefault(r["therapist_id"], {"therapist_id": r["therapist_id"],
                                                               "therapist": r["therapist"], "count": 0,
-                                                              "revenue": 0, "services": {}})
+                                                              "minutes": 0, "revenue": 0, "services": {}})
             th["count"] += 1
+            th["minutes"] += r["duration_min"]
             th["revenue"] = payroll.money(th["revenue"]) + price
-            ts = th["services"].setdefault(r["service"], {"service": r["service"], "count": 0, "revenue": 0})
+            ts = th["services"].setdefault(r["service"], {"service": r["service"], "count": 0, "minutes": 0, "revenue": 0})
             ts["count"] += 1
+            ts["minutes"] += r["duration_min"]
             ts["revenue"] = payroll.money(ts["revenue"]) + price
 
         def out(d: dict) -> dict:
@@ -601,7 +604,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
         return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
                 "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
-                "services_count": len(lines), "new_customers": new_c, "by_status": by_status,
+                "services_count": len(lines), "minutes": sum(r["duration_min"] for r in lines), "new_customers": new_c, "by_status": by_status,
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
                 "by_therapist": therapists, "lines": lines}
 
@@ -639,11 +642,12 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["Date", "Time", "Customer", "Service", "Therapist", "Price"])
+        w.writerow(["Date", "Time", "Customer", "Service", "Therapist", "Minutes", "Price"])
         for x in r["lines"]:
             when = str(x["start_at"]).replace(" ", "T")
-            w.writerow([when[:10], when[11:16], x["customer"], x["service"], x["therapist"], f"{float(x['price']):.2f}"])
-        w.writerow(["Total", "", "", "", "", f"{r['revenue']:.2f}"])
+            w.writerow([when[:10], when[11:16], x["customer"], x["service"], x["therapist"], x["duration_min"],
+                        f"{float(x['price']):.2f}"])
+        w.writerow(["Total", "", "", "", "", r["minutes"], f"{r['revenue']:.2f}"])
         return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 

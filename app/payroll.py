@@ -128,28 +128,29 @@ def report_pdf(r: dict, business: str) -> bytes:
         f.append(Paragraph(f"New customers: {r['new_customers']}", st["Normal"]))
 
     f += [Spacer(1, 10), Paragraph("By service", st["Heading3"])]
-    rows = [["Service", "Done", "Revenue"]] + [[x["service"], x["count"], amt(x["revenue"])] for x in r["by_service"]]
-    rows.append(["Total", r["services_count"], amt(r["revenue"])])
-    f.append(table(rows, [300, 70, 100], total=True))
+    rows = [["Service", "Done", "Minutes", "Revenue"]] + [[x["service"], x["count"], x.get("minutes", ""), amt(x["revenue"])]
+                                                         for x in r["by_service"]]
+    rows.append(["Total", r["services_count"], r.get("minutes", ""), amt(r["revenue"])])
+    f.append(table(rows, [260, 60, 70, 90], total=True, numeric=3))
 
     f += [Spacer(1, 10), Paragraph("By therapist", st["Heading3"])]
-    rows = [["Therapist / service", "Done", "Amount"]]
+    rows = [["Therapist / service", "Done", "Minutes", "Amount"]]
     bold = []
     for t in r["by_therapist"]:
         bold.append(len(rows))
-        rows.append([t["therapist"], t["count"], amt(t["revenue"])])
-        rows += [["    " + x["service"], x["count"], amt(x["revenue"])] for x in t["services"]]
+        rows.append([t["therapist"], t["count"], t.get("minutes", ""), amt(t["revenue"])])
+        rows += [["    " + x["service"], x["count"], x.get("minutes", ""), amt(x["revenue"])] for x in t["services"]]
     if len(rows) == 1:
-        rows.append(["-", "-", "-"])
-    tt = table(rows, [300, 70, 100])
+        rows.append(["-", "-", "-", "-"])
+    tt = table(rows, [260, 60, 70, 90], numeric=3)
     tt.setStyle(TableStyle([("FONTNAME", (0, i), (-1, i), "Helvetica-Bold") for i in bold]))
     f.append(tt)
 
     f += [Spacer(1, 10), Paragraph("All services done", st["Heading3"])]
-    rows = [["Date", "Customer", "Service", "Therapist", "Price"]]
-    rows += [[str(x["start_at"]).replace("T", " ")[:16], x["customer"], x["service"], x["therapist"], amt(x["price"])]
-             for x in r["lines"]] or [["-", "-", "-", "-", "-"]]
-    rows.append(["Total", "", "", "", amt(r["revenue"])])
-    f.append(table(rows, [85, 120, 110, 95, 60], total=True, numeric=1))
+    rows = [["Date", "Customer", "Service", "Therapist", "Min", "Price"]]
+    rows += [[str(x["start_at"]).replace("T", " ")[:16], x["customer"], x["service"], x["therapist"], x["duration_min"],
+              amt(x["price"])] for x in r["lines"]] or [["-", "-", "-", "-", "-", "-"]]
+    rows.append(["Total", "", "", "", r.get("minutes", ""), amt(r["revenue"])])
+    f.append(table(rows, [85, 110, 100, 90, 35, 55], total=True, numeric=2))
     doc.build(f)
     return buf.getvalue()
