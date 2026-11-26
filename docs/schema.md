@@ -121,6 +121,7 @@ Prepaid package owned by one customer in one spa. A balance is measured in hours
 | `notes` | text | yes |  | Optional purchase or package notes. |
 | `created_at` | timestamp with time zone | no | `now()` | When the plan was added to the customer. |
 | `price_paid` | numeric(12,2) | yes |  | Money received when the plan was sold (INR); counted as revenue on the sale date. |
+| `paid_at` | timestamp with time zone | yes |  | When the plan cost was received; NULL = payment pending. Plan sales count on this date. |
 
 **Constraints**
 
@@ -298,6 +299,7 @@ Amounts added to an existing prepaid plan after it was sold.
 | `created_by` | bigint | yes |  | Login that added the top-up. |
 | `created_at` | timestamp with time zone | no | `now()` | When the top-up was added. |
 | `price_paid` | numeric(12,2) | yes |  | Money received for this top-up (INR); counted as revenue on the top-up date. |
+| `paid_at` | timestamp with time zone | yes |  | When the top-up cost was received; NULL = payment pending. Plan sales count on this date. |
 
 **Constraints**
 

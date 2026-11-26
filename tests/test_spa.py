@@ -972,3 +972,21 @@ class TestPriorityOneOperations(Base):
             first_appointment={"customer_id":0,"therapist_id":t,"service_id":s,"start_at":"2026-11-24T15:00"})
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(self.c.get("/api/customers?q=9991000023",headers=self.h).json(),[])
+
+
+class TestPlanPaidStatus(Base):
+    def test_pending_plan_counts_in_revenue_only_when_paid(self):
+        import datetime as d
+        _, _, c = self.seed()
+        pid = self.post(f"/api/customers/{c}/plans", name="10 hrs", plan_type="hours", amount=10, price_paid=9000,
+                        paid=False).json()["id"]
+        m = d.date.today().strftime("%Y-%m")
+        r = self.c.get(f"/api/reports/summary?month={m}", headers=self.h).json()
+        self.assertEqual((r["plan_sales"], r["plan_dues"], r["plan_dues_count"]), (0.0, 9000.0, 1))
+        self.assertIsNone(self.c.get(f"/api/customers/{c}", headers=self.h).json()["plans"][0]["paid_at"])
+        self.assertEqual(self.c.put(f"/api/customers/{c}/plans/{pid}/paid", json={"paid": True}, headers=self.h).status_code, 200)
+        r = self.c.get(f"/api/reports/summary?month={m}", headers=self.h).json()
+        self.assertEqual((r["plan_sales"], r["plan_dues"]), (9000.0, 0.0))
+        self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=2, price_paid=1800, paid=False)
+        r = self.c.get(f"/api/reports/summary?month={m}", headers=self.h).json()
+        self.assertEqual((r["plan_sales"], r["plan_dues"]), (9000.0, 1800.0))

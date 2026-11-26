@@ -124,6 +124,7 @@ class CustomerPlanIn(BaseModel):
     expires_on: Optional[dt.date] = None
     notes: Optional[str] = Field(default=None, max_length=500)
     price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)  # INR; rupee plans default to amount
+    paid: bool = True  # False = sold on credit, payment pending
 
 
 class CustomerPlanUpdate(BaseModel):
@@ -145,6 +146,11 @@ class PlanTopUp(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
     price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)
     note: Optional[str] = Field(default=None, max_length=500)
+    paid: bool = True
+
+
+class PaidIn(BaseModel):
+    paid: bool
 
 
 class ExpenseIn(BaseModel):
@@ -507,7 +513,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
         c["plans"] = db.all(
             """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
-                                      WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
+                                      WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount,
+                      COALESCE((SELECT json_agg(json_build_object('id',x.id,'amount',x.amount,'price_paid',x.price_paid,
+                                                                  'created_at',x.created_at) ORDER BY x.id)
+                                FROM plan_topups x WHERE x.plan_id=p.id AND x.paid_at IS NULL),'[]'::json) AS pending_topups
                FROM customer_plans p WHERE p.customer_id=%s AND p.spa_id=%s
                ORDER BY p.created_at DESC, p.id DESC""", (cid, u["spa"]))
         c["payments"] = db.all(
@@ -1018,10 +1027,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(404, "Customer not found")
             pid = t.insert(
                 """INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,
-                                               price_paid)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                               price_paid,paid_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
                 (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes,
-                 paid_for(b.plan_type, b.amount, b.price_paid)))
+                 paid_for(b.plan_type, b.amount, b.price_paid), b.paid))
         return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
     @app.put("/api/customers/{cid}/plans/{pid}")
@@ -1033,6 +1042,21 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Plan not found")
         return {"id": pid}
 
+    @app.put("/api/customers/{cid}/plans/{pid}/paid")
+    def set_plan_paid(cid: int, pid: int, b: PaidIn, u=Depends(admin)):
+        """Mark a plan's cost received (revenue counts it today) or back to pending."""
+        if not db.run("""UPDATE customer_plans SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END
+                         WHERE id=%s AND customer_id=%s AND spa_id=%s""", (b.paid, pid, cid, u["spa"])):
+            raise HTTPException(404, "Plan not found")
+        return {"id": pid, "paid": b.paid}
+
+    @app.put("/api/plan-topups/{tid}/paid")
+    def set_topup_paid(tid: int, b: PaidIn, u=Depends(admin)):
+        if not db.run("UPDATE plan_topups SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END WHERE id=%s AND spa_id=%s",
+                      (b.paid, tid, u["spa"])):
+            raise HTTPException(404, "Top-up not found")
+        return {"id": tid, "paid": b.paid}
+
     @app.post("/api/customers/{cid}/plans/{pid}/topup", status_code=201)
     def top_up_plan(cid: int, pid: int, b: PlanTopUp, u=Depends(admin)):
         """Add hours or rupees to a plan: both the purchased amount and the balance grow."""
@@ -1043,10 +1067,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(404, "Plan not found")
             t.run("UPDATE customer_plans SET purchased_amount=purchased_amount+%s, balance=balance+%s WHERE id=%s",
                   (b.amount, b.amount, pid))
-            t.insert("""INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by,price_paid)
-                        VALUES(%s,%s,%s,%s,%s,%s)""",
+            t.insert("""INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by,price_paid,paid_at)
+                        VALUES(%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
                      (pid, u["spa"], b.amount, (b.note or "").strip() or None, u["id"],
-                      paid_for(p["plan_type"], b.amount, b.price_paid)))
+                      paid_for(p["plan_type"], b.amount, b.price_paid), b.paid))
         return {"id": pid, "balance": round(float(p["balance"]) + b.amount, 2),
                 "purchased_amount": round(float(p["purchased_amount"]) + b.amount, 2)}
 
@@ -1062,10 +1086,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
             pid = None
             if b.plan:
-                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid)
-                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid,paid_at)
+                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
                                (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
-                                b.plan.expires_on, b.plan.notes, paid_for(b.plan.plan_type,b.plan.amount,b.plan.price_paid)))
+                                b.plan.expires_on, b.plan.notes, paid_for(b.plan.plan_type,b.plan.amount,b.plan.price_paid),
+                                b.plan.paid))
         return {"customer_id": cid, "appointment_id": aid, "plan_id": pid}
 
     # ---- reports & payroll (admin) --------------------------------------
@@ -1197,16 +1222,23 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         cust = " AND p.customer_id=%s" if customer_id is not None else ""
         cargs = (customer_id,) if customer_id is not None else ()
         plan_rows = [] if (therapist_id is not None or service_id is not None) else db.all(
-            f"""SELECT 'plan' AS kind, p.created_at AS at, c.name AS customer, p.name AS plan, p.plan_type,
+            f"""SELECT 'plan' AS kind, p.paid_at AS at, c.name AS customer, p.name AS plan, p.plan_type,
                        p.purchased_amount - COALESCE((SELECT SUM(x.amount) FROM plan_topups x WHERE x.plan_id=p.id),0)
                          AS amount, COALESCE(p.price_paid,0) AS price_paid
                 FROM customer_plans p JOIN customers c ON c.id=p.customer_id
-                WHERE p.spa_id=%s AND p.created_at >= %s AND p.created_at < %s{cust}
+                WHERE p.spa_id=%s AND p.paid_at >= %s AND p.paid_at < %s{cust}
                 UNION ALL
-                SELECT 'topup', x.created_at, c.name, p.name, p.plan_type, x.amount, COALESCE(x.price_paid,0)
+                SELECT 'topup', x.paid_at, c.name, p.name, p.plan_type, x.amount, COALESCE(x.price_paid,0)
                 FROM plan_topups x JOIN customer_plans p ON p.id=x.plan_id JOIN customers c ON c.id=p.customer_id
-                WHERE x.spa_id=%s AND x.created_at >= %s AND x.created_at < %s{cust}
+                WHERE x.spa_id=%s AND x.paid_at >= %s AND x.paid_at < %s{cust}
                 ORDER BY 2""", (u["spa"], lo, hi, *cargs, u["spa"], lo, hi, *cargs))
+        pending = db.one(f"""SELECT COALESCE(SUM(v),0) AS v, COUNT(*) AS n FROM (
+                               SELECT COALESCE(p.price_paid,0) AS v FROM customer_plans p
+                                WHERE p.spa_id=%s AND p.paid_at IS NULL{cust}
+                               UNION ALL
+                               SELECT COALESCE(x.price_paid,0) FROM plan_topups x JOIN customer_plans p ON p.id=x.plan_id
+                                WHERE x.spa_id=%s AND x.paid_at IS NULL{cust}) q""",
+                         (u["spa"], *cargs, u["spa"], *cargs))
         plan_sales = sum((payroll.money(x["price_paid"]) for x in plan_rows), payroll.money(0))
         by_plan = db.one(f"""SELECT COALESCE(SUM(a.price),0) AS v FROM appointments a
                               WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s{who}
@@ -1223,7 +1255,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                        db.all("SELECT * FROM therapists WHERE spa_id=%s AND is_active", (u["spa"],))), payroll.money(0))
         return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
                 "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
-                "plan_sales": float(plan_sales), "paid_by_plan": float(paid_by_plan),
+                "plan_sales": float(plan_sales), "plan_dues": float(pending["v"]), "plan_dues_count": int(pending["n"]),
+                "paid_by_plan": float(paid_by_plan),
                 "collected": float(rev - paid_by_plan + plan_sales), "plan_lines": plan_rows,
                 "payroll": None if pay is None else float(pay),
                 "expenses": float(exp_total), "expense_lines": exp_rows,
