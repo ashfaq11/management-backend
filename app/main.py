@@ -35,6 +35,19 @@ class CustomerIn(BaseModel):
     dob: Optional[dt.date] = None
     address: Optional[str] = None
     notes: Optional[str] = None
+    preferred_payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None
+
+
+class PaymentIn(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    method: Literal["cash", "upi", "card", "bank_transfer", "other"]
+    reference: Optional[str] = Field(default=None, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RefundIn(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    reason: Optional[str] = Field(default=None, max_length=500)
 
 
 class TherapistIn(BaseModel):
@@ -173,6 +186,7 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
 
 class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
+    plan: Optional[CustomerPlanIn] = None
 
 
 class BonusIn(BaseModel):
@@ -431,9 +445,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     def insert_customer(t, b: CustomerIn, spa: int) -> int:
         try:
-            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,spa_id)
-                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, spa))
+            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,preferred_payment_method,spa_id)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes,
+                             b.preferred_payment_method, spa))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
 
@@ -448,6 +463,18 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         with db.tx() as t:
             return {"id": insert_customer(t, b, u["spa"])}
 
+    @app.get("/api/customers/page")
+    def customer_page(q: str = "", page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
+                      u=Depends(member)):
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        total = db.one("""SELECT COUNT(*) AS n FROM customers
+                          WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)""",
+                       (u["spa"], like, like))["n"]
+        items = db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)
+                          ORDER BY lower(name), id LIMIT %s OFFSET %s""",
+                       (u["spa"], like, like, page_size, (page - 1) * page_size))
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
+
     @app.get("/api/customers/{cid}")
     def customer(cid: int, u=Depends(member)):
         c = db.one("SELECT * FROM customers WHERE id=%s AND spa_id=%s", (cid, u["spa"]))
@@ -456,7 +483,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         c["appointments"] = db.all(
             """SELECT a.*, s.name AS service, t.name AS therapist,
                       p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit,
-                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at
+                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at,
+                      COALESCE(pay.paid_amount,0) AS paid_amount,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 0
+                           ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 'prepaid'
+                           WHEN a.price=0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                           WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                           ELSE 'pending' END AS payment_status
                FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                LEFT JOIN LATERAL (
@@ -465,20 +499,33 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                    ORDER BY x.created_at DESC, x.id DESC LIMIT 1
                ) r ON TRUE
                LEFT JOIN customer_plans p ON p.id=r.plan_id
+               LEFT JOIN LATERAL (
+                   SELECT SUM(pm.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                  WHERE rf.payment_id=pm.id AND rf.spa_id=pm.spa_id),0)) AS paid_amount
+                   FROM payments pm WHERE pm.appointment_id=a.id AND pm.spa_id=a.spa_id
+               ) pay ON TRUE
                WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
         c["plans"] = db.all(
             """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
                                       WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
                FROM customer_plans p WHERE p.customer_id=%s AND p.spa_id=%s
                ORDER BY p.created_at DESC, p.id DESC""", (cid, u["spa"]))
+        c["payments"] = db.all(
+            """SELECT p.id, p.appointment_id, p.amount, p.method, p.reference, p.note, p.received_at,
+                      COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
+               FROM payments p LEFT JOIN LATERAL (
+                   SELECT SUM(amount) AS amount FROM payment_refunds WHERE payment_id=p.id AND spa_id=p.spa_id
+               ) r ON TRUE
+               WHERE p.customer_id=%s AND p.spa_id=%s ORDER BY p.received_at DESC, p.id DESC""", (cid, u["spa"]))
         return c
 
     @app.put("/api/customers/{cid}")
     def edit_customer(cid: int, b: CustomerIn, u=Depends(member)):
         try:
             n = db.run("""UPDATE customers SET name=%s,phone=%s,email=%s,gender=%s,dob=%s,address=%s,notes=%s,
-                          updated_at=now() WHERE id=%s AND spa_id=%s""",
-                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, cid, u["spa"]))
+                          preferred_payment_method=%s,updated_at=now() WHERE id=%s AND spa_id=%s""",
+                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes,
+                        b.preferred_payment_method, cid, u["spa"]))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
         if not n:
