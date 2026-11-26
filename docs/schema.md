@@ -16,10 +16,6 @@ erDiagram
   spas ||--o{ customers : has
   users ||--o{ expenses : has
   spas ||--o{ expenses : has
-  appointments ||--o{ plan_redemptions : has
-  customer_plans ||--o{ plan_redemptions : has
-  spas ||--o{ plan_redemptions : has
-  users ||--o{ plan_topups : has
   payments ||--o{ payment_refunds : has
   users ||--o{ payment_refunds : has
   spas ||--o{ payment_refunds : has
@@ -27,6 +23,10 @@ erDiagram
   customers ||--o{ payments : has
   users ||--o{ payments : has
   spas ||--o{ payments : has
+  appointments ||--o{ plan_redemptions : has
+  customer_plans ||--o{ plan_redemptions : has
+  spas ||--o{ plan_redemptions : has
+  users ||--o{ plan_topups : has
   customer_plans ||--o{ plan_topups : has
   spas ||--o{ plan_topups : has
   spas ||--o{ recurring_expenses : has
@@ -50,6 +50,8 @@ erDiagram
 | [`customer_plans`](#customer_plans) | Prepaid package owned by one customer in one spa. A balance is measured in hours or INR. |
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
 | [`expenses`](#expenses) | One-off spa costs on a given date. |
+| [`payment_refunds`](#payment_refunds) | Immutable partial or full refunds against recorded appointment payments. |
+| [`payments`](#payments) | Amounts collected from customers against appointments; multiple partial payments are allowed. |
 | [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
 | [`plan_topups`](#plan_topups) | Amounts added to an existing prepaid plan after it was sold. |
 | [`recurring_expenses`](#recurring_expenses) | A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active. |
@@ -157,6 +159,7 @@ Spa clients, created by onboarding or by hand.
 **Constraints**
 
 - Check `customers_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `customers_preferred_payment_method_check`: `CHECK (((preferred_payment_method IS NULL) OR (preferred_payment_method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text]))))`
 - Foreign key `customers_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `customers_pkey`: `PRIMARY KEY (id)`
 - Unique `customers_phone_key`: `UNIQUE (spa_id, phone)`
@@ -193,7 +196,6 @@ One-off spa costs on a given date.
 
 - `expenses_spa_date_idx`: `CREATE INDEX expenses_spa_date_idx ON expenses USING btree (spa_id, on_date)`
 
-
 ## payment_refunds
 
 Immutable partial or full refunds against recorded appointment payments.
@@ -208,6 +210,18 @@ Immutable partial or full refunds against recorded appointment payments.
 | `refunded_by` | bigint | yes |  | Admin login that authorised the refund. |
 | `refunded_at` | timestamp with time zone | no | `now()` | When the refund was recorded. |
 
+**Constraints**
+
+- Check `payment_refunds_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Foreign key `payment_refunds_payment_id_fkey`: `FOREIGN KEY (payment_id) REFERENCES payments(id)`
+- Foreign key `payment_refunds_refunded_by_fkey`: `FOREIGN KEY (refunded_by) REFERENCES users(id)`
+- Foreign key `payment_refunds_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `payment_refunds_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `payment_refunds_payment_idx`: `CREATE INDEX payment_refunds_payment_idx ON payment_refunds USING btree (spa_id, payment_id, refunded_at)`
+
 ## payments
 
 Amounts collected from customers against appointments; multiple partial payments are allowed.
@@ -220,12 +234,26 @@ Amounts collected from customers against appointments; multiple partial payments
 | `customer_id` | bigint | no |  | Customer from whom payment was received. |
 | `amount` | numeric(12,2) | no |  | Gross amount received in INR. |
 | `method` | text | no |  | Collection method: cash, UPI, card, bank transfer, or other. |
-| `reference` | text | yes |  | Optional transaction reference. |
-| `note` | text | yes |  | Optional cashier note. |
+| `reference` | text | yes |  | Optional transaction reference, e.g. UPI reference or card slip. |
+| `note` | text | yes |  | Optional note entered by the cashier. |
 | `received_by` | bigint | yes |  | Login that recorded the payment. |
-| `received_at` | timestamp with time zone | no | `now()` | Payment receipt timestamp. |
+| `received_at` | timestamp with time zone | no | `now()` | Local settlement timestamp for daily collection reports. |
 | `created_at` | timestamp with time zone | no | `now()` | When the payment record was created. |
 
+**Constraints**
+
+- Check `payments_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `payments_method_check`: `CHECK ((method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text])))`
+- Foreign key `payments_appointment_id_fkey`: `FOREIGN KEY (appointment_id) REFERENCES appointments(id)`
+- Foreign key `payments_customer_id_fkey`: `FOREIGN KEY (customer_id) REFERENCES customers(id)`
+- Foreign key `payments_received_by_fkey`: `FOREIGN KEY (received_by) REFERENCES users(id)`
+- Foreign key `payments_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `payments_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `payments_appointment_idx`: `CREATE INDEX payments_appointment_idx ON payments USING btree (spa_id, appointment_id, received_at)`
+- `payments_spa_received_idx`: `CREATE INDEX payments_spa_received_idx ON payments USING btree (spa_id, received_at DESC)`
 
 ## plan_redemptions
 
