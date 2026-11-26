@@ -243,7 +243,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         yield
         db.close()
 
-    app = FastAPI(title="Spa Management API", lifespan=lifespan)
+    app = FastAPI(title="StudioDesk API", lifespan=lifespan)
     app.state.db = db
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],

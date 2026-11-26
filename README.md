@@ -1,4 +1,4 @@
-# Spa Manager - backend
+# StudioDesk - backend
 
 FastAPI + PostgreSQL REST service: login, customers, onboarding, appointments, incentive reports and PDF payslips.
 The web UI lives in the separate `management-ui` (Angular) repo.
