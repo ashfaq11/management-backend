@@ -682,3 +682,21 @@ class TestCustomerPlans(Base):
         h2 = {"Authorization": f"Bearer {tok}"}
         self.assertEqual(self.c.post(f"/api/customers/{c}/plans",
                          json={"name": "Wrong spa", "plan_type": "hours", "amount": 2}, headers=h2).status_code, 404)
+
+
+class TestPlanUpdates(Base):
+    def test_edit_and_top_up_plan(self):
+        _, _, c = self.seed()
+        pid = self.post(f"/api/customers/{c}/plans", name="5 hrs", plan_type="hours", amount=5).json()["id"]
+        r = self.c.put(f"/api/customers/{c}/plans/{pid}", json={"name": "Gold 5 hrs", "expires_on": "2030-01-01",
+                                                                 "notes": "paid cash"}, headers=self.h)
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=3, note="UPI")
+        self.assertEqual((r.status_code, r.json()["balance"], r.json()["purchased_amount"]), (201, 8.0, 8.0))
+        plan = self.c.get(f"/api/customers/{c}", headers=self.h).json()["plans"][0]
+        self.assertEqual((plan["name"], float(plan["balance"]), str(plan["expires_on"])), ("Gold 5 hrs", 8.0, "2030-01-01"))
+        month = __import__("datetime").date.today().strftime("%Y-%m")
+        rep = self.c.get(f"/api/reports/plans?month={month}", headers=self.h).json()["summary"]
+        self.assertEqual((rep["sold_hours"], rep["topped_up_hours"], rep["topups"]), (8.0, 3.0, 1))
+        self.assertEqual(self.post(f"/api/customers/{c}/plans/999/topup", amount=1).status_code, 404)
+        self.assertEqual(self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=0).status_code, 422)

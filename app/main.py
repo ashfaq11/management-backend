@@ -111,6 +111,17 @@ class CustomerPlanIn(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=500)
 
 
+class CustomerPlanUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    expires_on: Optional[dt.date] = None
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+class PlanTopUp(BaseModel):
+    amount: float = Field(gt=0, le=1_000_000)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
 class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
 
@@ -703,6 +714,30 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes))
         return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
+    @app.put("/api/customers/{cid}/plans/{pid}")
+    def edit_customer_plan(cid: int, pid: int, b: CustomerPlanUpdate, u=Depends(admin)):
+        """Rename a plan, change or clear its expiry, edit notes. Amounts change only through a top-up."""
+        if not db.run("""UPDATE customer_plans SET name=%s, expires_on=%s, notes=%s
+                         WHERE id=%s AND customer_id=%s AND spa_id=%s""",
+                      (b.name.strip(), b.expires_on, (b.notes or "").strip() or None, pid, cid, u["spa"])):
+            raise HTTPException(404, "Plan not found")
+        return {"id": pid}
+
+    @app.post("/api/customers/{cid}/plans/{pid}/topup", status_code=201)
+    def top_up_plan(cid: int, pid: int, b: PlanTopUp, u=Depends(admin)):
+        """Add hours or rupees to a plan: both the purchased amount and the balance grow."""
+        with db.tx() as t:
+            p = t.one("SELECT * FROM customer_plans WHERE id=%s AND customer_id=%s AND spa_id=%s FOR UPDATE",
+                      (pid, cid, u["spa"]))
+            if not p:
+                raise HTTPException(404, "Plan not found")
+            t.run("UPDATE customer_plans SET purchased_amount=purchased_amount+%s, balance=balance+%s WHERE id=%s",
+                  (b.amount, b.amount, pid))
+            t.insert("INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by) VALUES(%s,%s,%s,%s,%s)",
+                     (pid, u["spa"], b.amount, (b.note or "").strip() or None, u["id"]))
+        return {"id": pid, "balance": round(float(p["balance"]) + b.amount, 2),
+                "purchased_amount": round(float(p["purchased_amount"]) + b.amount, 2)}
+
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
     def onboard(b: OnboardIn, u=Depends(member)):
@@ -900,7 +935,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             f"""SELECT p.id, p.customer_id, c.name AS customer, c.phone, p.name, p.plan_type,
                        p.purchased_amount, p.balance, p.expires_on, p.created_at,
                        COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
-                                 WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
+                                 WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount,
+                       p.purchased_amount - COALESCE((SELECT SUM(x.amount) FROM plan_topups x WHERE x.plan_id=p.id),0)
+                         AS initial_amount
                 FROM customer_plans p JOIN customers c ON c.id=p.customer_id
                 WHERE p.spa_id=%s AND p.created_at >= %s AND p.created_at < %s{customer_filter}
                 ORDER BY p.created_at DESC, p.id DESC""",
@@ -944,6 +981,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     OR (r.reversed_at >= %s AND r.reversed_at < %s)){redemption_customer_filter}""",
             (lo, hi, lo, hi, lo, hi, lo, hi, u["spa"], lo, hi, lo, hi, *customer_args)) or {}
 
+        topups = db.one(
+            f"""SELECT COALESCE(SUM(x.amount) FILTER (WHERE p.plan_type='hours'),0) AS hours,
+                       COALESCE(SUM(x.amount) FILTER (WHERE p.plan_type='rupees'),0) AS rupees, COUNT(*) AS n
+                FROM plan_topups x JOIN customer_plans p ON p.id=x.plan_id
+                WHERE x.spa_id=%s AND x.created_at >= %s AND x.created_at < %s{customer_filter}""",
+            (u["spa"], lo, hi, *customer_args)) or {}
+
         def total(items, key):
             return round(sum(float(x.get(key) or 0) for x in items), 2)
 
@@ -953,8 +997,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             "customer_id": customer_id,
             "summary": {
                 "plans_added": len(plans),
-                "sold_hours": total([p for p in plans if p["plan_type"] == "hours"], "purchased_amount"),
-                "sold_rupees": total([p for p in plans if p["plan_type"] == "rupees"], "purchased_amount"),
+                # new plans at their first amount plus every top-up made in the period
+                "sold_hours": round(total([p for p in plans if p["plan_type"] == "hours"], "initial_amount")
+                                    + float(topups.get("hours") or 0), 2),
+                "sold_rupees": round(total([p for p in plans if p["plan_type"] == "rupees"], "initial_amount")
+                                     + float(topups.get("rupees") or 0), 2),
+                "topped_up_hours": round(float(topups.get("hours") or 0), 2),
+                "topped_up_rupees": round(float(topups.get("rupees") or 0), 2),
+                "topups": int(topups.get("n") or 0),
                 "available_hours": round(balance_by_type.get("hours", 0), 2),
                 "available_rupees": round(balance_by_type.get("rupees", 0), 2),
                 "deducted_hours": round(float(activity.get("deducted_hours") or 0), 2),

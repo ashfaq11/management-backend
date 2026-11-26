@@ -17,6 +17,9 @@ erDiagram
   appointments ||--o{ plan_redemptions : has
   customer_plans ||--o{ plan_redemptions : has
   spas ||--o{ plan_redemptions : has
+  users ||--o{ plan_topups : has
+  customer_plans ||--o{ plan_topups : has
+  spas ||--o{ plan_topups : has
   spas ||--o{ services : has
   users ||--o{ sessions : has
   spas ||--o{ shifts : has
@@ -37,6 +40,7 @@ erDiagram
 | [`customer_plans`](#customer_plans) | Prepaid package owned by one customer in one spa. A balance is measured in hours or INR. |
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
 | [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
+| [`plan_topups`](#plan_topups) | Amounts added to an existing prepaid plan after it was sold. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
 | [`shifts`](#shifts) | Reusable daily work-time window for a spa. |
@@ -176,6 +180,33 @@ Auditable deductions from prepaid customer plans for completed appointments; rev
 
 - `plan_redemptions_one_active_appointment`: `CREATE UNIQUE INDEX plan_redemptions_one_active_appointment ON plan_redemptions USING btree (appointment_id) WHERE (reversed_at IS NULL)`
 - `plan_redemptions_plan_idx`: `CREATE INDEX plan_redemptions_plan_idx ON plan_redemptions USING btree (plan_id, created_at)`
+
+## plan_topups
+
+Amounts added to an existing prepaid plan after it was sold.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `plan_id` | bigint | no |  | Plan that was topped up. |
+| `spa_id` | bigint | no |  | Owning spa; same as the plan. |
+| `amount` | numeric(12,2) | no |  | Amount added, in the plan unit (hours or rupees). |
+| `note` | text | yes |  | Optional note, e.g. payment details. |
+| `created_by` | bigint | yes |  | Login that added the top-up. |
+| `created_at` | timestamp with time zone | no | `now()` | When the top-up was added. |
+
+**Constraints**
+
+- Check `plan_topups_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Foreign key `plan_topups_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `plan_topups_plan_id_fkey`: `FOREIGN KEY (plan_id) REFERENCES customer_plans(id)`
+- Foreign key `plan_topups_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `plan_topups_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `plan_topups_plan_idx`: `CREATE INDEX plan_topups_plan_idx ON plan_topups USING btree (plan_id, created_at)`
+- `plan_topups_spa_time_idx`: `CREATE INDEX plan_topups_spa_time_idx ON plan_topups USING btree (spa_id, created_at)`
 
 ## services
 
