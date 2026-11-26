@@ -35,6 +35,19 @@ class CustomerIn(BaseModel):
     dob: Optional[dt.date] = None
     address: Optional[str] = None
     notes: Optional[str] = None
+    preferred_payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None
+
+
+class PaymentIn(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    method: Literal["cash", "upi", "card", "bank_transfer", "other"]
+    reference: Optional[str] = Field(default=None, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RefundIn(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    reason: Optional[str] = Field(default=None, max_length=500)
 
 
 class TherapistIn(BaseModel):
@@ -173,6 +186,7 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
 
 class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
+    plan: Optional[CustomerPlanIn] = None
 
 
 class BonusIn(BaseModel):
@@ -431,9 +445,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     def insert_customer(t, b: CustomerIn, spa: int) -> int:
         try:
-            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,spa_id)
-                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, spa))
+            return t.insert("""INSERT INTO customers(name,phone,email,gender,dob,address,notes,preferred_payment_method,spa_id)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes,
+                             b.preferred_payment_method, spa))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
 
@@ -448,6 +463,18 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         with db.tx() as t:
             return {"id": insert_customer(t, b, u["spa"])}
 
+    @app.get("/api/customers/page")
+    def customer_page(q: str = "", page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
+                      u=Depends(member)):
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        total = db.one("""SELECT COUNT(*) AS n FROM customers
+                          WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)""",
+                       (u["spa"], like, like))["n"]
+        items = db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)
+                          ORDER BY lower(name), id LIMIT %s OFFSET %s""",
+                       (u["spa"], like, like, page_size, (page - 1) * page_size))
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
+
     @app.get("/api/customers/{cid}")
     def customer(cid: int, u=Depends(member)):
         c = db.one("SELECT * FROM customers WHERE id=%s AND spa_id=%s", (cid, u["spa"]))
@@ -456,7 +483,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         c["appointments"] = db.all(
             """SELECT a.*, s.name AS service, t.name AS therapist,
                       p.name AS plan_name, r.amount AS plan_deducted, r.unit AS plan_unit,
-                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at
+                      r.created_at AS plan_deducted_at, r.reversed_at AS plan_reversed_at,
+                      COALESCE(pay.paid_amount,0) AS paid_amount,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 0
+                           ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                      CASE WHEN r.reversed_at IS NULL AND r.id IS NOT NULL THEN 'prepaid'
+                           WHEN a.price=0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                           WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                           ELSE 'pending' END AS payment_status
                FROM appointments a
                JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                LEFT JOIN LATERAL (
@@ -465,20 +499,33 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                    ORDER BY x.created_at DESC, x.id DESC LIMIT 1
                ) r ON TRUE
                LEFT JOIN customer_plans p ON p.id=r.plan_id
+               LEFT JOIN LATERAL (
+                   SELECT SUM(pm.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                  WHERE rf.payment_id=pm.id AND rf.spa_id=pm.spa_id),0)) AS paid_amount
+                   FROM payments pm WHERE pm.appointment_id=a.id AND pm.spa_id=a.spa_id
+               ) pay ON TRUE
                WHERE a.customer_id=%s AND a.spa_id=%s ORDER BY a.start_at DESC""", (cid, u["spa"]))
         c["plans"] = db.all(
             """SELECT p.*, COALESCE((SELECT SUM(r.amount) FROM plan_redemptions r
                                       WHERE r.plan_id=p.id AND r.reversed_at IS NULL),0) AS used_amount
                FROM customer_plans p WHERE p.customer_id=%s AND p.spa_id=%s
                ORDER BY p.created_at DESC, p.id DESC""", (cid, u["spa"]))
+        c["payments"] = db.all(
+            """SELECT p.id, p.appointment_id, p.amount, p.method, p.reference, p.note, p.received_at,
+                      COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
+               FROM payments p LEFT JOIN LATERAL (
+                   SELECT SUM(amount) AS amount FROM payment_refunds WHERE payment_id=p.id AND spa_id=p.spa_id
+               ) r ON TRUE
+               WHERE p.customer_id=%s AND p.spa_id=%s ORDER BY p.received_at DESC, p.id DESC""", (cid, u["spa"]))
         return c
 
     @app.put("/api/customers/{cid}")
     def edit_customer(cid: int, b: CustomerIn, u=Depends(member)):
         try:
             n = db.run("""UPDATE customers SET name=%s,phone=%s,email=%s,gender=%s,dob=%s,address=%s,notes=%s,
-                          updated_at=now() WHERE id=%s AND spa_id=%s""",
-                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes, cid, u["spa"]))
+                          preferred_payment_method=%s,updated_at=now() WHERE id=%s AND spa_id=%s""",
+                       (b.name.strip(), b.phone.strip(), b.email, b.gender, b.dob, b.address, b.notes,
+                        b.preferred_payment_method, cid, u["spa"]))
         except pgerr.UniqueViolation:
             raise HTTPException(409, PHONE_TAKEN)
         if not n:
@@ -657,20 +704,113 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(409, SLOT_TAKEN)
 
     @app.get("/api/appointments")
-    def appointments(date: Optional[dt.date] = None, therapist_id: Optional[int] = None,
+    def appointments(date: Optional[dt.date] = None, date_from: Optional[dt.date] = Query(None, alias="from"),
+                     date_to: Optional[dt.date] = Query(None, alias="to"), therapist_id: Optional[int] = None,
                      status: Optional[Status] = None, u=Depends(member)):
-        sql = """SELECT a.*, c.name AS customer, c.phone, s.name AS service, t.name AS therapist
+        sql = """SELECT a.*, c.name AS customer, c.phone, c.preferred_payment_method,
+                         s.name AS service, t.name AS therapist,
+                         COALESCE(pay.paid_amount,0) AS paid_amount,
+                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                              THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                              THEN 'prepaid'
+                              WHEN a.price=0 OR COALESCE(pay.paid_amount,0) >= a.price THEN 'paid'
+                              WHEN COALESCE(pay.paid_amount,0) > 0 THEN 'partial'
+                              ELSE 'pending' END AS payment_status,
+                         (SELECT r.unit FROM plan_redemptions r WHERE r.appointment_id=a.id AND r.spa_id=a.spa_id
+                           AND r.reversed_at IS NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS plan_unit
                  FROM appointments a JOIN customers c ON c.id=a.customer_id
-                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id WHERE a.spa_id=%s"""
+                 JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
+                 LEFT JOIN LATERAL (
+                   SELECT SUM(p.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                  WHERE rf.payment_id=p.id AND rf.spa_id=p.spa_id),0)) AS paid_amount
+                   FROM payments p WHERE p.appointment_id=a.id AND p.spa_id=a.spa_id
+                 ) pay ON TRUE WHERE a.spa_id=%s"""
         args = [u["spa"]]
-        if date:
+        if date_from or date_to:
+            if not (date_from and date_to) or date_to < date_from:
+                raise HTTPException(422, "give a valid from and to date range")
+            if (date_to - date_from).days > 366:
+                raise HTTPException(422, "at most one year at a time")
+            sql += " AND a.start_at >= %s AND a.start_at < %s"
+            args += [date_from, date_to + dt.timedelta(days=1)]
+        elif date:
             sql += " AND a.start_at >= %s AND a.start_at < %s"
             args += [date, date + dt.timedelta(days=1)]
         if therapist_id:
             sql += " AND a.therapist_id=%s"; args.append(therapist_id)
         if status:
             sql += " AND a.status=%s"; args.append(status)
-        return db.all(sql + " ORDER BY a.start_at LIMIT 500", args)
+        return db.all(sql + " ORDER BY a.start_at, a.id LIMIT 1500", args)
+
+    @app.get("/api/dashboard")
+    def dashboard(u=Depends(member)):
+        today_row = db.one("""SELECT COUNT(*) AS total,
+                                      COUNT(*) FILTER (WHERE status='booked') AS booked,
+                                      COUNT(*) FILTER (WHERE status='completed') AS completed,
+                                      COUNT(*) FILTER (WHERE status='cancelled') AS cancelled,
+                                      COUNT(*) FILTER (WHERE status='no_show') AS no_show,
+                                      COALESCE(SUM(price) FILTER (WHERE status='completed'),0) AS completed_value
+                               FROM appointments WHERE spa_id=%s AND start_at::date=CURRENT_DATE""", (u["spa"],))
+        collections = db.one("""SELECT COALESCE(SUM(p.amount),0) AS gross,
+                                       COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                 WHERE r.spa_id=%s AND r.refunded_at::date=CURRENT_DATE),0) AS refunds
+                                FROM payments p WHERE p.spa_id=%s AND p.received_at::date=CURRENT_DATE""",
+                             (u["spa"], u["spa"]))
+        customers_today = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s AND created_at::date=CURRENT_DATE",
+                                 (u["spa"],))["n"]
+        total_customers = db.one("SELECT COUNT(*) AS n FROM customers WHERE spa_id=%s", (u["spa"],))["n"]
+        monthly = db.all("""WITH months AS (
+                               SELECT generate_series(date_trunc('month',CURRENT_DATE)-interval '5 months',
+                                                      date_trunc('month',CURRENT_DATE),interval '1 month') AS m),
+                             visits AS (
+                               SELECT date_trunc('month',start_at) AS m,
+                                      COUNT(*) FILTER (WHERE status='completed') AS completed,
+                                      COALESCE(SUM(price) FILTER (WHERE status='completed'),0) AS revenue
+                               FROM appointments WHERE spa_id=%s AND start_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND start_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1),
+                             customers_month AS (
+                               SELECT date_trunc('month',created_at AT TIME ZONE current_setting('TimeZone')) AS m, COUNT(*) AS new_customers
+                               FROM customers WHERE spa_id=%s AND created_at >= date_trunc('month',CURRENT_DATE)-interval '5 months'
+                                 AND created_at < date_trunc('month',CURRENT_DATE)+interval '1 month'
+                               GROUP BY 1)
+                             SELECT to_char(months.m,'YYYY-MM') AS month,
+                                    COALESCE(visits.completed,0) AS completed,
+                                    COALESCE(visits.revenue,0) AS revenue,
+                                    COALESCE(customers_month.new_customers,0) AS new_customers
+                             FROM months LEFT JOIN visits USING(m) LEFT JOIN customers_month USING(m)
+                             ORDER BY months.m""", (u["spa"],u["spa"]))
+        upcoming = db.all("""SELECT a.id, a.start_at, a.duration_min, a.price, a.status,
+                                    c.name AS customer, c.phone, s.name AS service, t.name AS therapist,
+                                    COALESCE(pay.paid_amount,0) AS paid_amount,
+                                    CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                                      AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
+                                         THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due
+                             FROM appointments a JOIN customers c ON c.id=a.customer_id
+                             JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
+                             LEFT JOIN LATERAL (SELECT SUM(p.amount-COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                WHERE rf.payment_id=p.id AND rf.spa_id=p.spa_id),0)) AS paid_amount
+                                FROM payments p WHERE p.appointment_id=a.id AND p.spa_id=a.spa_id) pay ON TRUE
+                             WHERE a.spa_id=%s AND a.status='booked' AND a.start_at::date=CURRENT_DATE
+                               AND a.start_at >= localtimestamp ORDER BY a.start_at LIMIT 10""", (u["spa"],))
+        on_shift = db.one("""SELECT COUNT(*) AS n FROM therapists t
+                             WHERE t.spa_id=%s AND t.is_active AND (
+                               (NOT EXISTS (SELECT 1 FROM therapist_shift_assignments a WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id)
+                                AND localtime >= TIME '09:00' AND localtime < TIME '21:00')
+                               OR EXISTS (SELECT 1 FROM therapist_shift_assignments a
+                                          JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id AND sh.is_active
+                                          WHERE a.spa_id=t.spa_id AND a.therapist_id=t.id
+                                            AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
+                                            AND localtime >= sh.start_time AND localtime < sh.end_time)
+                             )""", (u["spa"],))["n"]
+        return {"date": db.one("SELECT CURRENT_DATE AS day")["day"], "today": today_row,
+                "collections": {"gross": float(collections["gross"]), "refunds": float(collections["refunds"]),
+                                "net": float(collections["gross"]-collections["refunds"])},
+                "customers_today": customers_today, "total_customers": total_customers,
+                "therapists_on_shift": on_shift, "monthly": monthly, "upcoming": upcoming}
 
     @app.post("/api/appointments", status_code=201)
     def add_appointment(b: AppointmentIn, u=Depends(member)):
@@ -691,6 +831,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             price = b.price if b.price is not None else (sv["price"] if sv["id"] != a["service_id"] else a["price"])
             # the same rule for the length
             minutes = b.duration_min or (sv["duration_min"] if sv["id"] != a["service_id"] else a["duration_min"])
+            collected = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                  WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS paid
+                                  FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""", (aid,u["spa"]))["paid"]
+            if float(collected) - float(price) > 0.005:
+                raise HTTPException(409, "Refund the excess payment before reducing this appointment price")
             try:
                 t.run("""UPDATE appointments SET customer_id=%s,therapist_id=%s,service_id=%s,start_at=%s,
                          duration_min=%s,price=%s,notes=%s,updated_at=now() WHERE id=%s""",
@@ -709,9 +854,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 if a["status"] == b.status:
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
-                deduction = plan = has_active = None
+                deduction = plan = None
                 if b.status == "completed" and b.plan_type:
-                    # Staff explicitly chooses hours or rupees; never auto-select a balance type.
+                    already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
+                                             AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                                      WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)
+                                             LIMIT 1""", (aid, u["spa"]))
+                    if already_paid:
+                        raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
                     amount = (round(a["duration_min"] / 60.0, 2)
                               if b.plan_type == "hours" else round(float(a["price"]), 2))
                     plan = t.one(
@@ -720,11 +870,6 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
                            ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
                         (a["customer_id"], u["spa"], b.plan_type, amount))
-                    has_active = plan or t.one(
-                        """SELECT 1 FROM customer_plans WHERE customer_id=%s AND spa_id=%s AND plan_type=%s
-                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)""",
-                        (a["customer_id"], u["spa"], b.plan_type))
-                if b.status == "completed" and b.plan_type and has_active:
                     if not plan:
                         unit_label = "hours" if b.plan_type == "hours" else "rupees"
                         raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
@@ -737,7 +882,6 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
                                  "amount": amount, "unit": b.plan_type, "remaining_balance": remaining}
                 elif a["status"] == "completed":
-                    # Re-open/cancel a completed booking: refund its active package deduction.
                     redemption = t.one(
                         """SELECT r.*, p.name FROM plan_redemptions r
                            JOIN customer_plans p ON p.id=r.plan_id
@@ -747,11 +891,128 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s",
                               (redemption["amount"], redemption["plan_id"]))
                         t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (redemption["id"],))
-                t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s",
-                      (b.status, aid))
+                t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
         return {"id": aid, "status": b.status, "plan_deduction": deduction}
+
+    # ---- appointment payments ------------------------------------------
+    def payment_due(t, appointment: dict, spa: int) -> float:
+        prepaid = t.one("SELECT 1 FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
+                        (appointment["id"], spa))
+        paid = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                              WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS total
+                         FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""",
+                     (appointment["id"], spa))["total"]
+        return 0.0 if prepaid else max(round(float(appointment["price"])-float(paid), 2), 0.0)
+
+    @app.post("/api/appointments/{aid}/payments", status_code=201)
+    def collect_payment(aid: int, b: PaymentIn, u=Depends(member)):
+        with db.tx() as t:
+            a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
+            if not a:
+                raise HTTPException(404, "Appointment not found")
+            if a["status"] in ("cancelled", "no_show"):
+                raise HTTPException(409, "Payments cannot be collected for a cancelled or no-show appointment")
+            due = payment_due(t, a, u["spa"])
+            if float(b.amount) - due > 0.005:
+                raise HTTPException(409, f"Payment exceeds the outstanding balance of Rs {due:.2f}")
+            pid = t.insert("""INSERT INTO payments(spa_id,appointment_id,customer_id,amount,method,reference,note,received_by)
+                              VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           (u["spa"], aid, a["customer_id"], b.amount, b.method,
+                            (b.reference or "").strip() or None, (b.note or "").strip() or None, u["id"]))
+            remaining = round(due - float(b.amount), 2)
+        return {"id": pid, "receipt_number": f"SP-{pid:06d}", "balance_due": remaining}
+
+    @app.get("/api/payments")
+    def payments(received_on: dt.date | None = None, u=Depends(member)):
+        """Payment and refund activity for the selected settlement day."""
+        day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
+        return db.all("""SELECT activity.*, activity.activity_at AS received_at FROM (
+                           SELECT 'payment'::text AS event_type, p.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, p.amount, p.method, p.reference, p.note,
+                                  p.received_at AS activity_at, c.name AS customer, c.phone, a.start_at,
+                                  COALESCE(r.amount,0) AS refunded_amount, p.amount-COALESCE(r.amount,0) AS net_amount
+                           FROM payments p JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
+                              WHERE payment_id=p.id AND spa_id=p.spa_id) r ON TRUE
+                           WHERE p.spa_id=%s AND p.received_at::date=%s
+                           UNION ALL
+                           SELECT 'refund'::text AS event_type, r.id AS id, p.id AS payment_id,
+                                  p.appointment_id, p.customer_id, r.amount, p.method, p.reference,
+                                  r.reason AS note, r.refunded_at AS activity_at, c.name AS customer, c.phone,
+                                  a.start_at, 0::numeric AS refunded_amount, -r.amount AS net_amount
+                           FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                           JOIN customers c ON c.id=p.customer_id
+                           JOIN appointments a ON a.id=p.appointment_id
+                           WHERE r.spa_id=%s AND r.refunded_at::date=%s
+                         ) activity ORDER BY activity_at DESC, event_type DESC, id DESC LIMIT 1000""",
+                        (u["spa"], day, u["spa"], day))
+
+    @app.post("/api/payments/{pid}/refunds", status_code=201)
+    def refund_payment(pid: int, b: RefundIn, u=Depends(admin)):
+        with db.tx() as t:
+            p = t.one("SELECT * FROM payments WHERE id=%s AND spa_id=%s FOR UPDATE", (pid, u["spa"]))
+            if not p:
+                raise HTTPException(404, "Payment not found")
+            refunded = t.one("SELECT COALESCE(SUM(amount),0) AS total FROM payment_refunds WHERE payment_id=%s AND spa_id=%s",
+                             (pid, u["spa"]))["total"]
+            remaining = round(float(p["amount"])-float(refunded), 2)
+            if float(b.amount) - remaining > 0.005:
+                raise HTTPException(409, f"Refund exceeds the refundable balance of Rs {remaining:.2f}")
+            rid = t.insert("""INSERT INTO payment_refunds(spa_id,payment_id,amount,reason,refunded_by)
+                              VALUES(%s,%s,%s,%s,%s)""",
+                           (u["spa"], pid, b.amount, (b.reason or "").strip() or None, u["id"]))
+        return {"id": rid, "refundable_balance": round(remaining-float(b.amount),2)}
+
+    @app.get("/api/payments/settlement")
+    def payment_settlement(received_on: dt.date | None = None, u=Depends(member)):
+        day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
+        gross_rows = db.all("""SELECT method, COUNT(*) AS count, COALESCE(SUM(amount),0) AS gross
+                               FROM payments WHERE spa_id=%s AND received_at::date=%s
+                               GROUP BY method ORDER BY method""", (u["spa"], day))
+        refund_rows = db.all("""SELECT p.method, COALESCE(SUM(r.amount),0) AS refunds
+                                FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                                WHERE r.spa_id=%s AND r.refunded_at::date=%s GROUP BY p.method""", (u["spa"], day))
+        by_method = {x["method"]: {"method": x["method"], "count": int(x["count"]),
+                                   "gross": float(x["gross"]), "refunds": 0.0} for x in gross_rows}
+        for x in refund_rows:
+            by_method.setdefault(x["method"], {"method": x["method"], "count": 0, "gross": 0.0, "refunds": 0.0})["refunds"] = float(x["refunds"])
+        gross = sum(x["gross"] for x in by_method.values())
+        refunds = sum(x["refunds"] for x in by_method.values())
+        return {"date": day, "methods": sorted(by_method.values(), key=lambda x: x["method"]),
+                "gross": round(gross,2), "refunds": round(refunds,2), "net": round(gross-refunds,2)}
+
+    @app.get("/api/payments/{pid}/receipt")
+    def payment_receipt(pid: int, u=Depends(member)):
+        p = db.one("""SELECT p.*, c.name AS customer, c.phone, a.start_at, s.name AS service,
+                             t.name AS therapist, sp.name AS spa_name
+                      FROM payments p JOIN customers c ON c.id=p.customer_id
+                      JOIN appointments a ON a.id=p.appointment_id JOIN services s ON s.id=a.service_id
+                      JOIN therapists t ON t.id=a.therapist_id JOIN spas sp ON sp.id=p.spa_id
+                      WHERE p.id=%s AND p.spa_id=%s""", (pid, u["spa"]))
+        if not p:
+            raise HTTPException(404, "Receipt not found")
+        from xml.sax.saxutils import escape
+        from reportlab.lib.pagesizes import A5
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
+        buf = io.BytesIO()
+        styles = getSampleStyleSheet()
+        doc = SimpleDocTemplate(buf, pagesize=A5, title=f"Receipt SP-{pid:06d}")
+        story = [Paragraph(escape(p["spa_name"]), styles["Title"]), Paragraph("Payment receipt", styles["Heading2"]),
+                 Paragraph(f"Receipt: <b>SP-{pid:06d}</b>", styles["Normal"]),
+                 Paragraph(f"Customer: {escape(p['customer'])} ({escape(p['phone'])})", styles["Normal"]),
+                 Paragraph(f"Appointment: {escape(str(p['start_at']).replace('T',' ')[:16])} · {escape(p['service'])}", styles["Normal"]),
+                 Paragraph(f"Therapist: {escape(p['therapist'])}", styles["Normal"]), Spacer(1,10),
+                 Table([["Amount received", f"Rs {float(p['amount']):,.2f}"],
+                        ["Payment method", p["method"].replace("_"," ").title()],
+                        ["Reference", escape(p["reference"] or "—")],
+                        ["Note", escape(p["note"] or "—")]], colWidths=[100,180])]
+        doc.build(story)
+        return Response(buf.getvalue(), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="receipt_SP-{pid:06d}.pdf"'})
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
     def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
@@ -795,12 +1056,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     # ---- onboarding: customer (+ optional first booking) in ONE transaction ----
     @app.post("/api/onboarding", status_code=201)
     def onboard(b: OnboardIn, u=Depends(member)):
-        with db.tx() as t:  # a clashing first appointment rolls the new customer back too
+        if b.plan and u["role"] not in ("admin", "superadmin"):
+            raise HTTPException(403, "Only admins can add prepaid plans during onboarding")
+        with db.tx() as t:  # customer, first appointment and optional plan either all commit or all roll back
             cid = insert_customer(t, b, u["spa"])
             aid = None
             if b.first_appointment:
                 aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
-        return {"customer_id": cid, "appointment_id": aid}
+            pid = None
+            if b.plan:
+                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid)
+                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
+                                b.plan.expires_on, b.plan.notes, paid_for(b.plan.plan_type,b.plan.amount,b.plan.price_paid)))
+        return {"customer_id": cid, "appointment_id": aid, "plan_id": pid}
 
     # ---- reports & payroll (admin) --------------------------------------
     def check_month(month: str):
