@@ -137,6 +137,7 @@ class PlanTopUp(BaseModel):
 
 class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
+    plan: Optional[CustomerPlanIn] = None
 
 
 class BonusIn(BaseModel):
@@ -853,19 +854,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/reports/payments")
     def payment_report(received_on: dt.date | None = None, u=Depends(admin)):
         day = received_on or db.one("SELECT CURRENT_DATE AS d")["d"]
-        rows = db.all("""SELECT p.method, COUNT(*) AS count, COALESCE(SUM(p.amount),0) AS gross,
-                                COALESCE(SUM(COALESCE(r.amount,0)),0) AS refunds
-                         FROM payments p LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
-                           WHERE payment_id=p.id AND spa_id=p.spa_id AND refunded_at::date=%s) r ON TRUE
-                         WHERE p.spa_id=%s AND p.received_at::date=%s GROUP BY p.method ORDER BY p.method""",
-                      (day, u["spa"], day))
-        total = db.one("""SELECT COALESCE(SUM(p.amount),0) AS gross,
-                                 COALESCE(SUM(COALESCE(r.amount,0)),0) AS refunds
-                          FROM payments p LEFT JOIN LATERAL (SELECT SUM(amount) AS amount FROM payment_refunds
-                            WHERE payment_id=p.id AND spa_id=p.spa_id AND refunded_at::date=%s) r ON TRUE
-                          WHERE p.spa_id=%s AND p.received_at::date=%s""", (day, u["spa"], day))
-        return {"date": day, "methods": rows, "gross": float(total["gross"]), "refunds": float(total["refunds"]),
-                "net": round(float(total["gross"])-float(total["refunds"]),2)}
+        gross_rows = db.all("""SELECT method, COUNT(*) AS count, COALESCE(SUM(amount),0) AS gross
+                               FROM payments WHERE spa_id=%s AND received_at::date=%s
+                               GROUP BY method ORDER BY method""", (u["spa"], day))
+        refund_rows = db.all("""SELECT p.method, COALESCE(SUM(r.amount),0) AS refunds
+                                FROM payment_refunds r JOIN payments p ON p.id=r.payment_id AND p.spa_id=r.spa_id
+                                WHERE r.spa_id=%s AND r.refunded_at::date=%s GROUP BY p.method""", (u["spa"], day))
+        by_method = {x["method"]: {"method": x["method"], "count": int(x["count"]),
+                                   "gross": float(x["gross"]), "refunds": 0.0} for x in gross_rows}
+        for x in refund_rows:
+            by_method.setdefault(x["method"], {"method": x["method"], "count": 0, "gross": 0.0, "refunds": 0.0})["refunds"] = float(x["refunds"])
+        gross = sum(x["gross"] for x in by_method.values())
+        refunds = sum(x["refunds"] for x in by_method.values())
+        return {"date": day, "methods": sorted(by_method.values(), key=lambda x: x["method"]),
+                "gross": round(gross,2), "refunds": round(refunds,2), "net": round(gross-refunds,2)}
 
     @app.get("/api/payments/{pid}/receipt")
     def payment_receipt(pid: int, u=Depends(member)):
@@ -940,7 +942,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             aid = None
             if b.first_appointment:
                 aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
-        return {"customer_id": cid, "appointment_id": aid}
+            pid = None
+            if b.plan:
+                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes)
+                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
+                                b.plan.expires_on, b.plan.notes))
+        return {"customer_id": cid, "appointment_id": aid, "plan_id": pid}
 
     # ---- reports & payroll (admin) --------------------------------------
     def check_month(month: str):
