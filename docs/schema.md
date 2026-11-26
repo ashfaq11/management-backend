@@ -20,6 +20,13 @@ erDiagram
   customer_plans ||--o{ plan_redemptions : has
   spas ||--o{ plan_redemptions : has
   users ||--o{ plan_topups : has
+  payments ||--o{ payment_refunds : has
+  users ||--o{ payment_refunds : has
+  spas ||--o{ payment_refunds : has
+  appointments ||--o{ payments : has
+  customers ||--o{ payments : has
+  users ||--o{ payments : has
+  spas ||--o{ payments : has
   customer_plans ||--o{ plan_topups : has
   spas ||--o{ plan_topups : has
   spas ||--o{ recurring_expenses : has
@@ -145,6 +152,7 @@ Spa clients, created by onboarding or by hand.
 | `created_at` | timestamp with time zone | no | `now()` | Onboarding time; the "new customers" report counts by it in the spa time zone. |
 | `updated_at` | timestamp with time zone | no | `now()` | Last edit. |
 | `spa_id` | bigint | no |  | The spa this customer belongs to; phone is unique within it (customers_phone_key). |
+| `preferred_payment_method` | text | yes |  | Optional default payment method preference; each payment records its actual method independently. |
 
 **Constraints**
 
@@ -184,6 +192,40 @@ One-off spa costs on a given date.
 **Indexes**
 
 - `expenses_spa_date_idx`: `CREATE INDEX expenses_spa_date_idx ON expenses USING btree (spa_id, on_date)`
+
+
+## payment_refunds
+
+Immutable partial or full refunds against recorded appointment payments.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa for tenant isolation. |
+| `payment_id` | bigint | no |  | Original payment being refunded. |
+| `amount` | numeric(12,2) | no |  | Refunded amount in INR; cumulative refunds cannot exceed the payment. |
+| `reason` | text | yes |  | Optional reason for the refund. |
+| `refunded_by` | bigint | yes |  | Admin login that authorised the refund. |
+| `refunded_at` | timestamp with time zone | no | `now()` | When the refund was recorded. |
+
+## payments
+
+Amounts collected from customers against appointments; multiple partial payments are allowed.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity and receipt number source. |
+| `spa_id` | bigint | no |  | Owning spa for tenant isolation. |
+| `appointment_id` | bigint | no |  | Appointment this payment settles. |
+| `customer_id` | bigint | no |  | Customer from whom payment was received. |
+| `amount` | numeric(12,2) | no |  | Gross amount received in INR. |
+| `method` | text | no |  | Collection method: cash, UPI, card, bank transfer, or other. |
+| `reference` | text | yes |  | Optional transaction reference. |
+| `note` | text | yes |  | Optional cashier note. |
+| `received_by` | bigint | yes |  | Login that recorded the payment. |
+| `received_at` | timestamp with time zone | no | `now()` | Payment receipt timestamp. |
+| `created_at` | timestamp with time zone | no | `now()` | When the payment record was created. |
+
 
 ## plan_redemptions
 
