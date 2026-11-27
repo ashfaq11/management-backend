@@ -2003,6 +2003,72 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         cancellations, expiring, dues. `days` drives lapsed (not seen for N days) and expiring (within N days)."""
         return insight(kind, month, date_from, date_to, days, u)
 
+    def closing(day: Optional[dt.date], month: Optional[str], u):
+        """End-of-day or end-of-month summary: money in by source, bookings, memberships, expenses and (monthly) profit."""
+        if day:
+            r = summary(None, None, day, day, None, None, None, u)
+            title, period_label = "Daily closing", day.strftime("%d %b %Y")
+        else:
+            r = summary(month, None, None, None, None, None, None, u)
+            title, period_label = "Monthly closing", payroll.period_label(month)
+        lo, hi = period(None if day else month, day, day)
+        counts = db.one("""SELECT COUNT(*) FILTER (WHERE status='completed') AS done, COUNT(*) FILTER (WHERE status='booked') AS open,
+                                  COUNT(*) FILTER (WHERE status='cancelled') AS cancelled, COUNT(*) FILTER (WHERE status='no_show') AS no_show,
+                                  COUNT(*) AS total
+                           FROM appointments WHERE spa_id=%s AND start_at >= %s AND start_at < %s""", (u["spa"], lo, hi))
+        sold = db.one("SELECT COUNT(*) AS n FROM customer_plans WHERE spa_id=%s AND created_at >= %s AND created_at < %s",
+                      (u["spa"], lo, hi))["n"]
+        methods = {m["method"]: m["services"] + m["plans"] for m in r.get("by_method", [])}
+        rows = [["Money received", ""],
+                *[[f"  {payroll.METHODS.get(k, k)}", round(v, 2)] for k, v in methods.items()],
+                ["  Total received", round(sum(methods.values()), 2)],
+                ["  Refunds", round(-sum(m.get("refunds", 0) for m in r.get("by_method", [])), 2)] if any(m.get("refunds") for m in r.get("by_method", [])) else None,
+                ["Services", ""],
+                ["  Completed", counts["done"]], ["  Still booked", counts["open"]], ["  Cancelled", counts["cancelled"]],
+                ["  No-shows", counts["no_show"]], ["  Service revenue", r["revenue"]], ["  Service time (hours)", round(r.get("minutes", 0) / 60, 1)],
+                ["  Paid from memberships", r.get("paid_by_plan", 0)],
+                ["Customers & memberships", ""],
+                ["  New customers", r["new_customers"]], ["  Memberships sold", sold], ["  Membership sales", r.get("plan_sales", 0)],
+                ["  Membership payments pending", r.get("plan_dues", 0)],
+                ["Spending", ""], ["  Expenses", r.get("expenses", 0)]]
+        if r.get("profit") is not None:
+            rows += [["Profit", ""], ["  Money collected", r["collected"]], ["  Payroll", r["payroll"]], ["  Expenses", r["expenses"]],
+                     ["  Net profit", r["profit"]]]
+        rows = [x for x in rows if x]
+        return {"title": title, "period": period_label, "columns": ["Item", "Value"], "rows": rows,
+                "by_method": r.get("by_method", []), "counts": counts, "revenue": r["revenue"], "collected": r.get("collected"),
+                "expenses": r.get("expenses", 0), "profit": r.get("profit"), "new_customers": r["new_customers"], "memberships_sold": sold,
+                "plan_sales": r.get("plan_sales", 0), "paid_by_plan": r.get("paid_by_plan", 0), "payroll": r.get("payroll")}
+
+    @app.get("/api/reports/closing")
+    def closing_json(day: Optional[dt.date] = None, month: Optional[str] = None, u=Depends(admin)):
+        if not day and not month:
+            day = dt.date.today()
+        return closing(day, month, u)
+
+    @app.get("/api/reports/closing/{ext}")
+    def closing_file(ext: Literal["pdf", "xlsx"], day: Optional[dt.date] = None, month: Optional[str] = None, u=Depends(admin)):
+        if not day and not month:
+            day = dt.date.today()
+        r = closing(day, month, u)
+        name = payroll.file_name(u["spa_name"], r["title"], str(day) if day else month)
+        if ext == "pdf":
+            body = payroll.table_pdf(u["spa_name"], r["title"], r["period"], r["columns"], r["rows"])
+            return Response(body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        wb = Workbook(); ws = wb.active; ws.title = r["title"]
+        ws.append([u["spa_name"]]); ws["A1"].font = Font(bold=True, size=14)
+        ws.append([f"{r['title']} · {r['period']} · generated {payroll.generated_at():%d %b %Y %H:%M} IST"]); ws.append([])
+        for row in r["rows"]:
+            ws.append(row)
+            if row[1] == "":
+                ws.cell(ws.max_row, 1).font = Font(bold=True)
+        ws.column_dimensions["A"].width = 34; ws.column_dimensions["B"].width = 16
+        out = io.BytesIO(); wb.save(out)
+        return Response(out.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
+
     @app.get("/api/reports/insights/{kind}/pdf")
     def insight_pdf(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
                     date_to: dt.date | None = Query(None, alias="to"), days: int = Query(30, ge=1, le=365), u=Depends(admin)):
