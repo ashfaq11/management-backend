@@ -739,6 +739,11 @@ ALTER TABLE plan_redemptions ADD COLUMN IF NOT EXISTS created_by BIGINT;
 COMMENT ON COLUMN plan_redemptions.covered IS 'Rupee value of the visit this deduction paid for; NULL = the whole visit.';
 COMMENT ON COLUMN plan_redemptions.created_by IS 'Login that made the deduction.';
 
+-- ======== 026_wa_templates.sql ========
+-- Spa's own WhatsApp message texts (reminder, receipt, top-up, hello); NULL keys use the app's defaults.
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS wa_templates JSONB NOT NULL DEFAULT '{}'::jsonb;
+COMMENT ON COLUMN spas.wa_templates IS 'WhatsApp message templates set on the Settings page; missing keys use built-in texts.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -767,5 +772,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('022_spa_subscription.sql'),
   ('023_spa_profile.sql'),
   ('024_last_login.sql'),
-  ('025_partial_redemption.sql')
+  ('025_partial_redemption.sql'),
+  ('026_wa_templates.sql')
 ON CONFLICT DO NOTHING;

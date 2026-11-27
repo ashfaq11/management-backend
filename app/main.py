@@ -1,3 +1,4 @@
+import json
 import csv
 import io
 import datetime as dt
@@ -592,6 +593,18 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Spa not found")
         row["complete"] = all(row.get(k) not in (None, "") for k in ("contact_phone", "address", "rooms", "therapist_count", "owner_name", "owner_phone"))
         return row
+
+    @app.get("/api/spa/templates")
+    def get_templates(u=Depends(member)):
+        r = db.one("SELECT wa_templates FROM spas WHERE id=%s", (u["spa"],))
+        t = (r or {}).get("wa_templates") or {}
+        return json.loads(t) if isinstance(t, str) else t
+
+    @app.put("/api/spa/templates")
+    def set_templates(b: dict[str, str], u=Depends(admin)):
+        keep = {k: v.strip()[:1000] for k, v in b.items() if k in ("reminder", "receipt", "topup", "renew", "hello") and v and v.strip()}
+        db.run("UPDATE spas SET wa_templates=%s::jsonb WHERE id=%s", (json.dumps(keep), u["spa"]))
+        return keep
 
     @app.put("/api/spa/profile")
     def set_spa_profile(b: SpaProfile, u=Depends(admin)):

@@ -553,6 +553,7 @@ Each spa (business) using the system. Its admins and staff see only its data; a 
 | `owner_phone` | text | yes |  | Owner phone. |
 | `manager_name` | text | yes |  | Manager name. |
 | `manager_phone` | text | yes |  | Manager phone. |
+| `wa_templates` | jsonb | no | `'{}'::jsonb` | WhatsApp message templates set on the Settings page; missing keys use built-in texts. |
 
 **Constraints**
 
