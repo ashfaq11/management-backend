@@ -881,7 +881,18 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                             AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
                                             AND localtime >= sh.start_time AND localtime < sh.end_time)
                              )""", (u["spa"],))["n"]
+        today_shifts = db.all("""SELECT t.id AS therapist_id, t.name AS therapist, t.phone, sh.name AS shift,
+                                         to_char(sh.start_time,'HH24:MI') AS start_time, to_char(sh.end_time,'HH24:MI') AS end_time,
+                                         (localtime >= sh.start_time AND localtime < sh.end_time) AS on_duty,
+                                         (SELECT COUNT(*) FROM appointments ap WHERE ap.spa_id=t.spa_id AND ap.therapist_id=t.id
+                                            AND ap.start_at::date=CURRENT_DATE AND ap.status IN ('booked','completed')) AS bookings
+                                  FROM therapist_shift_assignments a
+                                  JOIN therapists t ON t.id=a.therapist_id AND t.spa_id=a.spa_id AND t.is_active
+                                  JOIN shifts sh ON sh.id=a.shift_id AND sh.spa_id=a.spa_id AND sh.is_active
+                                  WHERE a.spa_id=%s AND a.day_of_week=((EXTRACT(ISODOW FROM CURRENT_DATE)::int)-1)
+                                  ORDER BY sh.start_time, lower(t.name)""", (u["spa"],))
         return {"date": db.one("SELECT CURRENT_DATE AS day")["day"], "today": today_row,
+                "today_shifts": today_shifts,
                 "collections": {"gross": float(collections["gross"]), "refunds": float(collections["refunds"]),
                                 "net": float(collections["gross"]-collections["refunds"])},
                 "customers_today": customers_today, "total_customers": total_customers,

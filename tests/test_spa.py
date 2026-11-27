@@ -1029,3 +1029,15 @@ class TestPlanPackages(Base):
         self.c.put(f"/api/plan-packages/{k}", json={"name": "10 Hours Gold", "plan_type": "hours", "amount": 10, "price": 9000,
                                                     "is_active": False}, headers=self.h)
         self.assertEqual(self.c.post(f"/api/customers/{c}/plans/assign", json={"package_id": k}, headers=h).status_code, 404)
+
+
+class TestDashboardShifts(Base):
+    def test_todays_shift_therapists_listed(self):
+        import datetime as d
+        t, _, _ = self.seed()
+        sh = self.post("/api/shifts", name="Morning", start_time="09:00", end_time="15:00").json()["id"]
+        dow = d.date.today().weekday()
+        r = self.post("/api/shift-assignments", therapist_id=t, shift_id=sh, day_of_week=dow)
+        self.assertEqual(r.status_code, 201, r.text)
+        rows = self.c.get("/api/dashboard", headers=self.h).json()["today_shifts"]
+        self.assertEqual([(x["therapist_id"], x["shift"], x["start_time"]) for x in rows], [(t, "Morning", "09:00")])
