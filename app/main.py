@@ -225,6 +225,9 @@ class SpaUpdate(SpaIn):
 class SpaLogoUpdate(BaseModel):
     logo_data_url: Optional[str] = Field(default=None, max_length=1500000)
 
+class SpaReceiptDetailsUpdate(BaseModel):
+    address: Optional[str] = Field(default=None, max_length=500)
+
 
 class PasswordReset(BaseModel):
     password: str = Field(min_length=8)
@@ -401,6 +404,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not db.run("UPDATE spas SET logo_data_url=%s WHERE id=%s", (value, u["spa"])):
             raise HTTPException(404, "Spa not found")
         return {"logo_data_url": value}
+
+    @app.get("/api/spa/receipt-details")
+    def get_spa_receipt_details(u=Depends(member)):
+        row = db.one("SELECT address FROM spas WHERE id=%s", (u["spa"],))
+        if not row:
+            raise HTTPException(404, "Spa not found")
+        return {"address": row["address"]}
+
+    @app.put("/api/spa/receipt-details")
+    def set_spa_receipt_details(b: SpaReceiptDetailsUpdate, u=Depends(admin)):
+        address = (b.address or "").strip() or None
+        if not db.run("UPDATE spas SET address=%s WHERE id=%s", (address, u["spa"])):
+            raise HTTPException(404, "Spa not found")
+        return {"address": address}
 
     # ---- users: superadmin manages everyone; an admin manages the staff of their own spa ----
     def user_in_scope(t, me, uid, lock=False):
@@ -1027,7 +1044,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/payments/{pid}/receipt")
     def payment_receipt(pid: int, u=Depends(member)):
         p = db.one("""SELECT p.*, c.name AS customer, c.phone, a.start_at, s.name AS service,
-                             t.name AS therapist, sp.name AS spa_name, sp.logo_data_url
+                             t.name AS therapist, sp.name AS spa_name, sp.logo_data_url, sp.address AS spa_address
                       FROM payments p JOIN customers c ON c.id=p.customer_id
                       JOIN appointments a ON a.id=p.appointment_id JOIN services s ON s.id=a.service_id
                       JOIN therapists t ON t.id=a.therapist_id JOIN spas sp ON sp.id=p.spa_id
