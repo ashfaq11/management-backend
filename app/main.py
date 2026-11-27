@@ -788,7 +788,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         sv = t.one("SELECT * FROM services WHERE id=%s AND spa_id=%s AND is_active", (b.service_id, spa))
         if not th or not sv:
             raise HTTPException(404, "Therapist or service not found (or inactive)")
-        if th["joined_on"] and start.date() < th["joined_on"]:
+        if th["joined_on"] and start.date() < dt.date.fromisoformat(str(th["joined_on"])[:10]):
             raise HTTPException(422, "Appointment cannot be before the therapist's joining date")
 
         # Once a weekly roster exists, the date must have an active shift and the
