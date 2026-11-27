@@ -180,6 +180,7 @@ class CustomerPlanUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     expires_on: Optional[dt.date] = None
     notes: Optional[str] = Field(default=None, max_length=500)
+    balance: Optional[float] = Field(default=None, ge=0, le=100000)  # admin correction of what is left
 
 
 def paid_for(plan_type: str, amount: float, price_paid: Optional[float]) -> float:
@@ -1352,9 +1353,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.put("/api/customers/{cid}/plans/{pid}")
     def edit_customer_plan(cid: int, pid: int, b: CustomerPlanUpdate, u=Depends(admin)):
         """Rename a plan, change or clear its expiry, edit notes. Amounts change only through a top-up."""
-        if not db.run("""UPDATE customer_plans SET name=%s, expires_on=%s, notes=%s
+        if not db.run("""UPDATE customer_plans SET name=%s, expires_on=%s, notes=%s, balance=COALESCE(%s, balance),
+                                purchased_amount=GREATEST(purchased_amount, COALESCE(%s, 0))
                          WHERE id=%s AND customer_id=%s AND spa_id=%s""",
-                      (b.name.strip(), b.expires_on, (b.notes or "").strip() or None, pid, cid, u["spa"])):
+                      (b.name.strip(), b.expires_on, (b.notes or "").strip() or None, b.balance, b.balance,
+                       pid, cid, u["spa"])):
             raise HTTPException(404, "Plan not found")
         return {"id": pid}
 
