@@ -1758,9 +1758,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                        JOIN therapist_shift_assignments x ON x.day_of_week = EXTRACT(ISODOW FROM days.day)::int - 1
                                        JOIN shifts s ON s.id=x.shift_id AND s.is_active WHERE x.spa_id=%s)
                         SELECT t.id AS therapist_id, t.name AS therapist,
-                               (SELECT COUNT(*) FROM sched WHERE sched.therapist_id=t.id) AS scheduled,
+                               (SELECT COUNT(*) FROM sched WHERE sched.therapist_id=t.id
+                                  AND (t.joined_on IS NULL OR sched.day >= t.joined_on)) AS scheduled,
                                COALESCE((SELECT SUM(CASE WHEN a.half_day THEN 0.5 ELSE 1 END) FROM therapist_absences a
-                                         WHERE a.therapist_id=t.id AND a.on_date >= %s AND a.on_date < %s AND a.on_date <= CURRENT_DATE),0) AS away
+                                         WHERE a.therapist_id=t.id AND a.on_date >= %s AND a.on_date < %s AND a.on_date <= CURRENT_DATE
+                                           AND (t.joined_on IS NULL OR a.on_date >= t.joined_on)),0) AS away
                         FROM therapists t WHERE t.spa_id=%s AND t.is_active ORDER BY lower(t.name)""",
                      (lo, hi, u["spa"], lo, hi, u["spa"]))
         for r in att:
@@ -1769,9 +1771,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.post("/api/absences", status_code=201)
     def add_absence(b: AbsenceIn, u=Depends(admin)):
-        if not db.one("SELECT 1 FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"])):
+        therapist = db.one("SELECT joined_on FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"]))
+        if not therapist:
             raise HTTPException(404, "Therapist not found")
+        if therapist["joined_on"] and b.on_date < therapist["joined_on"]:
+            raise HTTPException(422, "Absence cannot be recorded before the therapist's joining date")
         end = b.to_date or b.on_date
+        if therapist["joined_on"] and end < therapist["joined_on"]:
+            raise HTTPException(422, "Absence cannot be recorded before the therapist's joining date")
         if end < b.on_date or (end - b.on_date).days > 62:
             raise HTTPException(422, "Pick a range of up to 2 months")
         n = 0
