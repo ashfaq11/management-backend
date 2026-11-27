@@ -21,7 +21,7 @@ REPORTS = {
         """SELECT c.name, p.name, p.plan_type, p.purchased_amount, p.purchased_amount-p.balance, p.balance, COALESCE(p.price_paid,0),
                   CASE WHEN p.paid_at IS NULL THEN 'Pending' ELSE COALESCE(p.payment_method,'paid') END, p.expires_on
            FROM customer_plans p JOIN customers c ON c.id=p.customer_id
-           WHERE p.spa_id=%(spa)s AND p.created_at < %(hi)s ORDER BY p.balance DESC, c.name"""),
+           WHERE p.spa_id=%(spa)s AND p.created_at >= %(lo)s AND p.created_at < %(hi)s ORDER BY p.balance DESC, c.name"""),
     "services": ("Services", ["Service", "Done", "Revenue", "Avg price", "Hours", "Cancelled", "No-shows"],
         f"""SELECT s.name, COUNT(*) FILTER (WHERE a.status='completed'), COALESCE(SUM(a.price) FILTER (WHERE a.status='completed'),0),
                    ROUND(COALESCE(AVG(a.price) FILTER (WHERE a.status='completed'),0),2),
@@ -31,8 +31,8 @@ REPORTS = {
             WHERE s.spa_id=%(spa)s GROUP BY s.id ORDER BY 3 DESC"""),
     "customers": ("Customers", ["Customer", "Phone", "Visits", "Spent", "Last visit", "Plan balance (hrs)", "Plan balance (Rs)"],
         f"""SELECT c.name, c.phone, COUNT(a.id), COALESCE(SUM(a.price),0), MAX(a.start_at)::date,
-                   COALESCE((SELECT SUM(balance) FROM customer_plans p WHERE p.customer_id=c.id AND p.plan_type='hours'),0),
-                   COALESCE((SELECT SUM(balance) FROM customer_plans p WHERE p.customer_id=c.id AND p.plan_type='rupees'),0)
+                   COALESCE((SELECT SUM(balance) FROM customer_plans p WHERE p.customer_id=c.id AND p.plan_type='hours' AND (p.expires_on IS NULL OR p.expires_on >= CURRENT_DATE)),0),
+                   COALESCE((SELECT SUM(balance) FROM customer_plans p WHERE p.customer_id=c.id AND p.plan_type='rupees' AND (p.expires_on IS NULL OR p.expires_on >= CURRENT_DATE)),0)
             FROM customers c JOIN appointments a ON a.customer_id=c.id AND a.status='completed' AND {C}
             WHERE c.spa_id=%(spa)s GROUP BY c.id ORDER BY 4 DESC LIMIT 500"""),
     "payments": ("Payments by source", ["Source", "Payments", "Received", "Refunded", "Net"],
@@ -57,6 +57,8 @@ REPORTS = {
         f"""WITH days AS (SELECT d::date AS day FROM generate_series(%(lo)s::date, %(hi)s::date - 1, '1 day') d),
                 sh AS (SELECT x.therapist_id, SUM(EXTRACT(EPOCH FROM (s.end_time - s.start_time))/3600.0) h
                        FROM days JOIN therapist_shift_assignments x ON x.day_of_week = EXTRACT(ISODOW FROM days.day)::int - 1
+                       JOIN therapists jt ON jt.id=x.therapist_id AND jt.spa_id=x.spa_id
+                         AND (jt.joined_on IS NULL OR days.day >= jt.joined_on)
                        JOIN shifts s ON s.id=x.shift_id AND s.is_active WHERE x.spa_id=%(spa)s GROUP BY 1),
                 bk AS (SELECT a.therapist_id, SUM(a.duration_min)/60.0 h FROM appointments a
                        WHERE {C} AND a.status IN ('booked','completed') GROUP BY 1)
