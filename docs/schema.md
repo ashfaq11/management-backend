@@ -37,6 +37,9 @@ erDiagram
   spas ||--o{ services : has
   users ||--o{ sessions : has
   spas ||--o{ shifts : has
+  users ||--o{ therapist_absences : has
+  spas ||--o{ therapist_absences : has
+  therapists ||--o{ therapist_absences : has
   appointments ||--o{ therapist_bonuses : has
   users ||--o{ therapist_bonuses : has
   spas ||--o{ therapist_bonuses : has
@@ -65,6 +68,7 @@ erDiagram
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
 | [`shifts`](#shifts) | Reusable daily work-time window for a spa. |
 | [`spas`](#spas) | Each spa (business) using the system. Its admins and staff see only its data; a superadmin sees every spa. |
+| [`therapist_absences`](#therapist_absences) | Days a therapist was away; attendance counts scheduled shift days minus these. |
 | [`therapist_bonuses`](#therapist_bonuses) | Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive. |
 | [`therapist_shift_assignments`](#therapist_shift_assignments) | Weekly therapist roster; one shift per weekday. Monday=0 through Sunday=6. |
 | [`therapists`](#therapists) | Staff who perform services and are paid on payslips. Never deleted, only set inactive, so past payslips stay reproducible. |
@@ -511,6 +515,36 @@ Each spa (business) using the system. Its admins and staff see only its data; a 
 **Indexes**
 
 - `spas_name_key`: `CREATE UNIQUE INDEX spas_name_key ON spas USING btree (lower(name))`
+
+## therapist_absences
+
+Days a therapist was away; attendance counts scheduled shift days minus these.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa. |
+| `therapist_id` | bigint | no |  | Therapist who was away. |
+| `on_date` | date | no |  | The day away. |
+| `kind` | text | no | `'leave'::text` | leave, sick, absent (no notice) or holiday. |
+| `half_day` | boolean | no | `false` | Away for half the day (counts 0.5). |
+| `note` | text | yes |  | Optional reason. |
+| `created_by` | bigint | yes |  | Login that recorded it. |
+| `created_at` | timestamp with time zone | no | `now()` | When it was recorded. |
+
+**Constraints**
+
+- Check `therapist_absences_kind_check`: `CHECK ((kind = ANY (ARRAY['leave'::text, 'sick'::text, 'absent'::text, 'holiday'::text])))`
+- Foreign key `therapist_absences_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `therapist_absences_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Foreign key `therapist_absences_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
+- Primary key `therapist_absences_pkey`: `PRIMARY KEY (id)`
+- Unique `therapist_absences_therapist_id_on_date_key`: `UNIQUE (therapist_id, on_date)`
+
+**Indexes**
+
+- `therapist_absences_spa_date_idx`: `CREATE INDEX therapist_absences_spa_date_idx ON therapist_absences USING btree (spa_id, on_date)`
+- `therapist_absences_therapist_id_on_date_key`: `CREATE UNIQUE INDEX therapist_absences_therapist_id_on_date_key ON therapist_absences USING btree (therapist_id, on_date)`
 
 ## therapist_bonuses
 

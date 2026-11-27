@@ -113,6 +113,15 @@ class AssignPlanIn(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=500)
 
 
+class AbsenceIn(BaseModel):
+    therapist_id: int
+    on_date: dt.date
+    to_date: Optional[dt.date] = None  # mark a range in one go
+    kind: Literal["leave", "sick", "absent", "holiday"] = "leave"
+    half_day: bool = False
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
 class ServiceIn(BaseModel):
     name: str = Field(min_length=1)
     price: float = Field(ge=0)
@@ -1736,6 +1745,51 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def health():
         db.one("SELECT 1")  # fails (500) if the database is unreachable, so the load balancer sees it
         return {"ok": True}
+
+    @app.get("/api/absences")
+    def absences(month: str = Query(...), u=Depends(admin)):
+        """The month's absences, and each therapist's attendance: shift days scheduled (up to today), days away, present."""
+        check_month(month)
+        lo, hi = period(month, None, None)
+        rows = db.all("""SELECT x.*, t.name AS therapist FROM therapist_absences x JOIN therapists t ON t.id=x.therapist_id
+                         WHERE x.spa_id=%s AND x.on_date >= %s AND x.on_date < %s ORDER BY x.on_date, t.name""", (u["spa"], lo, hi))
+        att = db.all("""WITH days AS (SELECT d::date AS day FROM generate_series(%s::date, LEAST(%s::date - 1, CURRENT_DATE), '1 day') d),
+                             sched AS (SELECT DISTINCT x.therapist_id, days.day FROM days
+                                       JOIN therapist_shift_assignments x ON x.day_of_week = EXTRACT(ISODOW FROM days.day)::int - 1
+                                       JOIN shifts s ON s.id=x.shift_id AND s.is_active WHERE x.spa_id=%s)
+                        SELECT t.id AS therapist_id, t.name AS therapist,
+                               (SELECT COUNT(*) FROM sched WHERE sched.therapist_id=t.id) AS scheduled,
+                               COALESCE((SELECT SUM(CASE WHEN a.half_day THEN 0.5 ELSE 1 END) FROM therapist_absences a
+                                         WHERE a.therapist_id=t.id AND a.on_date >= %s AND a.on_date < %s AND a.on_date <= CURRENT_DATE),0) AS away
+                        FROM therapists t WHERE t.spa_id=%s AND t.is_active ORDER BY lower(t.name)""",
+                     (lo, hi, u["spa"], lo, hi, u["spa"]))
+        for r in att:
+            r["away"] = float(r["away"]); r["present"] = max(float(r["scheduled"]) - r["away"], 0)
+        return {"month": month, "absences": rows, "attendance": att}
+
+    @app.post("/api/absences", status_code=201)
+    def add_absence(b: AbsenceIn, u=Depends(admin)):
+        if not db.one("SELECT 1 FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"])):
+            raise HTTPException(404, "Therapist not found")
+        end = b.to_date or b.on_date
+        if end < b.on_date or (end - b.on_date).days > 62:
+            raise HTTPException(422, "Pick a range of up to 2 months")
+        n = 0
+        with db.tx() as t:
+            d = b.on_date
+            while d <= end:
+                n += t.run("""INSERT INTO therapist_absences(spa_id,therapist_id,on_date,kind,half_day,note,created_by)
+                              VALUES(%s,%s,%s,%s,%s,%s,%s)
+                              ON CONFLICT (therapist_id,on_date) DO UPDATE SET kind=EXCLUDED.kind, half_day=EXCLUDED.half_day,
+                                note=EXCLUDED.note""",
+                           (u["spa"], b.therapist_id, d, b.kind, b.half_day, (b.note or "").strip() or None, u["id"]))
+                d += dt.timedelta(days=1)
+        return {"days": n}
+
+    @app.delete("/api/absences/{aid}", status_code=204)
+    def delete_absence(aid: int, u=Depends(admin)):
+        if not db.run("DELETE FROM therapist_absences WHERE id=%s AND spa_id=%s", (aid, u["spa"])):
+            raise HTTPException(404, "Absence not found")
 
     def insight(kind, month, date_from, date_to, days, u):
         if kind not in insights.KINDS:

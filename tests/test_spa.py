@@ -1070,3 +1070,17 @@ class TestInsights(Base):
             self.assertEqual(r.status_code, 200, (k, r.text[:300]))
             self.assertEqual(len(r.json()["columns"]), len(r.json()["rows"][0]) if r.json()["rows"] else len(r.json()["columns"]))
         self.assertEqual(self.c.get(f"/api/reports/insights/therapists/xlsx?month={m}", headers=self.h).status_code, 200)
+
+
+class TestAbsences(Base):
+    def test_mark_absences_and_attendance(self):
+        import datetime as d
+        t, _, _ = self.seed()
+        today = d.date.today()
+        r = self.post("/api/absences", therapist_id=t, on_date=str(today.replace(day=1)), kind="sick", half_day=True)
+        self.assertEqual(r.status_code, 201, r.text)
+        out = self.c.get(f"/api/absences?month={today:%Y-%m}", headers=self.h).json()
+        self.assertEqual(len(out["absences"]), 1)
+        row = next(x for x in out["attendance"] if x["therapist_id"] == t)
+        self.assertEqual(row["away"], 0.5)
+        self.assertEqual(self.c.delete(f"/api/absences/{out['absences'][0]['id']}", headers=self.h).status_code, 204)
