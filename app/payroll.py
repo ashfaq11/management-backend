@@ -33,6 +33,13 @@ def compute_payslip(db, therapist: dict, month: str) -> dict:
     pct = Decimal(str(therapist["incentive_percent"]))
     incentive = money(revenue * pct / 100)
     fixed = money(therapist["fixed_salary"])
+    joined_on = therapist.get("joined_on")
+    if joined_on:
+        if isinstance(joined_on, str):
+            joined_on = dt.date.fromisoformat(joined_on[:10])
+        eligible_from = max(lo, joined_on)
+        eligible_days = max((hi - eligible_from).days, 0)
+        fixed = money(fixed * Decimal(eligible_days) / Decimal((hi - lo).days))
     bonuses = db.all(
         """SELECT id, on_date, amount, note FROM therapist_bonuses
            WHERE therapist_id=%s AND on_date >= %s AND on_date < %s ORDER BY on_date, id""",
