@@ -22,6 +22,27 @@ ENTITY = {
 }
 
 
+# path resource -> table, to snapshot the row before an edit so the log can show "old -> new"
+TABLES = {"appointments": "appointments", "customers": "customers", "therapists": "therapists", "services": "services",
+          "users": "users", "plans": "customer_plans", "plan-packages": "plan_packages", "shifts": "shifts",
+          "expenses": "expenses", "recurring": "recurring_expenses", "payments": "payments", "spas": "spas",
+          "deductions": "therapist_deductions", "absences": "therapist_absences"}
+BEFORE_SKIP = {"id", "spa_id", "created_at", "updated_at", "password_hash", "logo"}
+
+
+def target_of(path: str):
+    segs = path.split("/")[2:]
+    hit = None
+    for i in range(len(segs) - 1):
+        if segs[i] in TABLES and segs[i + 1].isdigit():
+            hit = (TABLES[segs[i]], int(segs[i + 1]))
+    return hit
+
+
+def _plain(v):
+    return None if v is None else str(v)[:200]
+
+
 def action_for(method: str, path: str) -> str:
     parts = [p for p in path.split("/")[2:] if p and not p.isdigit()]
     if path.startswith("/api/auth/login"):
@@ -68,6 +89,14 @@ class AuditMiddleware:
                 status["code"] = msg["status"]
             await send(msg)
 
+        before = None
+        tgt = target_of(scope["path"]) if scope["method"] in ("PUT", "PATCH", "DELETE") else None
+        if tgt:
+            try:
+                before = await anyio.to_thread.run_sync(
+                    lambda: self.db.one(f"SELECT * FROM {tgt[0]} WHERE id=%s", (tgt[1],)))
+            except Exception:  # noqa: BLE001
+                before = None
         await self.app(scope, rec, snd)
         if not (200 <= status["code"] < 300):
             return
@@ -82,6 +111,17 @@ class AuditMiddleware:
                 details = None
         elif body:
             details = {"upload": f"{len(body)} bytes"}
+        if before:
+            if scope["method"] == "DELETE":
+                details = {**(details or {}), "_removed": {k: _plain(v) for k, v in before.items()
+                                                           if k not in BEFORE_SKIP and v not in (None, "")}}
+            elif isinstance(details, dict):
+                ch = {k: [_plain(before[k]), _plain(v)] for k, v in details.items()
+                      if k in before and k not in BEFORE_SKIP and not isinstance(v, (dict, list))
+                      and _plain(before[k]) != _plain(v) and not (before[k] is not None and v is not None
+                                                                   and _num_eq(before[k], v))}
+                if ch:
+                    details["_changes"] = ch
         if scope["path"].startswith("/api/auth/login") and isinstance(details, dict):
             user = user or {"username": details.get("username")}
         client = scope.get("client") or ("", 0)
@@ -102,3 +142,10 @@ def _ip(scope, client):
         if k == b"x-forwarded-for":
             return v.decode(errors="ignore").split(",")[0].strip()
     return client[0]
+
+
+def _num_eq(a, b):
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a)[:10] == str(b)[:10] and len(str(b)) == 10  # a date given as YYYY-MM-DD

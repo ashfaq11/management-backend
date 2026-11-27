@@ -2229,6 +2229,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.get("/api/audit")
     def audit(page: int = Query(1, ge=1), size: int = Query(50, ge=1, le=200), user_id: Optional[int] = None,
+              kind: str = "", ref: str = "",
               q: str = "", date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
               u=Depends(current_user)):
         """Newest first. Admins see their own spa; a superadmin sees the picked spa, or everything when none is picked."""
@@ -2239,6 +2240,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             where.append("spa_id=%s"); args.append(u["spa"])
         if user_id:
             where.append("user_id=%s"); args.append(user_id)
+        if kind in AUDIT_KINDS:
+            where.append("path ~ %s"); args.append(AUDIT_KINDS[kind])
+        if ref and re.fullmatch(r"[a-z]+:\d+", ref):
+            k, i = ref.split(":")
+            seg = {v: k2 for k2, v in SEG_KIND.items()}.get(k)
+            if seg:
+                where.append("(path ~ %s OR details->>%s = %s)"); args += [f"/{seg}/{i}(/|$)", f"{k}_id", i]
         if q.strip():
             where.append("(action ILIKE %s OR username ILIKE %s OR path ILIKE %s OR details::text ILIKE %s)")
             like = f"%{q.strip()}%"; args += [like] * 4
@@ -2252,6 +2260,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                       (*args, size, (page - 1) * size))
         name_audit_rows(rows)
         return {"total": total, "page": page, "size": size, "items": rows}
+
+    AUDIT_KINDS = {
+        "bookings": r"^/api/(appointments|onboarding)", "memberships": r"/(plans|plan-packages|topup|plan-topups)(/|$)",
+        "payments": r"/(payments|refunds|paid)(/|$)", "staff": r"^/api/(therapists|shifts|shift-assignments|absences|deductions|bonuses)",
+        "users": r"^/api/(users|auth)", "expenses": r"^/api/(expenses|recurring)", "settings": r"^/api/(spa|platform|spas)",
+        "customers": r"^/api/customers(/\d+)?$",
+    }
 
     # what an id in an audit path or body points at -> SQL giving (id, readable name)
     AUDIT_NAMES = {
