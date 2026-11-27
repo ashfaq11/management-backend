@@ -359,6 +359,8 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
 
     # Use the spa-specific logo when one has been configured.
     brand_cell = [Paragraph(f"<b>{e(business)}</b>", style("brand", fontName="Helvetica-Bold", fontSize=11, leading=13))]
+    if p.get("spa_address"):
+        brand_cell.append(Paragraph(e(p["spa_address"]).replace("\\n", "<br/>"), small))
     data_url = p.get("logo_data_url")
     if data_url:
         match = re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})", data_url)
@@ -372,6 +374,8 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
                 scale = min(54 / max(iw, 1), 42 / max(ih, 1))
                 brand_cell = [Image(BytesIO(raw), width=iw * scale, height=ih * scale), Spacer(1, 3),
                               Paragraph(e(business), style("brand2", fontName="Helvetica-Bold", fontSize=9, leading=11))]
+                if p.get("spa_address"):
+                    brand_cell.append(Paragraph(e(p["spa_address"]).replace("\\n", "<br/>"), small))
             except Exception:
                 pass
 
