@@ -352,10 +352,13 @@ Auditable deductions from prepaid customer plans for completed appointments; rev
 | `created_at` | timestamp with time zone | no | `now()` | When the appointment consumed the plan. |
 | `reversed_at` | timestamp with time zone | yes |  | When a deduction was reversed because the appointment left completed status. |
 | `at_booking` | boolean | no | `false` | Taken when booking (stays if the visit is reopened); false = taken at completion (returned on reopen). |
+| `covered` | numeric(12,2) | yes |  | Rupee value of the visit this deduction paid for; NULL = the whole visit. |
+| `created_by` | bigint | yes |  | Login that made the deduction. |
 
 **Constraints**
 
 - Check `plan_redemptions_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `plan_redemptions_covered_check`: `CHECK ((covered >= (0)::numeric))`
 - Check `plan_redemptions_unit_check`: `CHECK ((unit = ANY (ARRAY['hours'::text, 'rupees'::text])))`
 - Foreign key `plan_redemptions_appointment_id_fkey`: `FOREIGN KEY (appointment_id) REFERENCES appointments(id)`
 - Foreign key `plan_redemptions_plan_id_fkey`: `FOREIGN KEY (plan_id) REFERENCES customer_plans(id)`

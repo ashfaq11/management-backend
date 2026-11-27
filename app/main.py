@@ -161,6 +161,8 @@ class StatusIn(BaseModel):
     status: Status
     plan_type: Optional[Literal["hours", "rupees"]] = None
     deduct_amount: Optional[float] = Field(default=None, gt=0, le=1000)  # override hours (or rupees) taken from the plan
+    partial: bool = False  # balance short: take what is left, the rest is collected as a payment
+    keep_plan: bool = False  # cancel / no-show without returning the deduction
 
 
 class CustomerPlanIn(BaseModel):
@@ -756,6 +758,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                WHERE p.customer_id=%s AND p.spa_id=%s ORDER BY p.received_at DESC, p.id DESC""", (cid, u["spa"]))
         return c
 
+    @app.get("/api/customers/{cid}/plan-history")
+    def plan_history(cid: int, u=Depends(member)):
+        """Every membership deduction for a customer, newest first."""
+        return db.all("""SELECT r.id, r.created_at, p.name AS plan, s.name AS service, a.start_at, r.amount, r.unit,
+                                r.covered, r.reversed_at, us.username AS done_by
+                         FROM plan_redemptions r JOIN customer_plans p ON p.id=r.plan_id
+                         JOIN appointments a ON a.id=r.appointment_id JOIN services s ON s.id=a.service_id
+                         LEFT JOIN users us ON us.id=r.created_by
+                         WHERE p.customer_id=%s AND r.spa_id=%s ORDER BY r.created_at DESC, r.id DESC""", (cid, u["spa"]))
+
     @app.put("/api/customers/{cid}")
     def edit_customer(cid: int, b: CustomerIn, u=Depends(member)):
         try:
@@ -949,9 +961,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         sql = """SELECT a.*, c.name AS customer, c.phone, c.preferred_payment_method,
                          s.name AS service, t.name AS therapist,
                          COALESCE(pay.paid_amount,0) AS paid_amount,
-                         CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
-                                           AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
-                              THEN 0 ELSE GREATEST(a.price-COALESCE(pay.paid_amount,0),0) END AS balance_due,
+                         GREATEST(a.price-COALESCE(pay.paid_amount,0)-COALESCE((SELECT COALESCE(r.covered,a.price)
+                                  FROM plan_redemptions r WHERE r.appointment_id=a.id AND r.spa_id=a.spa_id
+                                  AND r.reversed_at IS NULL LIMIT 1),0),0) AS balance_due,
                          CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
                                            AND r.spa_id=a.spa_id AND r.reversed_at IS NULL)
                               THEN 'prepaid'
@@ -1069,7 +1081,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             deduction = None
             if b.plan_type:
                 a = t.one("SELECT * FROM appointments WHERE id=%s", (aid,))
-                deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], True)
+                deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], True, by=u["id"])
             return {"id": aid, "plan_deduction": deduction}
 
     @app.put("/api/appointments/{aid}")
@@ -1112,7 +1124,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                 u["spa"], r["at_booking"])
         return {"id": aid}
 
-    def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int, at_booking: bool = False) -> dict:
+    def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int, at_booking: bool = False,
+                    partial: bool = False, by=None) -> dict:
         """Take the visit's hours (or rupees) from the customer's oldest active plan with enough balance."""
         already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
                                  AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
@@ -1127,12 +1140,24 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
                           AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
                         ORDER BY created_at, id LIMIT 1 FOR UPDATE""", (a["customer_id"], spa, plan_type, amount))
+        covered = None
+        if not plan and partial:
+            plan = t.one("""SELECT * FROM customer_plans
+                            WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance > 0
+                              AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
+                            ORDER BY balance DESC, id LIMIT 1 FOR UPDATE""", (a["customer_id"], spa, plan_type))
+            if plan:
+                full = amount
+                amount = round(float(plan["balance"]), 2)
+                covered = round(float(a["price"]) * amount / full, 2) if full else 0
         if not plan:
             raise HTTPException(409, f"No active {'hours' if plan_type == 'hours' else 'rupees'} plan has enough balance for this appointment")
         t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
-        t.insert("INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit,at_booking) VALUES(%s,%s,%s,%s,%s,%s)",
-                 (plan["id"], a["id"], spa, amount, plan_type, at_booking))
+        t.insert("""INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit,at_booking,covered,created_by)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 (plan["id"], a["id"], spa, amount, plan_type, at_booking, covered, by))
         return {"plan_id": plan["id"], "plan_name": plan["name"], "amount": amount, "unit": plan_type,
+                "balance_due": round(float(a["price"]) - covered, 2) if covered is not None else 0,
                 "remaining_balance": round(float(plan["balance"]) - amount, 2)}
 
     def reverse_plan(t, aid: int, spa: int) -> None:
@@ -1162,7 +1187,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if not b.plan_type:
                 raise HTTPException(422, "Choose hours or rupees")
             reverse_plan(t, aid, u["spa"])  # changing the amount: put back the old deduction first
-            return {"id": aid, "plan_deduction": deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], a["status"] == "booked")}
+            return {"id": aid, "plan_deduction": deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], a["status"] == "booked", b.partial, u["id"])}
 
     @app.patch("/api/appointments/{aid}/status")
     def set_status(aid: int, b: StatusIn, u=Depends(member)):
@@ -1178,7 +1203,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 held = t.one("SELECT 1 FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
                              (aid, u["spa"]))
                 if b.status in ("cancelled", "no_show"):
-                    reverse_plan(t, aid, u["spa"])  # the visit did not happen: hours / rupees go back
+                    if not b.keep_plan:
+                        reverse_plan(t, aid, u["spa"])  # the visit did not happen: hours / rupees go back
                 elif b.status == "booked" and a["status"] == "completed":
                     # reopening: a deduction made at completion goes back; one made at booking stays
                     t.run("""UPDATE customer_plans p SET balance=p.balance+r.amount FROM plan_redemptions r
@@ -1187,7 +1213,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                     t.run("""UPDATE plan_redemptions SET reversed_at=now() WHERE appointment_id=%s AND spa_id=%s
                              AND reversed_at IS NULL AND NOT at_booking""", (aid, u["spa"]))
                 elif b.status == "completed" and b.plan_type and not held:
-                    deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])
+                    deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], False, b.partial, u["id"])
                 t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
@@ -1195,13 +1221,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     # ---- appointment payments ------------------------------------------
     def payment_due(t, appointment: dict, spa: int) -> float:
-        prepaid = t.one("SELECT 1 FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
+        prepaid = t.one("SELECT covered FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
                         (appointment["id"], spa))
         paid = t.one("""SELECT COALESCE(SUM(p.amount-COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
                               WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)),0) AS total
                          FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s""",
                      (appointment["id"], spa))["total"]
-        return 0.0 if prepaid else max(round(float(appointment["price"])-float(paid), 2), 0.0)
+        covered = float(appointment["price"]) if prepaid and prepaid["covered"] is None else float(prepaid["covered"]) if prepaid else 0.0
+        return max(round(float(appointment["price"])-covered-float(paid), 2), 0.0)
 
     @app.post("/api/appointments/{aid}/payments", status_code=201)
     def collect_payment(aid: int, b: PaymentIn, u=Depends(member)):

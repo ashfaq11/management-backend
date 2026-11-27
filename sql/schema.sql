@@ -732,6 +732,13 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INT NOT NULL DEFAULT 0;
 COMMENT ON COLUMN users.last_login_at IS 'Last successful sign-in.';
 COMMENT ON COLUMN users.login_count IS 'Number of successful sign-ins.';
 
+-- ======== 025_partial_redemption.sql ========
+-- Part-paid visits: a membership short of the visit covers part, the rest is collected.
+ALTER TABLE plan_redemptions ADD COLUMN IF NOT EXISTS covered NUMERIC(12,2) CHECK (covered >= 0);
+ALTER TABLE plan_redemptions ADD COLUMN IF NOT EXISTS created_by BIGINT;
+COMMENT ON COLUMN plan_redemptions.covered IS 'Rupee value of the visit this deduction paid for; NULL = the whole visit.';
+COMMENT ON COLUMN plan_redemptions.created_by IS 'Login that made the deduction.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -759,5 +766,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('021_expense_source_and_redemption_timing.sql'),
   ('022_spa_subscription.sql'),
   ('023_spa_profile.sql'),
-  ('024_last_login.sql')
+  ('024_last_login.sql'),
+  ('025_partial_redemption.sql')
 ON CONFLICT DO NOTHING;
