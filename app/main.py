@@ -1129,6 +1129,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s", (r["amount"], r["plan_id"]))
             t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (r["id"],))
 
+    @app.delete("/api/appointments/{aid}/plan", status_code=204)
+    def drop_plan(aid: int, u=Depends(member)):
+        """Undo a membership deduction: the balance goes back and the appointment is unpaid again."""
+        with db.tx() as t:
+            if not t.one("SELECT 1 FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"])):
+                raise HTTPException(404, "Appointment not found")
+            reverse_plan(t, aid, u["spa"])
+
     @app.post("/api/appointments/{aid}/plan")
     def use_plan(aid: int, b: StatusIn, u=Depends(member)):
         """Pay a booked appointment from a plan now (hours / rupees come off at booking; cancel or no-show returns them)."""
