@@ -344,8 +344,8 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     W = 354
 
     def style(name, **kw):
-        return ParagraphStyle(name, fontName="Helvetica", fontSize=8, leading=10,
-                              textColor=INK, **kw)
+        return ParagraphStyle(name, **{"fontName": "Helvetica", "fontSize": 8, "leading": 10,
+                                       "textColor": INK, **kw})
 
     title = style("receipt_title", fontName="Times-Roman", fontSize=19, leading=22, alignment=TA_RIGHT)
     small = style("small", fontSize=6.5, leading=8, textColor=MUT)
