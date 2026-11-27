@@ -7,12 +7,13 @@ import re
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg import errors as pgerr
 from pydantic import BaseModel, Field
 
 from . import payroll, security
+from .audit import AuditMiddleware
 from .db import Database, default_dsn
 
 MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -315,13 +316,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     app = FastAPI(title="StudioDesk API", lifespan=lifespan)
     app.state.db = db
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
+    app.add_middleware(AuditMiddleware, db=db)
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],
                        allow_headers=["Authorization", "Content-Type", "X-Spa-Id"],
                        expose_headers=["Content-Disposition"],
                        max_age=3600)  # browsers reuse the preflight answer, so a cross-origin UI pays it once an hour
 
     # ---- auth ---------------------------------------------------------
-    def current_user(authorization: str = Header(default=""), x_spa_id: Optional[int] = Header(default=None)):
+    def current_user(request: Request, authorization: str = Header(default=""), x_spa_id: Optional[int] = Header(default=None)):
         """The caller, with `spa` = the spa they are working in: their own for admin/staff; for a superadmin the
         one chosen with the X-Spa-Id header (None when none is chosen). A deactivated spa signs its users out."""
         tok = authorization[7:] if authorization.lower().startswith("bearer ") else ""
@@ -338,6 +340,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if not p:
                 raise HTTPException(404, "Spa not found")
             u["spa"], u["spa_name"] = p["id"], p["name"]
+        request.state.audit_user = {k: u.get(k) for k in ("id", "username", "role", "spa")}
         return u
 
     def member(u=Depends(current_user)):
@@ -1732,5 +1735,30 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def health():
         db.one("SELECT 1")  # fails (500) if the database is unreachable, so the load balancer sees it
         return {"ok": True}
+
+    @app.get("/api/audit")
+    def audit(page: int = Query(1, ge=1), size: int = Query(50, ge=1, le=200), user_id: Optional[int] = None,
+              q: str = "", date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
+              u=Depends(current_user)):
+        """Newest first. Admins see their own spa; a superadmin sees the picked spa, or everything when none is picked."""
+        if u["role"] not in ("admin", "superadmin"):
+            raise HTTPException(403, "Admins only")
+        where, args = [], []
+        if u["role"] != "superadmin" or u["spa"] is not None:
+            where.append("spa_id=%s"); args.append(u["spa"])
+        if user_id:
+            where.append("user_id=%s"); args.append(user_id)
+        if q.strip():
+            where.append("(action ILIKE %s OR username ILIKE %s OR path ILIKE %s OR details::text ILIKE %s)")
+            like = f"%{q.strip()}%"; args += [like] * 4
+        if date_from:
+            where.append("at >= %s"); args.append(date_from)
+        if date_to:
+            where.append("at < %s"); args.append(date_to + dt.timedelta(days=1))
+        w = (" WHERE " + " AND ".join(where)) if where else ""
+        total = db.one(f"SELECT COUNT(*) AS n FROM audit_log{w}", tuple(args))["n"]
+        rows = db.all(f"SELECT * FROM audit_log{w} ORDER BY at DESC, id DESC LIMIT %s OFFSET %s",
+                      (*args, size, (page - 1) * size))
+        return {"total": total, "page": page, "size": size, "items": rows}
 
     return app

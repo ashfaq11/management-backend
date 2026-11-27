@@ -1044,3 +1044,16 @@ class TestDashboardShifts(Base):
         self.assertEqual(r.status_code, 201, r.text)
         rows = self.c.get("/api/dashboard", headers=self.h).json()["today_shifts"]
         self.assertEqual([(x["therapist_id"], x["shift"], x["start_time"]) for x in rows], [(t, "Morning", "09:00")])
+
+
+class TestAudit(Base):
+    def test_changes_are_logged_without_secrets(self):
+        self.post("/api/services", name="Thai", price=2000, duration_min=60)
+        self.post("/api/users", username="front", password="frontdesk1", role="staff")
+        r = self.c.get("/api/audit", headers=self.h).json()
+        actions = [x["action"] for x in r["items"]]
+        self.assertIn("Add service", actions)
+        u = next(x for x in r["items"] if x["action"] == "Add user")
+        self.assertEqual((u["username"], u["details"]["password"]), ("admin", "***"))
+        tok = self.c.post("/api/auth/login", json={"username": "front", "password": "frontdesk1"}).json()["token"]
+        self.assertEqual(self.c.get("/api/audit", headers={"Authorization": f"Bearer {tok}"}).status_code, 403)

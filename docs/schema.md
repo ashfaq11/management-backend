@@ -11,6 +11,8 @@ erDiagram
   services ||--o{ appointments : has
   spas ||--o{ appointments : has
   therapists ||--o{ appointments : has
+  spas ||--o{ audit_log : has
+  users ||--o{ audit_log : has
   customers ||--o{ customer_plans : has
   plan_packages ||--o{ customer_plans : has
   spas ||--o{ customer_plans : has
@@ -49,6 +51,7 @@ erDiagram
 | Table | Purpose |
 |---|---|
 | [`appointments`](#appointments) | One booking of one customer with one therapist for one service. Completed appointments drive revenue and incentive. |
+| [`audit_log`](#audit_log) | Append-only record of every successful change made through the API; never edited or deleted by the app. |
 | [`customer_plans`](#customer_plans) | Prepaid package owned by one customer in one spa. A balance is measured in hours or INR. |
 | [`customers`](#customers) | Spa clients, created by onboarding or by hand. |
 | [`expenses`](#expenses) | One-off spa costs on a given date. |
@@ -106,6 +109,36 @@ One booking of one customer with one therapist for one service. Completed appoin
 - `appointments_spa_start_idx`: `CREATE INDEX appointments_spa_start_idx ON appointments USING btree (spa_id, start_at)`
 - `appointments_start_idx`: `CREATE INDEX appointments_start_idx ON appointments USING btree (start_at)`
 - `appointments_therapist_idx`: `CREATE INDEX appointments_therapist_idx ON appointments USING btree (therapist_id, start_at)`
+
+## audit_log
+
+Append-only record of every successful change made through the API; never edited or deleted by the app.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `at` | timestamp with time zone | no | `now()` | When the change happened. |
+| `spa_id` | bigint | yes |  | Spa the change was made in (NULL for superadmin-wide actions). |
+| `user_id` | bigint | yes |  | Login that made the change. |
+| `username` | text | yes |  | Username at the time, kept even if the login is renamed. |
+| `role` | text | yes |  | Role at the time (superadmin, admin, staff). |
+| `action` | text | no |  | Readable action, e.g. "Refund payment", "Edit service". |
+| `method` | text | no |  | HTTP method (POST, PUT, PATCH, DELETE). |
+| `path` | text | no |  | API path, with record ids. |
+| `status` | smallint | no |  | HTTP status returned. |
+| `details` | jsonb | yes |  | Request body with passwords and tokens removed. |
+| `ip` | text | yes |  | Client address as seen by the API. |
+
+**Constraints**
+
+- Foreign key `audit_log_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Foreign key `audit_log_user_id_fkey`: `FOREIGN KEY (user_id) REFERENCES users(id)`
+- Primary key `audit_log_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `audit_log_spa_at_idx`: `CREATE INDEX audit_log_spa_at_idx ON audit_log USING btree (spa_id, at DESC)`
+- `audit_log_user_at_idx`: `CREATE INDEX audit_log_user_at_idx ON audit_log USING btree (user_id, at DESC)`
 
 ## customer_plans
 
