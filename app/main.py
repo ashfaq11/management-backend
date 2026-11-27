@@ -2250,6 +2250,44 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         total = db.one(f"SELECT COUNT(*) AS n FROM audit_log{w}", tuple(args))["n"]
         rows = db.all(f"SELECT * FROM audit_log{w} ORDER BY at DESC, id DESC LIMIT %s OFFSET %s",
                       (*args, size, (page - 1) * size))
+        name_audit_rows(rows)
         return {"total": total, "page": page, "size": size, "items": rows}
+
+    # what an id in an audit path or body points at -> SQL giving (id, readable name)
+    AUDIT_NAMES = {
+        "therapist": "SELECT id, name FROM therapists WHERE id = ANY(%s)",
+        "customer": "SELECT id, name || ' (' || phone || ')' FROM customers WHERE id = ANY(%s)",
+        "service": "SELECT id, name FROM services WHERE id = ANY(%s)",
+        "user": "SELECT id, username FROM users WHERE id = ANY(%s)",
+        "package": "SELECT id, name FROM plan_packages WHERE id = ANY(%s)",
+        "plan": "SELECT id, name FROM customer_plans WHERE id = ANY(%s)",
+        "shift": "SELECT id, name FROM shifts WHERE id = ANY(%s)",
+        "appointment": """SELECT a.id, c.name || ' · ' || s.name || ' · ' || to_char(a.start_at AT TIME ZONE 'Asia/Kolkata', 'DD Mon HH24:MI')
+                          FROM appointments a JOIN customers c ON c.id=a.customer_id JOIN services s ON s.id=a.service_id
+                          WHERE a.id = ANY(%s)""",
+    }
+    SEG_KIND = {"therapists": "therapist", "customers": "customer", "services": "service", "users": "user",
+                "plan-packages": "package", "plans": "plan", "shifts": "shift", "appointments": "appointment"}
+
+    def name_audit_rows(rows):
+        """Adds `target` (e.g. "Therapist Asha") and `names` ({field: name}) so the log never shows bare ids."""
+        want: dict[str, set] = {k: set() for k in AUDIT_NAMES}
+        for r in rows:
+            segs = (r.get("path") or "").split("/")[2:]
+            r["_refs"] = [(SEG_KIND[segs[i]], int(segs[i + 1])) for i in range(len(segs) - 1)
+                          if segs[i] in SEG_KIND and segs[i + 1].isdigit()]
+            d = r.get("details") if isinstance(r.get("details"), dict) else {}
+            r["_fields"] = [(k, k[:-3].replace("plan_package", "package"), v) for k, v in d.items()
+                            if k.endswith("_id") and isinstance(v, int)]
+            for kind, i in r["_refs"]:
+                want[kind].add(i)
+            for _, kind, v in r["_fields"]:
+                if kind in want:
+                    want[kind].add(v)
+        found = {k: {v[0]: v[1] for v in (list(x.values()) for x in db.all(AUDIT_NAMES[k], (list(ids),)))} if ids else {}
+                 for k, ids in want.items()}
+        for r in rows:
+            r["target"] = " › ".join(f"{k.capitalize()} {found[k].get(i, '#' + str(i) + ' (deleted)')}" for k, i in r.pop("_refs"))
+            r["names"] = {f: found[k].get(v, f"#{v}") for f, k, v in r.pop("_fields") if k in found}
 
     return app
