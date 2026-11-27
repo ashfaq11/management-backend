@@ -17,9 +17,9 @@ REPORTS = {
                    COUNT(*) FILTER (WHERE a.status='no_show'), COUNT(*) FILTER (WHERE a.status='cancelled')
             FROM therapists t LEFT JOIN appointments a ON a.therapist_id=t.id AND {C}
             WHERE t.spa_id=%(spa)s GROUP BY t.id ORDER BY 4 DESC"""),
-    "plans": ("Plans", ["Customer", "Plan", "Type", "Bought", "Used", "Balance", "Price", "Payment", "Expires"],
+    "plans": ("Plans", ["Customer", "Plan", "Type", "Bought", "Used", "Balance", "Price", "Payment", "Expires", "Phone"],
         """SELECT c.name, p.name, p.plan_type, p.purchased_amount, p.purchased_amount-p.balance, p.balance, COALESCE(p.price_paid,0),
-                  CASE WHEN p.paid_at IS NULL THEN 'Pending' ELSE COALESCE(p.payment_method,'paid') END, p.expires_on
+                  CASE WHEN p.paid_at IS NULL THEN 'Pending' ELSE COALESCE(p.payment_method,'paid') END, p.expires_on, c.phone
            FROM customer_plans p JOIN customers c ON c.id=p.customer_id
            WHERE p.spa_id=%(spa)s AND p.created_at >= %(lo)s AND p.created_at < %(hi)s ORDER BY p.balance DESC, c.name"""),
     "services": ("Services", ["Service", "Done", "Revenue", "Avg price", "Hours", "Cancelled", "No-shows"],
