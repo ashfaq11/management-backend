@@ -2002,7 +2002,49 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Unknown report")
         lo, hi = period(month, date_from, date_to)
         r = insights.run(db, kind, u["spa"], lo, hi, days, expenses_in)
+        if kind == "therapists" and month:
+            # attendance and pay for the month, matched by therapist name (names are unique enough per spa)
+            att = {x["therapist"]: x for x in absences(month, u)["attendance"]}
+            pay = {}
+            for t in db.all("SELECT * FROM therapists WHERE spa_id=%s", (u["spa"],)):
+                try:
+                    pay[t["name"]] = payroll.compute_payslip(db, t, month)
+                except Exception:  # noqa: BLE001 - a missing payslip must not break the report
+                    pass
+            r["columns"] = r["columns"] + ["Days present", "Days away", "Deductions", "Net pay"]
+            for row in r["rows"]:
+                a_, p_ = att.get(row[0], {}), pay.get(row[0], {})
+                row += [a_.get("present"), a_.get("away"), p_.get("deductions_total"), p_.get("net_pay")]
         return {**r, "kind": kind, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat()}
+
+    class ExportIn(BaseModel):
+        title: str = Field(min_length=1, max_length=120)
+        period: str = Field(default="", max_length=120)
+        columns: list[str] = Field(min_length=1, max_length=30)
+        rows: list[list] = Field(default_factory=list, max_length=5000)
+
+    @app.post("/api/export/{ext}")
+    def export_table(ext: Literal["pdf", "xlsx"], b: ExportIn, u=Depends(member)):
+        """Any on-screen table as a branded PDF or Excel file (the page sends what it shows)."""
+        name = payroll.file_name(u["spa_name"], b.title, b.period or dt.date.today().isoformat())
+        if ext == "pdf":
+            return Response(payroll.table_pdf(u["spa_name"], b.title, b.period, b.columns, b.rows), media_type="application/pdf",
+                            headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook(); ws = wb.active; ws.title = b.title[:31]
+        ws.append([u["spa_name"]]); ws["A1"].font = Font(bold=True, size=14)
+        ws.append([f"{b.title}  ·  {b.period}  ·  generated {payroll.generated_at():%d %b %Y %H:%M} IST"]); ws.append([])
+        ws.append(b.columns)
+        for c in ws[4]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="0E6E6A")
+        for row in b.rows:
+            ws.append([v if isinstance(v, (int, float)) or v is None else str(v) for v in row])
+        for i, col in enumerate(b.columns, 1):
+            ws.column_dimensions[chr(64 + i) if i <= 26 else "Z"].width = max(12, len(col) + 4)
+        out = io.BytesIO(); wb.save(out)
+        return Response(out.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
 
     @app.get("/api/reports/insights/{kind}")
     def insight_json(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
