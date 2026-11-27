@@ -1097,6 +1097,19 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                       (b.customer_id, th["id"], sv["id"], start, minutes, price, b.notes, aid))
             except pgerr.ExclusionViolation:
                 raise HTTPException(409, SLOT_TAKEN)
+            # a membership taken at booking follows the edit: the old amount goes back and the new one is taken,
+            # unless staff had typed their own amount (then it is left alone)
+            r = t.one("""SELECT * FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL""",
+                      (aid, u["spa"]))
+            if r:
+                auto = round(a["duration_min"] / 60.0, 2) if r["unit"] == "hours" else round(float(a["price"]), 2)
+                new = round(minutes / 60.0, 2) if r["unit"] == "hours" else round(float(price), 2)
+                changed_customer = b.customer_id != a["customer_id"]
+                if changed_customer or (round(float(r["amount"]), 2) == auto and new != auto):
+                    reverse_plan(t, aid, u["spa"])
+                    fresh = t.one("SELECT * FROM appointments WHERE id=%s", (aid,))
+                    deduct_plan(t, fresh, r["unit"], None if changed_customer or round(float(r["amount"]), 2) == auto else float(r["amount"]),
+                                u["spa"], r["at_booking"])
         return {"id": aid}
 
     def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int, at_booking: bool = False) -> dict:
