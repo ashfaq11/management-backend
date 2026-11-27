@@ -1027,7 +1027,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/payments/{pid}/receipt")
     def payment_receipt(pid: int, u=Depends(member)):
         p = db.one("""SELECT p.*, c.name AS customer, c.phone, a.start_at, s.name AS service,
-                             t.name AS therapist, sp.name AS spa_name
+                             t.name AS therapist, sp.name AS spa_name, sp.logo_data_url
                       FROM payments p JOIN customers c ON c.id=p.customer_id
                       JOIN appointments a ON a.id=p.appointment_id JOIN services s ON s.id=a.service_id
                       JOIN therapists t ON t.id=a.therapist_id JOIN spas sp ON sp.id=p.spa_id
