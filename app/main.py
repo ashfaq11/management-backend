@@ -95,6 +95,21 @@ class ShiftAssignmentIn(BaseModel):
     day_of_week: int = Field(ge=0, le=6)  # Monday=0 through Sunday=6
 
 
+class PlanPackageIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    plan_type: Literal["hours", "rupees"]
+    amount: float = Field(gt=0, le=1_000_000)
+    price: float = Field(ge=0, le=10_000_000)
+    validity_days: Optional[int] = Field(default=None, gt=0, le=3650)
+    is_active: bool = True
+
+
+class AssignPlanIn(BaseModel):
+    package_id: int
+    paid: bool = True
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
 class ServiceIn(BaseModel):
     name: str = Field(min_length=1)
     price: float = Field(ge=0)
@@ -190,9 +205,23 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
     return sorted(rows, key=lambda x: (str(x["on_date"]), x["kind"], x["id"]))
 
 
+def assign_package(t, cid: int, spa: int, b: "AssignPlanIn") -> int:
+    """Create a customer plan from a package: its amount, price and validity, nothing typed by hand."""
+    pk = t.one("SELECT * FROM plan_packages WHERE id=%s AND spa_id=%s AND is_active", (b.package_id, spa))
+    if not pk:
+        raise HTTPException(404, "Plan package not found")
+    expires = dt.date.today() + dt.timedelta(days=pk["validity_days"]) if pk["validity_days"] else None
+    return t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,
+                                                  price_paid,paid_at,package_id)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
+                    (cid, spa, pk["name"], pk["plan_type"], pk["amount"], pk["amount"], expires,
+                     (b.notes or "").strip() or None, pk["price"], b.paid, pk["id"]))
+
+
 class OnboardIn(CustomerIn):
     first_appointment: Optional[AppointmentIn] = None  # customer_id ignored
-    plan: Optional[CustomerPlanIn] = None
+    plan: Optional[CustomerPlanIn] = None  # custom plan: admins only
+    package: Optional[AssignPlanIn] = None  # a plan package: anyone
 
 
 class BonusIn(BaseModel):
@@ -1079,8 +1108,43 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(404, "Plan not found")
         return {"id": pid}
 
+    @app.post("/api/customers/{cid}/plans/assign", status_code=201)
+    def assign_customer_plan(cid: int, b: AssignPlanIn, u=Depends(member)):
+        """Staff and admins: give a customer a plan from the spa's packages."""
+        with db.tx() as t:
+            if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
+                raise HTTPException(404, "Customer not found")
+            pid = assign_package(t, cid, u["spa"], b)
+        return {"id": pid}
+
+    @app.get("/api/plan-packages")
+    def plan_packages(u=Depends(member)):
+        return db.all("SELECT * FROM plan_packages WHERE spa_id=%s ORDER BY NOT is_active, plan_type, price", (u["spa"],))
+
+    @app.post("/api/plan-packages", status_code=201)
+    def add_plan_package(b: PlanPackageIn, u=Depends(admin)):
+        try:
+            return {"id": db.insert("""INSERT INTO plan_packages(spa_id,name,plan_type,amount,price,validity_days,is_active)
+                                       VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                                    (u["spa"], b.name.strip(), b.plan_type, b.amount, b.price, b.validity_days, b.is_active))}
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, "A package with this name already exists")
+
+    @app.put("/api/plan-packages/{kid}")
+    def edit_plan_package(kid: int, b: PlanPackageIn, u=Depends(admin)):
+        """Changes apply to future assignments only; plans already sold keep their terms."""
+        try:
+            n = db.run("""UPDATE plan_packages SET name=%s,plan_type=%s,amount=%s,price=%s,validity_days=%s,is_active=%s
+                          WHERE id=%s AND spa_id=%s""",
+                       (b.name.strip(), b.plan_type, b.amount, b.price, b.validity_days, b.is_active, kid, u["spa"]))
+        except pgerr.UniqueViolation:
+            raise HTTPException(409, "A package with this name already exists")
+        if not n:
+            raise HTTPException(404, "Plan package not found")
+        return {"id": kid}
+
     @app.put("/api/customers/{cid}/plans/{pid}/paid")
-    def set_plan_paid(cid: int, pid: int, b: PaidIn, u=Depends(admin)):
+    def set_plan_paid(cid: int, pid: int, b: PaidIn, u=Depends(member)):
         """Mark a plan's cost received (revenue counts it today) or back to pending."""
         if not db.run("""UPDATE customer_plans SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END
                          WHERE id=%s AND customer_id=%s AND spa_id=%s""", (b.paid, pid, cid, u["spa"])):
@@ -1088,7 +1152,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"id": pid, "paid": b.paid}
 
     @app.put("/api/plan-topups/{tid}/paid")
-    def set_topup_paid(tid: int, b: PaidIn, u=Depends(admin)):
+    def set_topup_paid(tid: int, b: PaidIn, u=Depends(member)):
         if not db.run("UPDATE plan_topups SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END WHERE id=%s AND spa_id=%s",
                       (b.paid, tid, u["spa"])):
             raise HTTPException(404, "Top-up not found")
@@ -1122,7 +1186,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if b.first_appointment:
                 aid = insert_appointment(t, b.first_appointment.model_copy(update={"customer_id": cid}), u["spa"])
             pid = None
-            if b.plan:
+            if b.package:
+                pid = assign_package(t, cid, u["spa"], b.package)
+            elif b.plan:
+                if u["role"] == "staff":
+                    raise HTTPException(403, "Staff can only assign a plan package")
                 pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid,paid_at)
                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
                                (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,

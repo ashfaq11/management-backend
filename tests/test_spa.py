@@ -1000,3 +1000,32 @@ class TestPlanPaidStatus(Base):
         self.post(f"/api/customers/{c}/plans/{pid}/topup", amount=2, price_paid=1800, paid=False)
         r = self.c.get(f"/api/reports/summary?month={m}", headers=self.h).json()
         self.assertEqual((r["plan_sales"], r["plan_dues"]), (9000.0, 1800.0))
+
+
+class TestPlanPackages(Base):
+    def test_admin_defines_packages_staff_assigns(self):
+        _, _, c = self.seed()
+        k = self.post("/api/plan-packages", name="10 Hours Gold", plan_type="hours", amount=10, price=9000,
+                      validity_days=90).json()["id"]
+        self.post("/api/users", username="front", password="frontdesk1", role="staff")
+        tok = self.c.post("/api/auth/login", json={"username": "front", "password": "frontdesk1"}).json()["token"]
+        h = {"Authorization": f"Bearer {tok}"}
+        self.assertEqual(self.c.post("/api/plan-packages", json={"name": "x", "plan_type": "hours", "amount": 1, "price": 1},
+                                     headers=h).status_code, 403)
+        self.assertEqual(self.c.post(f"/api/customers/{c}/plans", json={"name": "free", "plan_type": "hours", "amount": 99},
+                                     headers=h).status_code, 403)
+        r = self.c.post(f"/api/customers/{c}/plans/assign", json={"package_id": k, "paid": False}, headers=h)
+        self.assertEqual(r.status_code, 201, r.text)
+        plan = self.c.get(f"/api/customers/{c}", headers=h).json()["plans"][0]
+        self.assertEqual((plan["name"], float(plan["balance"]), float(plan["price_paid"]), plan["package_id"], plan["paid_at"]),
+                         ("10 Hours Gold", 10.0, 9000.0, k, None))
+        self.assertIsNotNone(plan["expires_on"])
+        self.assertEqual(self.c.put(f"/api/customers/{c}/plans/{plan['id']}/paid", json={"paid": True}, headers=h).status_code, 200)
+        r = self.c.post("/api/onboarding", json={"name": "N", "phone": "9990002222", "package": {"package_id": k}}, headers=h)
+        self.assertEqual(r.status_code, 201, r.text)
+        r = self.c.post("/api/onboarding", json={"name": "M", "phone": "9990003333",
+                                                 "plan": {"name": "x", "plan_type": "hours", "amount": 50}}, headers=h)
+        self.assertEqual(r.status_code, 403)
+        self.c.put(f"/api/plan-packages/{k}", json={"name": "10 Hours Gold", "plan_type": "hours", "amount": 10, "price": 9000,
+                                                    "is_active": False}, headers=self.h)
+        self.assertEqual(self.c.post(f"/api/customers/{c}/plans/assign", json={"package_id": k}, headers=h).status_code, 404)

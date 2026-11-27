@@ -12,6 +12,7 @@ erDiagram
   spas ||--o{ appointments : has
   therapists ||--o{ appointments : has
   customers ||--o{ customer_plans : has
+  plan_packages ||--o{ customer_plans : has
   spas ||--o{ customer_plans : has
   spas ||--o{ customers : has
   users ||--o{ expenses : has
@@ -23,6 +24,7 @@ erDiagram
   customers ||--o{ payments : has
   users ||--o{ payments : has
   spas ||--o{ payments : has
+  spas ||--o{ plan_packages : has
   appointments ||--o{ plan_redemptions : has
   customer_plans ||--o{ plan_redemptions : has
   spas ||--o{ plan_redemptions : has
@@ -52,6 +54,7 @@ erDiagram
 | [`expenses`](#expenses) | One-off spa costs on a given date. |
 | [`payment_refunds`](#payment_refunds) | Immutable partial or full refunds against recorded appointment payments. |
 | [`payments`](#payments) | Amounts collected from customers against appointments; multiple partial payments are allowed. |
+| [`plan_packages`](#plan_packages) | Plans a spa sells at a fixed price; staff assign them to customers. |
 | [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
 | [`plan_topups`](#plan_topups) | Amounts added to an existing prepaid plan after it was sold. |
 | [`recurring_expenses`](#recurring_expenses) | A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active. |
@@ -122,6 +125,7 @@ Prepaid package owned by one customer in one spa. A balance is measured in hours
 | `created_at` | timestamp with time zone | no | `now()` | When the plan was added to the customer. |
 | `price_paid` | numeric(12,2) | yes |  | Money received when the plan was sold (INR); counted as revenue on the sale date. |
 | `paid_at` | timestamp with time zone | yes |  | When the plan cost was received; NULL = payment pending. Plan sales count on this date. |
+| `package_id` | bigint | yes |  | Package the plan was assigned from; NULL = custom plan made by an admin. |
 
 **Constraints**
 
@@ -131,6 +135,7 @@ Prepaid package owned by one customer in one spa. A balance is measured in hours
 - Check `customer_plans_price_paid_check`: `CHECK ((price_paid >= (0)::numeric))`
 - Check `customer_plans_purchased_amount_check`: `CHECK ((purchased_amount > (0)::numeric))`
 - Foreign key `customer_plans_customer_id_fkey`: `FOREIGN KEY (customer_id) REFERENCES customers(id)`
+- Foreign key `customer_plans_package_id_fkey`: `FOREIGN KEY (package_id) REFERENCES plan_packages(id)`
 - Foreign key `customer_plans_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `customer_plans_pkey`: `PRIMARY KEY (id)`
 
@@ -255,6 +260,36 @@ Amounts collected from customers against appointments; multiple partial payments
 
 - `payments_appointment_idx`: `CREATE INDEX payments_appointment_idx ON payments USING btree (spa_id, appointment_id, received_at)`
 - `payments_spa_received_idx`: `CREATE INDEX payments_spa_received_idx ON payments USING btree (spa_id, received_at DESC)`
+
+## plan_packages
+
+Plans a spa sells at a fixed price; staff assign them to customers.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa. |
+| `name` | text | no |  | Package name, e.g. 10 Hours Gold. |
+| `plan_type` | text | no |  | hours or rupees, like customer_plans.plan_type. |
+| `amount` | numeric(12,2) | no |  | Hours or rupees the customer gets. |
+| `price` | numeric(12,2) | no |  | What the customer pays (INR). |
+| `validity_days` | integer | yes |  | Days the plan stays valid after it is assigned; NULL = no expiry. |
+| `is_active` | boolean | no | `true` | Inactive packages cannot be assigned; plans already sold are unaffected. |
+| `created_at` | timestamp with time zone | no | `now()` | When the package was created. |
+
+**Constraints**
+
+- Check `plan_packages_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `plan_packages_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `plan_packages_plan_type_check`: `CHECK ((plan_type = ANY (ARRAY['hours'::text, 'rupees'::text])))`
+- Check `plan_packages_price_check`: `CHECK ((price >= (0)::numeric))`
+- Check `plan_packages_validity_days_check`: `CHECK ((validity_days > 0))`
+- Foreign key `plan_packages_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Primary key `plan_packages_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `plan_packages_spa_name_key`: `CREATE UNIQUE INDEX plan_packages_spa_name_key ON plan_packages USING btree (spa_id, lower(name))`
 
 ## plan_redemptions
 
