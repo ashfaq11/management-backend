@@ -284,14 +284,39 @@ class SpaIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
 
-class SpaCreate(SpaIn):
+class SpaPlan(BaseModel):
+    plan_start: Optional[dt.date] = None
+    plan_end: Optional[dt.date] = None
+    is_trial: bool = False
+    contact_phone: Optional[str] = Field(default=None, max_length=30)
+    contact_email: Optional[str] = Field(default=None, max_length=120)
+
+
+class SpaCreate(SpaIn, SpaPlan):
     """A new spa and its first admin, created together."""
     admin_username: str = Field(min_length=3)
     admin_password: str = Field(min_length=8)
 
 
-class SpaUpdate(SpaIn):
+class SpaUpdate(SpaIn, SpaPlan):
     is_active: bool = True
+
+
+class SignupIn(BaseModel):
+    spa_name: str = Field(min_length=2, max_length=120)
+    username: str = Field(min_length=3, max_length=60)
+    password: str = Field(min_length=8, max_length=200)
+    phone: Optional[str] = Field(default=None, max_length=30)
+    email: Optional[str] = Field(default=None, max_length=120)
+
+
+class PlatformIn(BaseModel):
+    renewal_name: Optional[str] = Field(default=None, max_length=120)
+    renewal_phone: Optional[str] = Field(default=None, max_length=40)
+    renewal_email: Optional[str] = Field(default=None, max_length=120)
+    renewal_message: Optional[str] = Field(default=None, max_length=500)
+    trial_days: int = Field(default=30, ge=1, le=365)
+    allow_signup: bool = True
 
 
 class SpaLogoUpdate(BaseModel):
@@ -366,7 +391,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         """The caller, with `spa` = the spa they are working in: their own for admin/staff; for a superadmin the
         one chosen with the X-Spa-Id header (None when none is chosen). A deactivated spa signs its users out."""
         tok = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-        u = db.one("""SELECT u.id,u.username,u.role,u.spa_id,p.name AS spa_name FROM sessions s
+        u = db.one("""SELECT u.id,u.username,u.role,u.spa_id,p.name AS spa_name, p.plan_end, p.is_trial,
+                             (p.plan_end IS NOT NULL AND p.plan_end < CURRENT_DATE) AS spa_expired FROM sessions s
                       JOIN users u ON u.id=s.user_id LEFT JOIN spas p ON p.id=u.spa_id
                       WHERE s.token_hash=%s AND s.expires_at>now() AND u.is_active
                         AND (u.spa_id IS NULL OR p.is_active)""",
@@ -383,9 +409,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return u
 
     def member(u=Depends(current_user)):
-        """Anyone working inside one spa (a superadmin must pick one first)."""
+        """Anyone working inside one spa (a superadmin must pick one first). An expired spa's users get 402."""
         if u["spa"] is None:
             raise HTTPException(400, "Choose a spa first")
+        if u["role"] != "superadmin" and u.get("spa_expired"):
+            raise HTTPException(402, "Your subscription has ended. Please renew to continue.")
         return u
 
     def admin(u=Depends(member)):
@@ -413,6 +441,38 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return {"token": tok, "username": u["username"], "role": u["role"], "spa_id": u["spa_id"],
                 "spa_name": spa["name"] if spa else None}
 
+    @app.get("/api/platform/contact")
+    def platform_contact():
+        """Public: who to contact for renewal, and whether sign-up is open."""
+        return db.one("SELECT renewal_name, renewal_phone, renewal_email, renewal_message, trial_days, allow_signup FROM platform_settings WHERE id=1")
+
+    @app.put("/api/platform/settings")
+    def platform_settings(b: PlatformIn, _=Depends(superadmin)):
+        db.run("""UPDATE platform_settings SET renewal_name=%s, renewal_phone=%s, renewal_email=%s, renewal_message=%s,
+                  trial_days=%s, allow_signup=%s, updated_at=now() WHERE id=1""",
+               (b.renewal_name, b.renewal_phone, b.renewal_email, b.renewal_message, b.trial_days, b.allow_signup))
+        return platform_contact()
+
+    @app.post("/api/auth/register", status_code=201)
+    def register(b: SignupIn):
+        """Public sign-up: a new spa on a free trial with its first admin, signed in straight away."""
+        cfg = platform_contact()
+        if not cfg["allow_signup"]:
+            raise HTTPException(403, "Sign-up is closed. Please contact us.")
+        with db.tx() as t:
+            try:
+                sid = t.insert("""INSERT INTO spas(name, plan_start, plan_end, is_trial, contact_phone, contact_email)
+                                  VALUES(%s, CURRENT_DATE, CURRENT_DATE + %s, true, %s, %s)""",
+                               (b.spa_name.strip(), cfg["trial_days"], (b.phone or "").strip() or None, (b.email or "").strip() or None))
+            except pgerr.UniqueViolation:
+                raise HTTPException(409, "A spa with this name already exists")
+            try:
+                t.insert("INSERT INTO users(username,password_hash,role,spa_id) VALUES(%s,%s,'admin',%s)",
+                         (b.username.strip(), security.hash_password(b.password), sid))
+            except pgerr.UniqueViolation:
+                raise HTTPException(409, "Username taken")
+        return login(Login(username=b.username, password=b.password))
+
     @app.post("/api/auth/logout", status_code=204)
     def logout(authorization: str = Header(default=""), u=Depends(current_user)):
         db.run("DELETE FROM sessions WHERE token_hash=%s", (security.fingerprint(authorization[7:]),))
@@ -436,7 +496,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/spas")
     def spas(u=Depends(current_user)):
         """Superadmin: every spa with its people and this month's revenue. Others: just their own spa."""
-        sql = """SELECT p.id, p.name, p.is_active, p.created_at,
+        sql = """SELECT p.id, p.name, p.is_active, p.created_at, p.plan_start, p.plan_end, p.is_trial, p.contact_phone,
+                        p.contact_email, (p.plan_end IS NOT NULL AND p.plan_end < CURRENT_DATE) AS expired,
                         (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='admin' AND x.is_active) AS admins,
                         (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='staff' AND x.is_active) AS staff,
                         (SELECT COUNT(*) FROM customers c WHERE c.spa_id=p.id) AS customers,
@@ -451,7 +512,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def add_spa(b: SpaCreate, _=Depends(superadmin)):
         with db.tx() as t:
             try:
-                sid = t.insert("INSERT INTO spas(name) VALUES(%s)", (b.name.strip(),))
+                sid = t.insert("""INSERT INTO spas(name, plan_start, plan_end, is_trial, contact_phone, contact_email)
+                                  VALUES(%s,%s,%s,%s,%s,%s)""",
+                               (b.name.strip(), b.plan_start or dt.date.today(), b.plan_end, b.is_trial, b.contact_phone, b.contact_email))
             except pgerr.UniqueViolation:
                 raise HTTPException(409, "A spa with this name already exists")
             try:
@@ -465,7 +528,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def edit_spa(sid: int, b: SpaUpdate, _=Depends(superadmin)):
         with db.tx() as t:
             try:
-                if not t.run("UPDATE spas SET name=%s, is_active=%s WHERE id=%s", (b.name.strip(), b.is_active, sid)):
+                if b.plan_start and b.plan_end and b.plan_end < b.plan_start:
+                    raise HTTPException(422, "End date must be after the start date")
+                if not t.run("""UPDATE spas SET name=%s, is_active=%s, plan_start=%s, plan_end=%s, is_trial=%s,
+                                contact_phone=%s, contact_email=%s WHERE id=%s""",
+                             (b.name.strip(), b.is_active, b.plan_start, b.plan_end, b.is_trial, b.contact_phone, b.contact_email, sid)):
                     raise HTTPException(404, "Spa not found")
             except pgerr.UniqueViolation:
                 raise HTTPException(409, "A spa with this name already exists")
