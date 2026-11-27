@@ -1289,6 +1289,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.post("/api/customers/{cid}/plans", status_code=201)
     def add_customer_plan(cid: int, b: CustomerPlanIn, u=Depends(admin)):
+        raise HTTPException(403, "Custom plans are switched off. Assign a membership plan from the list.")
         with db.tx() as t:
             if not t.one("SELECT 1 FROM customers WHERE id=%s AND spa_id=%s FOR UPDATE", (cid, u["spa"])):
                 raise HTTPException(404, "Customer not found")
@@ -1392,8 +1393,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if b.package:
                 pid = assign_package(t, cid, u["spa"], b.package)
             elif b.plan:
-                if u["role"] == "staff":
-                    raise HTTPException(403, "Staff can only assign a plan package")
+                raise HTTPException(403, "Custom plans are switched off. Assign a membership plan from the list.")
                 pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid,paid_at,payment_method)
                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
                                (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
