@@ -1368,6 +1368,22 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                  paid_for(b.plan_type, b.amount, b.price_paid), b.paid, need_method(b.paid, b.payment_method)))
         return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
+    @app.delete("/api/customers/{cid}/plans/{pid}")
+    def remove_customer_plan(cid: int, pid: int, u=Depends(admin)):
+        """Removes a membership: unused ones are deleted, used ones are emptied and ended so history stays.
+        Recorded in the audit log like every change."""
+        with db.tx() as t:
+            p = t.one("SELECT id FROM customer_plans WHERE id=%s AND customer_id=%s AND spa_id=%s FOR UPDATE", (pid, cid, u["spa"]))
+            if not p:
+                raise HTTPException(404, "Membership not found")
+            if t.one("SELECT 1 FROM plan_redemptions WHERE plan_id=%s LIMIT 1", (pid,)):
+                t.run("""UPDATE customer_plans SET balance=0, expires_on=LEAST(COALESCE(expires_on, CURRENT_DATE), CURRENT_DATE - 1),
+                                notes=concat_ws(' ', notes, '[removed by ' || %s || ' on ' || CURRENT_DATE || ']') WHERE id=%s""",
+                      (u.get("username") or str(u["id"]), pid))
+                return {"removed": "ended"}
+            t.run("DELETE FROM customer_plans WHERE id=%s", (pid,))
+            return {"removed": "deleted"}
+
     @app.put("/api/customers/{cid}/plans/{pid}")
     def edit_customer_plan(cid: int, pid: int, b: CustomerPlanUpdate, u=Depends(admin)):
         """Rename a plan, change or clear its expiry, edit notes. Amounts change only through a top-up."""
