@@ -658,6 +658,14 @@ COMMENT ON COLUMN therapist_deductions.on_date IS 'Date of the deduction; decide
 COMMENT ON COLUMN therapist_deductions.created_by IS 'Login that recorded it.';
 COMMENT ON COLUMN therapist_deductions.created_at IS 'When it was recorded.';
 
+-- ======== 021_expense_source_and_redemption_timing.sql ========
+-- Regular expenses record how they are paid; plan redemptions remember whether they were taken at booking.
+ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash'
+  CHECK (payment_method IN ('cash','upi','card','bank_transfer','other'));
+ALTER TABLE plan_redemptions ADD COLUMN IF NOT EXISTS at_booking BOOLEAN NOT NULL DEFAULT false;
+COMMENT ON COLUMN recurring_expenses.payment_method IS 'How this regular cost is paid each month.';
+COMMENT ON COLUMN plan_redemptions.at_booking IS 'Taken when booking (stays if the visit is reopened); false = taken at completion (returned on reopen).';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -681,5 +689,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('017_payment_methods.sql'),
   ('018_audit_log.sql'),
   ('019_therapist_absences.sql'),
-  ('020_therapist_deductions.sql')
+  ('020_therapist_deductions.sql'),
+  ('021_expense_source_and_redemption_timing.sql')
 ON CONFLICT DO NOTHING;
