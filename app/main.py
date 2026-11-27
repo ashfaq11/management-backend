@@ -222,6 +222,7 @@ class RecurringExpenseIn(BaseModel):
     category: str = Field(default="Other", min_length=1, max_length=60)
     amount: float = Field(gt=0, le=100_000_000)
     day_of_month: int = Field(default=1, ge=1, le=28)
+    payment_method: Literal["cash", "upi", "card", "bank_transfer", "other"] = "cash"
     starts_on: dt.date
     ends_on: Optional[dt.date] = None
     notes: Optional[str] = Field(default=None, max_length=500)
@@ -242,7 +243,7 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
             due = dt.date(y, m, r["day_of_month"])
             if lo <= due < hi and start <= due and (end is None or due <= end):
                 rows.append({"id": r["id"], "on_date": due.isoformat(), "category": r["category"], "name": r["name"],
-                             "amount": r["amount"], "kind": "regular", "payment_method": None})
+                             "amount": r["amount"], "kind": "regular", "payment_method": r.get("payment_method") or "cash"})
             y, m = (y + 1, 1) if m == 12 else (y, m + 1)
     return sorted(rows, key=lambda x: (str(x["on_date"]), x["kind"], x["id"]))
 
@@ -961,7 +962,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             deduction = None
             if b.plan_type:
                 a = t.one("SELECT * FROM appointments WHERE id=%s", (aid,))
-                deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])
+                deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], True)
             return {"id": aid, "plan_deduction": deduction}
 
     @app.put("/api/appointments/{aid}")
@@ -991,7 +992,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(409, SLOT_TAKEN)
         return {"id": aid}
 
-    def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int) -> dict:
+    def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int, at_booking: bool = False) -> dict:
         """Take the visit's hours (or rupees) from the customer's oldest active plan with enough balance."""
         already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
                                  AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
@@ -1009,8 +1010,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not plan:
             raise HTTPException(409, f"No active {'hours' if plan_type == 'hours' else 'rupees'} plan has enough balance for this appointment")
         t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
-        t.insert("INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit) VALUES(%s,%s,%s,%s,%s)",
-                 (plan["id"], a["id"], spa, amount, plan_type))
+        t.insert("INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit,at_booking) VALUES(%s,%s,%s,%s,%s,%s)",
+                 (plan["id"], a["id"], spa, amount, plan_type, at_booking))
         return {"plan_id": plan["id"], "plan_name": plan["name"], "amount": amount, "unit": plan_type,
                 "remaining_balance": round(float(plan["balance"]) - amount, 2)}
 
@@ -1033,7 +1034,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             if not b.plan_type:
                 raise HTTPException(422, "Choose hours or rupees")
             reverse_plan(t, aid, u["spa"])  # changing the amount: put back the old deduction first
-            return {"id": aid, "plan_deduction": deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])}
+            return {"id": aid, "plan_deduction": deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"], a["status"] == "booked")}
 
     @app.patch("/api/appointments/{aid}/status")
     def set_status(aid: int, b: StatusIn, u=Depends(member)):
@@ -1050,6 +1051,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                              (aid, u["spa"]))
                 if b.status in ("cancelled", "no_show"):
                     reverse_plan(t, aid, u["spa"])  # the visit did not happen: hours / rupees go back
+                elif b.status == "booked" and a["status"] == "completed":
+                    # reopening: a deduction made at completion goes back; one made at booking stays
+                    t.run("""UPDATE customer_plans p SET balance=p.balance+r.amount FROM plan_redemptions r
+                             WHERE r.plan_id=p.id AND r.appointment_id=%s AND r.spa_id=%s AND r.reversed_at IS NULL
+                               AND NOT r.at_booking""", (aid, u["spa"]))
+                    t.run("""UPDATE plan_redemptions SET reversed_at=now() WHERE appointment_id=%s AND spa_id=%s
+                             AND reversed_at IS NULL AND NOT at_booking""", (aid, u["spa"]))
                 elif b.status == "completed" and b.plan_type and not held:
                     deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])
                 t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
@@ -1748,19 +1756,19 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.post("/api/expenses/recurring", status_code=201)
     def add_recurring(b: RecurringExpenseIn, u=Depends(admin)):
         check_recurring(b)
-        return {"id": db.insert("""INSERT INTO recurring_expenses(spa_id,name,category,amount,day_of_month,starts_on,ends_on,notes)
-                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+        return {"id": db.insert("""INSERT INTO recurring_expenses(spa_id,name,category,amount,day_of_month,starts_on,ends_on,notes,payment_method)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                                 (u["spa"], b.name.strip(), b.category.strip(), b.amount, b.day_of_month, b.starts_on,
-                                 b.ends_on, (b.notes or "").strip() or None))}
+                                 b.ends_on, (b.notes or "").strip() or None, b.payment_method))}
 
     @app.put("/api/expenses/recurring/{rid}")
     def edit_recurring(rid: int, b: RecurringExpenseIn, u=Depends(admin)):
         """Change a regular cost. To stop it, set ends_on: past months keep counting it."""
         check_recurring(b)
         if not db.run("""UPDATE recurring_expenses SET name=%s,category=%s,amount=%s,day_of_month=%s,starts_on=%s,
-                         ends_on=%s,notes=%s WHERE id=%s AND spa_id=%s""",
+                         ends_on=%s,notes=%s,payment_method=%s WHERE id=%s AND spa_id=%s""",
                       (b.name.strip(), b.category.strip(), b.amount, b.day_of_month, b.starts_on, b.ends_on,
-                       (b.notes or "").strip() or None, rid, u["spa"])):
+                       (b.notes or "").strip() or None, b.payment_method, rid, u["spa"])):
             raise HTTPException(404, "Regular expense not found")
         return {"id": rid}
 
