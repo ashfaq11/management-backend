@@ -340,6 +340,14 @@ def report_pdf(r: dict, business: str) -> bytes:
 METHODS = {"cash": "Cash", "upi": "UPI", "card": "Card", "bank_transfer": "Bank transfer", "other": "Other"}
 
 
+def _dur(m) -> str:
+    """90 -> '1 h 30 min · ' (empty when unknown)."""
+    if not m:
+        return ""
+    h, r = divmod(int(m), 60)
+    return " ".join(x for x in (f"{h} h" if h else "", f"{r} min" if r else "") if x) + " &middot; "
+
+
 def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     """Minimal editorial-style spa receipt inspired by a clean digital invoice layout."""
     import base64
@@ -414,7 +422,7 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     meta = Table([[Paragraph("BILL TO", small), Paragraph("ISSUE DATE", tiny_right)],
                   [customer, Paragraph(f"{received:%d %b %Y}", right)],
                   [Paragraph("APPOINTMENT", small), Paragraph("PAYMENT METHOD", tiny_right)],
-                  [Paragraph(f"{appt:%d %b %Y, %I:%M %p}<br/>{e(p.get('therapist') or '')}", body),
+                  [Paragraph(f"{appt:%d %b %Y, %I:%M %p}<br/>{_dur(p.get('duration_min'))}{e(p.get('therapist') or '')}", body),
                    Paragraph(e(METHODS.get(p.get("method"), p.get("method", ""))), right)]],
                  colWidths=[W * .58, W * .42])
     meta.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),
