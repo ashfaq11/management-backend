@@ -130,6 +130,14 @@ class AbsenceIn(BaseModel):
     note: Optional[str] = Field(default=None, max_length=300)
 
 
+class DeductionIn(BaseModel):
+    therapist_id: int
+    kind: Literal["advance", "leave", "damage", "fine", "loan", "other"]
+    amount: float = Field(gt=0, le=10_000_000)
+    reason: str = Field(min_length=3, max_length=500)
+    on_date: dt.date
+
+
 class ServiceIn(BaseModel):
     name: str = Field(min_length=1)
     price: float = Field(ge=0)
@@ -1784,6 +1792,30 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def health():
         db.one("SELECT 1")  # fails (500) if the database is unreachable, so the load balancer sees it
         return {"ok": True}
+
+    @app.get("/api/deductions")
+    def deductions(month: str = Query(...), therapist_id: Optional[int] = None, u=Depends(admin)):
+        check_month(month)
+        lo, hi = period(month, None, None)
+        sql = """SELECT d.*, t.name AS therapist FROM therapist_deductions d JOIN therapists t ON t.id=d.therapist_id
+                 WHERE d.spa_id=%s AND d.on_date >= %s AND d.on_date < %s"""
+        args: list = [u["spa"], lo, hi]
+        if therapist_id:
+            sql += " AND d.therapist_id=%s"; args.append(therapist_id)
+        return db.all(sql + " ORDER BY d.on_date DESC, d.id DESC", tuple(args))
+
+    @app.post("/api/deductions", status_code=201)
+    def add_deduction(b: DeductionIn, u=Depends(admin)):
+        if not db.one("SELECT 1 FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"])):
+            raise HTTPException(404, "Therapist not found")
+        return {"id": db.insert("""INSERT INTO therapist_deductions(spa_id,therapist_id,kind,amount,reason,on_date,created_by)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                                (u["spa"], b.therapist_id, b.kind, b.amount, b.reason.strip(), b.on_date, u["id"]))}
+
+    @app.delete("/api/deductions/{did}", status_code=204)
+    def delete_deduction(did: int, u=Depends(admin)):
+        if not db.run("DELETE FROM therapist_deductions WHERE id=%s AND spa_id=%s", (did, u["spa"])):
+            raise HTTPException(404, "Deduction not found")
 
     @app.get("/api/absences")
     def absences(month: str = Query(...), u=Depends(admin)):
