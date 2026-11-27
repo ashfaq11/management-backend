@@ -334,6 +334,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     app = FastAPI(title="StudioDesk API", lifespan=lifespan)
     app.state.db = db
     origins = [o.strip() for o in os.environ.get("SPA_CORS_ORIGINS", "http://localhost:4200").split(",") if o.strip()]
+    @app.exception_handler(Exception)
+    async def readable_error(request, exc):  # noqa: ARG001
+        """Unexpected errors: say what went wrong instead of a bare 500, and log the full traceback."""
+        import logging
+        logging.getLogger("spa").exception("unhandled error on %s %s", request.method, request.url.path)
+        from fastapi.responses import JSONResponse
+        msg = str(exc).strip().splitlines()[0][:200] if str(exc).strip() else ""
+        return JSONResponse(status_code=500, content={"detail": f"Server error: {type(exc).__name__}" + (f" - {msg}" if msg else "")
+                                                      + ". Please report this if it keeps happening."})
+
     app.add_middleware(AuditMiddleware, db=db)
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"],
                        allow_headers=["Authorization", "Content-Type", "X-Spa-Id"],
@@ -1787,6 +1797,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         therapist = db.one("SELECT joined_on FROM therapists WHERE id=%s AND spa_id=%s", (b.therapist_id, u["spa"]))
         if not therapist:
             raise HTTPException(404, "Therapist not found")
+        if therapist["joined_on"]:
+            therapist["joined_on"] = dt.date.fromisoformat(str(therapist["joined_on"])[:10])
         if therapist["joined_on"] and b.on_date < therapist["joined_on"]:
             raise HTTPException(422, "Absence cannot be recorded before the therapist's joining date")
         end = b.to_date or b.on_date
