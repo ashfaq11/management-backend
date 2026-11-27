@@ -365,8 +365,8 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     def money(value):
         return f"{value:,.2f}"
 
-    # Show the uploaded logo only; keep the address directly beneath it.
-    brand_cell = []
+    # Keep the logo on the left and spa identity immediately to its right.
+    logo_cell = []
     data_url = p.get("logo_data_url")
     if data_url:
         match = re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})", data_url)
@@ -377,19 +377,21 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
                 from io import BytesIO
                 reader = ImageReader(BytesIO(raw))
                 iw, ih = reader.getSize()
-                scale = min(72 / max(iw, 1), 48 / max(ih, 1))
-                brand_cell.append(Image(BytesIO(raw), width=iw * scale, height=ih * scale))
+                scale = min(64 / max(iw, 1), 48 / max(ih, 1))
+                logo_cell.append(Image(BytesIO(raw), width=iw * scale, height=ih * scale))
             except Exception:
                 pass
-    if not brand_cell:
-        # Retain a readable fallback if the admin has not uploaded a logo.
-        brand_cell.append(Paragraph(e(business), style("brand", fontName="Helvetica-Bold", fontSize=11, leading=13)))
+    spa_details = []
+    spa_details.append(Paragraph(e(business), style("brand", fontName="Helvetica-Bold", fontSize=9, leading=11)))
     if p.get("spa_address"):
-        brand_cell.append(Paragraph(e(p["spa_address"]).replace("\\n", "<br/>"), small))
+        spa_details.append(Paragraph(e(p["spa_address"]).replace("\\n", "<br/>"), small))
+    if not logo_cell:
+        # No uploaded logo: keep the spa identity readable without an empty logo column.
+        logo_cell = [Paragraph("", small)]
 
-    head = Table([[brand_cell, [Paragraph("RECEIPT", title),
-                                Paragraph(f"{number}<br/>{received:%d %b %Y}", tiny_right)]]],
-                 colWidths=[W * .60, W * .40])
+    head = Table([[logo_cell, spa_details, [Paragraph("RECEIPT", title),
+                                            Paragraph(f"{number}<br/>{received:%d %b %Y}", tiny_right)]]],
+                 colWidths=[W * .22, W * .38, W * .40])
     head.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING",(0,0),(-1,-1),0),
                               ("RIGHTPADDING",(0,0),(-1,-1),0), ("BOTTOMPADDING",(0,0),(-1,-1),5)]))
     story = [head, Spacer(1, 15)]
