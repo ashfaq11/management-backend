@@ -1057,3 +1057,16 @@ class TestAudit(Base):
         self.assertEqual((u["username"], u["details"]["password"]), ("admin", "***"))
         tok = self.c.post("/api/auth/login", json={"username": "front", "password": "frontdesk1"}).json()["token"]
         self.assertEqual(self.c.get("/api/audit", headers={"Authorization": f"Bearer {tok}"}).status_code, 403)
+
+
+class TestInsights(Base):
+    def test_every_report_tab_runs(self):
+        import datetime as d
+        self.seed()
+        m = d.date.today().strftime("%Y-%m")
+        for k in ["therapists", "plans", "services", "customers", "payments", "expenses", "lapsed", "busy", "utilisation",
+                  "cancellations", "expiring", "dues"]:
+            r = self.c.get(f"/api/reports/insights/{k}?month={m}", headers=self.h)
+            self.assertEqual(r.status_code, 200, (k, r.text[:300]))
+            self.assertEqual(len(r.json()["columns"]), len(r.json()["rows"][0]) if r.json()["rows"] else len(r.json()["columns"]))
+        self.assertEqual(self.c.get(f"/api/reports/insights/therapists/xlsx?month={m}", headers=self.h).status_code, 200)

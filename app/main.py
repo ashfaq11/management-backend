@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from . import payroll, security
 from .audit import AuditMiddleware
+from . import insights
 from .db import Database, default_dsn
 
 MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -1735,6 +1736,43 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def health():
         db.one("SELECT 1")  # fails (500) if the database is unreachable, so the load balancer sees it
         return {"ok": True}
+
+    def insight(kind, month, date_from, date_to, days, u):
+        if kind not in insights.KINDS:
+            raise HTTPException(404, "Unknown report")
+        lo, hi = period(month, date_from, date_to)
+        r = insights.run(db, kind, u["spa"], lo, hi, days, expenses_in)
+        return {**r, "kind": kind, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat()}
+
+    @app.get("/api/reports/insights/{kind}")
+    def insight_json(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                     date_to: dt.date | None = Query(None, alias="to"), days: int = Query(30, ge=1, le=365), u=Depends(admin)):
+        """One report tab: therapists, plans, services, customers, payments, expenses, lapsed, busy, utilisation,
+        cancellations, expiring, dues. `days` drives lapsed (not seen for N days) and expiring (within N days)."""
+        return insight(kind, month, date_from, date_to, days, u)
+
+    @app.get("/api/reports/insights/{kind}/xlsx")
+    def insight_xlsx(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                     date_to: dt.date | None = Query(None, alias="to"), days: int = Query(30, ge=1, le=365), u=Depends(admin)):
+        r = insight(kind, month, date_from, date_to, days, u)
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook(); ws = wb.active; ws.title = r["title"][:31]
+        ws.append([u["spa_name"]]); ws["A1"].font = Font(bold=True, size=14)
+        ws.append([f"{r['title']}  ·  {r['from']} to {r['to']}  ·  generated {payroll.generated_at():%d %b %Y %H:%M} IST"])
+        ws.append([]); ws.append(r["columns"])
+        for c in ws[4]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="0E6E6A")
+        for row in r["rows"]:
+            ws.append(row)
+        if r.get("total"):
+            ws.append(r["total"])
+        for i, col in enumerate(r["columns"], 1):
+            ws.column_dimensions[chr(64 + i)].width = max(12, len(col) + 4)
+        out = io.BytesIO(); wb.save(out)
+        name = payroll.file_name(u["spa_name"], r["title"], month or f"{r['from']}_to_{r['to']}")
+        return Response(out.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
 
     @app.get("/api/audit")
     def audit(page: int = Query(1, ge=1), size: int = Query(50, ge=1, le=200), user_id: Optional[int] = None,
