@@ -526,6 +526,11 @@ COMMENT ON COLUMN plan_topups.paid_at IS 'When the top-up cost was received; NUL
 ALTER TABLE spas ADD COLUMN logo_data_url TEXT;
 COMMENT ON COLUMN spas.logo_data_url IS 'Optional PNG, JPEG or WebP logo data URL for this spa; independent of other spas.';
 
+-- ======== 015_spa_receipt_address.sql ========
+-- Optional business address printed beneath the spa logo/name on customer receipts.
+ALTER TABLE spas ADD COLUMN address TEXT;
+COMMENT ON COLUMN spas.address IS 'Optional business address displayed on customer receipts.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -543,5 +548,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('011_appointment_payments.sql'),
   ('012_customer_payment_preference.sql'),
   ('013_plan_paid_status.sql'),
-  ('014_spa_logo.sql')
+  ('014_spa_logo.sql'),
+  ('015_spa_receipt_address.sql')
 ON CONFLICT DO NOTHING;
