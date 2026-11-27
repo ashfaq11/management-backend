@@ -720,7 +720,12 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         total = db.one("""SELECT COUNT(*) AS n FROM customers
                           WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))""",
                        (u["spa"], like, like, digits, "%" + digits + "%"))["n"]
-        items = db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))
+        items = db.all("""SELECT c.*, m.hours_left, m.rupees_left FROM customers c LEFT JOIN LATERAL (
+                            SELECT SUM(balance) FILTER (WHERE plan_type='hours') AS hours_left,
+                                   SUM(balance) FILTER (WHERE plan_type='rupees') AS rupees_left
+                            FROM customer_plans p WHERE p.customer_id=c.id AND p.spa_id=c.spa_id AND p.balance > 0
+                              AND (p.expires_on IS NULL OR p.expires_on >= CURRENT_DATE)) m ON true
+                          WHERE c.spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))
                           ORDER BY lower(name), id LIMIT %s OFFSET %s""",
                        (u["spa"], like, like, digits, "%" + digits + "%", page_size, (page - 1) * page_size))
         return {"items": items, "total": total, "page": page, "page_size": page_size}
