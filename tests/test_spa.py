@@ -26,6 +26,32 @@ class Base(unittest.TestCase):
         self.c = TestClient(self.app)
         tok = self.c.post("/api/auth/login", json={"username": "admin", "password": "admin12345"}).json()["token"]
         self.h = {"Authorization": f"Bearer {tok}"}
+        raw = self.c.post
+        n = iter(range(1, 10_000))
+
+        def post(url, json=None, headers=None, **kw):
+            # Custom plans are switched off: tests that sold one as admin now sell a matching package and assign it.
+            m = re.fullmatch(r"/api/customers/(\d+)/plans", url)
+            if m and headers == self.h and json and "plan_type" in json:
+                price = json.get("price_paid")
+                if price is None:
+                    price = json["amount"] if json["plan_type"] == "rupees" else 0
+                k = raw("/api/plan-packages", json={"name": f"{json.get('name', 'Plan')} #{next(n)}", "plan_type": json["plan_type"],
+                                                    "amount": json["amount"], "price": price}, headers=headers).json()["id"]
+                paid = json.get("paid", True)
+                r = raw(f"/api/customers/{m.group(1)}/plans/assign",
+                        json={"package_id": k, "paid": paid, "payment_method": json.get("payment_method", "cash") if paid else None},
+                        headers=headers)
+                if r.status_code == 201 and json.get("expires_on"):
+                    pid = r.json()["id"]
+                    self.c.put(f"/api/customers/{m.group(1)}/plans/{pid}",
+                               json={"name": json.get("name", "Plan"), "expires_on": json["expires_on"]}, headers=headers)
+                return r
+            if url == "/api/spas" and json is not None:
+                json = {"contact_phone": "9990001234", "address": "1 Main Road, Town", "rooms": 3, "therapist_count": 2,
+                        "owner_name": "Owner", "owner_phone": "9990005678", **json}
+            return raw(url, json=json, headers=headers, **kw)
+        self.c.post = post
 
     def tearDown(self):
         self.app.state.db.close()
@@ -701,7 +727,10 @@ class TestCustomerPlans(Base):
         tok = self.c.post("/api/auth/login", json={"username": "lotus", "password": "lotus12345"}).json()["token"]
         h2 = {"Authorization": f"Bearer {tok}"}
         self.assertEqual(self.c.post(f"/api/customers/{c}/plans",
-                         json={"name": "Wrong spa", "plan_type": "hours", "amount": 2, "payment_method": "cash"}, headers=h2).status_code, 404)
+                         json={"name": "Wrong spa", "plan_type": "hours", "amount": 2, "payment_method": "cash"}, headers=h2).status_code, 403)
+        # assigning in another spa: the customer and the package are both invisible there
+        self.assertEqual(self.c.post(f"/api/customers/{c}/plans/assign", json={"package_id": 1, "payment_method": "cash"},
+                                     headers=h2).status_code, 404)
 
 
 class TestPlanUpdates(Base):
@@ -963,9 +992,10 @@ class TestPriorityOneOperations(Base):
 
     def test_onboarding_saves_payment_preference_and_plan_atomically(self):
         t,s,_=self.seed()
+        k=self.post("/api/plan-packages", name="Five-hour package", plan_type="hours", amount=5, price=750).json()["id"]
         response=self.post("/api/onboarding", name="Priya", phone="9991000022",
             preferred_payment_method="upi",
-            plan={"name":"Five-hour package","plan_type":"hours","amount":5,"price_paid":750,"payment_method":"upi"},
+            package={"package_id":k,"payment_method":"upi"},
             first_appointment={"customer_id":0,"therapist_id":t,"service_id":s,"start_at":"2026-11-24T15:00"})
         self.assertEqual(response.status_code,201,response.text)
         body=response.json()

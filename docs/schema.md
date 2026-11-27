@@ -44,6 +44,9 @@ erDiagram
   users ||--o{ therapist_bonuses : has
   spas ||--o{ therapist_bonuses : has
   therapists ||--o{ therapist_bonuses : has
+  users ||--o{ therapist_deductions : has
+  spas ||--o{ therapist_deductions : has
+  therapists ||--o{ therapist_deductions : has
   shifts ||--o{ therapist_shift_assignments : has
   spas ||--o{ therapist_shift_assignments : has
   therapists ||--o{ therapist_shift_assignments : has
@@ -63,6 +66,7 @@ erDiagram
 | [`plan_packages`](#plan_packages) | Plans a spa sells at a fixed price; staff assign them to customers. |
 | [`plan_redemptions`](#plan_redemptions) | Auditable deductions from prepaid customer plans for completed appointments; reversal restores the balance. |
 | [`plan_topups`](#plan_topups) | Amounts added to an existing prepaid plan after it was sold. |
+| [`platform_settings`](#platform_settings) | One row of settings for the whole platform, edited by the superadmin. |
 | [`recurring_expenses`](#recurring_expenses) | A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active. |
 | [`services`](#services) | Price list of treatments. Editing a price affects future bookings only. |
 | [`sessions`](#sessions) | Login sessions as opaque bearer tokens. Only the SHA-256 fingerprint of a token is stored, so a database leak cannot be replayed. |
@@ -70,6 +74,7 @@ erDiagram
 | [`spas`](#spas) | Each spa (business) using the system. Its admins and staff see only its data; a superadmin sees every spa. |
 | [`therapist_absences`](#therapist_absences) | Days a therapist was away; attendance counts scheduled shift days minus these. |
 | [`therapist_bonuses`](#therapist_bonuses) | Extra incentives for a therapist on a date, added to that month's payslip on top of the percentage incentive. |
+| [`therapist_deductions`](#therapist_deductions) | Amounts taken off a therapist's salary in the month of on_date. |
 | [`therapist_shift_assignments`](#therapist_shift_assignments) | Weekly therapist roster; one shift per weekday. Monday=0 through Sunday=6. |
 | [`therapists`](#therapists) | Staff who perform services and are paid on payslips. Never deleted, only set inactive, so past payslips stay reproducible. |
 | [`users`](#users) | Staff logins. Role admin = everything; staff = customers, onboarding, appointments. |
@@ -346,6 +351,7 @@ Auditable deductions from prepaid customer plans for completed appointments; rev
 | `unit` | text | no |  | hours or rupees, matching the plan type. |
 | `created_at` | timestamp with time zone | no | `now()` | When the appointment consumed the plan. |
 | `reversed_at` | timestamp with time zone | yes |  | When a deduction was reversed because the appointment left completed status. |
+| `at_booking` | boolean | no | `false` | Taken when booking (stays if the visit is reopened); false = taken at completion (returned on reopen). |
 
 **Constraints**
 
@@ -393,6 +399,27 @@ Amounts added to an existing prepaid plan after it was sold.
 - `plan_topups_plan_idx`: `CREATE INDEX plan_topups_plan_idx ON plan_topups USING btree (plan_id, created_at)`
 - `plan_topups_spa_time_idx`: `CREATE INDEX plan_topups_spa_time_idx ON plan_topups USING btree (spa_id, created_at)`
 
+## platform_settings
+
+One row of settings for the whole platform, edited by the superadmin.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | smallint | no | `1` | Always 1. |
+| `renewal_name` | text | yes |  | Name shown on the renewal screen. |
+| `renewal_phone` | text | yes |  | Phone / WhatsApp shown on the renewal screen. |
+| `renewal_email` | text | yes |  | Email shown on the renewal screen. |
+| `renewal_message` | text | yes |  | Message shown on the renewal screen. |
+| `trial_days` | integer | no | `30` | Free trial length for self sign-ups. |
+| `allow_signup` | boolean | no | `true` | Whether the public sign-up page is open. |
+| `updated_at` | timestamp with time zone | no | `now()` | Last change. |
+
+**Constraints**
+
+- Check `platform_settings_id_check`: `CHECK ((id = 1))`
+- Check `platform_settings_trial_days_check`: `CHECK (((trial_days >= 1) AND (trial_days <= 365)))`
+- Primary key `platform_settings_pkey`: `PRIMARY KEY (id)`
+
 ## recurring_expenses
 
 A cost charged every month on a fixed day (rent, electricity, internet...), counted in each month it is active.
@@ -409,6 +436,7 @@ A cost charged every month on a fixed day (rent, electricity, internet...), coun
 | `ends_on` | date | yes |  | Last date it applies; NULL = ongoing. |
 | `notes` | text | yes |  | Optional notes. |
 | `created_at` | timestamp with time zone | no | `now()` | When it was added. |
+| `payment_method` | text | no | `'cash'::text` | How this regular cost is paid each month. |
 
 **Constraints**
 
@@ -416,6 +444,7 @@ A cost charged every month on a fixed day (rent, electricity, internet...), coun
 - Check `recurring_expenses_check`: `CHECK (((ends_on IS NULL) OR (ends_on >= starts_on)))`
 - Check `recurring_expenses_day_of_month_check`: `CHECK (((day_of_month >= 1) AND (day_of_month <= 28)))`
 - Check `recurring_expenses_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `recurring_expenses_payment_method_check`: `CHECK ((payment_method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text])))`
 - Foreign key `recurring_expenses_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `recurring_expenses_pkey`: `PRIMARY KEY (id)`
 
@@ -506,10 +535,27 @@ Each spa (business) using the system. Its admins and staff see only its data; a 
 | `created_at` | timestamp with time zone | no | `now()` | When the spa was added. |
 | `logo_data_url` | text | yes |  | Optional PNG, JPEG or WebP logo data URL for this spa; independent of other spas. |
 | `address` | text | yes |  | Optional business address displayed on customer receipts. |
+| `plan_start` | date | yes |  | Subscription start date. |
+| `plan_end` | date | yes |  | Subscription end date; after it the spa is locked to the renewal screen. NULL = no end. |
+| `is_trial` | boolean | no | `false` | true while on the free trial a self sign-up gets. |
+| `contact_phone` | text | yes |  | Owner phone given at sign-up or by the superadmin. |
+| `contact_email` | text | yes |  | Owner email given at sign-up or by the superadmin. |
+| `city` | text | yes |  | City. |
+| `pincode` | text | yes |  | PIN code. |
+| `rooms` | integer | yes |  | Number of treatment rooms (required for new spas). |
+| `therapist_count` | integer | yes |  | Number of therapists declared for the spa (required for new spas). |
+| `license_number` | text | yes |  | Trade / shop licence number (optional). |
+| `gstin` | text | yes |  | GSTIN (optional). |
+| `owner_name` | text | yes |  | Owner name. |
+| `owner_phone` | text | yes |  | Owner phone. |
+| `manager_name` | text | yes |  | Manager name. |
+| `manager_phone` | text | yes |  | Manager phone. |
 
 **Constraints**
 
 - Check `spas_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `spas_rooms_check`: `CHECK ((rooms >= 0))`
+- Check `spas_therapist_count_check`: `CHECK ((therapist_count >= 0))`
 - Primary key `spas_pkey`: `PRIMARY KEY (id)`
 
 **Indexes**
@@ -575,6 +621,37 @@ Extra incentives for a therapist on a date, added to that month's payslip on top
 
 - `therapist_bonuses_spa_idx`: `CREATE INDEX therapist_bonuses_spa_idx ON therapist_bonuses USING btree (spa_id, on_date)`
 - `therapist_bonuses_therapist_idx`: `CREATE INDEX therapist_bonuses_therapist_idx ON therapist_bonuses USING btree (therapist_id, on_date)`
+
+## therapist_deductions
+
+Amounts taken off a therapist's salary in the month of on_date.
+
+| Column | Type | Null | Default | Description |
+|---|---|---|---|---|
+| `id` | bigint | no | identity | Identity. |
+| `spa_id` | bigint | no |  | Owning spa. |
+| `therapist_id` | bigint | no |  | Therapist whose pay is reduced. |
+| `kind` | text | no |  | advance, leave, damage, fine, loan or other. |
+| `amount` | numeric(10,2) | no |  | Amount deducted (INR). |
+| `reason` | text | no |  | Why it was deducted; printed on the payslip. |
+| `on_date` | date | no |  | Date of the deduction; decides the payslip month. |
+| `created_by` | bigint | yes |  | Login that recorded it. |
+| `created_at` | timestamp with time zone | no | `now()` | When it was recorded. |
+
+**Constraints**
+
+- Check `therapist_deductions_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `therapist_deductions_kind_check`: `CHECK ((kind = ANY (ARRAY['advance'::text, 'leave'::text, 'damage'::text, 'fine'::text, 'loan'::text, 'other'::text])))`
+- Check `therapist_deductions_reason_check`: `CHECK ((length(btrim(reason)) >= 3))`
+- Foreign key `therapist_deductions_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
+- Foreign key `therapist_deductions_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
+- Foreign key `therapist_deductions_therapist_id_fkey`: `FOREIGN KEY (therapist_id) REFERENCES therapists(id)`
+- Primary key `therapist_deductions_pkey`: `PRIMARY KEY (id)`
+
+**Indexes**
+
+- `therapist_deductions_spa_date_idx`: `CREATE INDEX therapist_deductions_spa_date_idx ON therapist_deductions USING btree (spa_id, on_date)`
+- `therapist_deductions_therapist_idx`: `CREATE INDEX therapist_deductions_therapist_idx ON therapist_deductions USING btree (therapist_id, on_date)`
 
 ## therapist_shift_assignments
 
@@ -661,6 +738,8 @@ Staff logins. Role admin = everything; staff = customers, onboarding, appointmen
 | `is_active` | boolean | no | `true` | False blocks login and ends all sessions immediately; accounts are deactivated, never deleted. |
 | `created_at` | timestamp with time zone | no | `now()` | When the account was created. |
 | `spa_id` | bigint | yes |  | The spa an admin or staff login belongs to; NULL for a superadmin (users_spa_by_role). |
+| `last_login_at` | timestamp with time zone | yes |  | Last successful sign-in. |
+| `login_count` | integer | no | `0` | Number of successful sign-ins. |
 
 **Constraints**
 
