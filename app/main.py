@@ -131,6 +131,7 @@ class AppointmentIn(BaseModel):
 class StatusIn(BaseModel):
     status: Status
     plan_type: Optional[Literal["hours", "rupees"]] = None
+    deduct_amount: Optional[float] = Field(default=None, gt=0, le=1000)  # override hours (or rupees) taken from the plan
 
 
 class CustomerPlanIn(BaseModel):
@@ -962,6 +963,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                         raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
                     amount = (round(a["duration_min"] / 60.0, 2)
                               if b.plan_type == "hours" else round(float(a["price"]), 2))
+                    if b.deduct_amount is not None:
+                        amount = round(b.deduct_amount, 2)
                     plan = t.one(
                         """SELECT * FROM customer_plans
                            WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
