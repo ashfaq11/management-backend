@@ -1758,15 +1758,18 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         att = db.all("""WITH days AS (SELECT d::date AS day FROM generate_series(%s::date, LEAST(%s::date - 1, CURRENT_DATE), '1 day') d),
                              sched AS (SELECT DISTINCT x.therapist_id, days.day FROM days
                                        JOIN therapist_shift_assignments x ON x.day_of_week = EXTRACT(ISODOW FROM days.day)::int - 1
-                                       JOIN shifts s ON s.id=x.shift_id AND s.is_active WHERE x.spa_id=%s)
+                                       JOIN shifts s ON s.id=x.shift_id AND s.is_active
+                                       JOIN therapists tt ON tt.id=x.therapist_id
+                                       WHERE x.spa_id=%s AND (tt.joined_on IS NULL OR days.day >= tt.joined_on))
                         SELECT t.id AS therapist_id, t.name AS therapist,
                                (SELECT COUNT(*) FROM sched WHERE sched.therapist_id=t.id
                                   AND (t.joined_on IS NULL OR sched.day >= t.joined_on)) AS scheduled,
                                COALESCE((SELECT SUM(CASE WHEN a.half_day THEN 0.5 ELSE 1 END) FROM therapist_absences a
                                          WHERE a.therapist_id=t.id AND a.on_date >= %s AND a.on_date < %s AND a.on_date <= CURRENT_DATE
                                            AND (t.joined_on IS NULL OR a.on_date >= t.joined_on)),0) AS away
-                        FROM therapists t WHERE t.spa_id=%s AND t.is_active ORDER BY lower(t.name)""",
-                     (lo, hi, u["spa"], lo, hi, u["spa"]))
+                        FROM therapists t WHERE t.spa_id=%s AND t.is_active AND (t.joined_on IS NULL OR t.joined_on < %s)
+                        ORDER BY lower(t.name)""",
+                     (lo, hi, u["spa"], lo, hi, u["spa"], hi))
         for r in att:
             r["away"] = float(r["away"]); r["present"] = max(float(r["scheduled"]) - r["away"], 0)
         return {"month": month, "absences": rows, "attendance": att}

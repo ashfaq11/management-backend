@@ -59,14 +59,15 @@ REPORTS = {
                        FROM days JOIN therapist_shift_assignments x ON x.day_of_week = EXTRACT(ISODOW FROM days.day)::int - 1
                        JOIN therapists jt ON jt.id=x.therapist_id AND jt.spa_id=x.spa_id
                          AND (jt.joined_on IS NULL OR days.day >= jt.joined_on)
-                       JOIN shifts s ON s.id=x.shift_id AND s.is_active WHERE x.spa_id=%(spa)s GROUP BY 1),
+                       JOIN shifts s ON s.id=x.shift_id AND s.is_active JOIN therapists tt ON tt.id=x.therapist_id
+                       WHERE x.spa_id=%(spa)s AND (tt.joined_on IS NULL OR days.day >= tt.joined_on) GROUP BY 1),
                 bk AS (SELECT a.therapist_id, SUM(a.duration_min)/60.0 h FROM appointments a
                        WHERE {C} AND a.status IN ('booked','completed') GROUP BY 1)
            SELECT t.name, ROUND(COALESCE(sh.h,0),1), ROUND(COALESCE(bk.h,0),1),
                   CASE WHEN COALESCE(sh.h,0) > 0 THEN ROUND(100*COALESCE(bk.h,0)/sh.h) END,
                   ROUND(GREATEST(COALESCE(sh.h,0)-COALESCE(bk.h,0),0),1)
            FROM therapists t LEFT JOIN sh ON sh.therapist_id=t.id LEFT JOIN bk ON bk.therapist_id=t.id
-           WHERE t.spa_id=%(spa)s AND t.is_active ORDER BY 4 DESC NULLS LAST"""),
+           WHERE t.spa_id=%(spa)s AND t.is_active AND (t.joined_on IS NULL OR t.joined_on < %(hi)s) ORDER BY 4 DESC NULLS LAST"""),
     "cancellations": ("Cancellations and no-shows", ["Customer", "Phone", "Cancelled", "No-shows", "Booked total", "Rate %"],
         f"""SELECT c.name, c.phone, COUNT(*) FILTER (WHERE a.status='cancelled'), COUNT(*) FILTER (WHERE a.status='no_show'), COUNT(*),
                    ROUND(100.0*COUNT(*) FILTER (WHERE a.status IN ('cancelled','no_show'))/COUNT(*))
