@@ -725,6 +725,13 @@ COMMENT ON COLUMN spas.owner_phone IS 'Owner phone.';
 COMMENT ON COLUMN spas.manager_name IS 'Manager name.';
 COMMENT ON COLUMN spas.manager_phone IS 'Manager phone.';
 
+-- ======== 024_last_login.sql ========
+-- When each login last signed in, and how often.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INT NOT NULL DEFAULT 0;
+COMMENT ON COLUMN users.last_login_at IS 'Last successful sign-in.';
+COMMENT ON COLUMN users.login_count IS 'Number of successful sign-ins.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -751,5 +758,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('020_therapist_deductions.sql'),
   ('021_expense_source_and_redemption_timing.sql'),
   ('022_spa_subscription.sql'),
-  ('023_spa_profile.sql')
+  ('023_spa_profile.sql'),
+  ('024_last_login.sql')
 ON CONFLICT DO NOTHING;

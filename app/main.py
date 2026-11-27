@@ -290,7 +290,7 @@ PROFILE = ("contact_phone", "contact_email", "address", "city", "pincode", "room
 
 class SpaProfile(BaseModel):
     """Audit details for a spa. Phone, address, rooms, therapist count and owner are required."""
-    contact_phone: str = Field(min_length=7, max_length=20, pattern=r"^[0-9+ -]+$")
+    contact_phone: str = Field(min_length=10, max_length=20, pattern=r"^[0-9+ -]+$")
     contact_email: Optional[str] = Field(default=None, max_length=120)
     address: str = Field(min_length=5, max_length=500)
     city: Optional[str] = Field(default=None, max_length=80)
@@ -300,7 +300,7 @@ class SpaProfile(BaseModel):
     license_number: Optional[str] = Field(default=None, max_length=60)
     gstin: Optional[str] = Field(default=None, max_length=20)
     owner_name: str = Field(min_length=2, max_length=120)
-    owner_phone: str = Field(min_length=7, max_length=20, pattern=r"^[0-9+ -]+$")
+    owner_phone: str = Field(min_length=10, max_length=20, pattern=r"^[0-9+ -]+$")
     manager_name: Optional[str] = Field(default=None, max_length=120)
     manager_phone: Optional[str] = Field(default=None, max_length=20)
 
@@ -458,6 +458,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not u or not security.verify_password(b.password, u["password_hash"]):
             raise HTTPException(401, "Invalid username or password")
         tok = security.new_token()
+        db.run("UPDATE users SET last_login_at=now(), login_count=login_count+1 WHERE id=%s", (u["id"],))
         db.run("DELETE FROM sessions WHERE expires_at<now()")  # housekeeping
         db.run("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(%s,%s,now()+make_interval(hours=>%s))",
                (security.fingerprint(tok), u["id"], SESSION_HOURS))
@@ -621,7 +622,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def users(me=Depends(current_user)):
         if me["role"] == "staff":
             raise HTTPException(403, "Admin only")
-        sql = """SELECT u.id,u.username,u.role,u.is_active,u.spa_id,p.name AS spa FROM users u
+        sql = """SELECT u.id,u.username,u.role,u.is_active,u.spa_id,p.name AS spa,u.last_login_at,u.login_count FROM users u
                  LEFT JOIN spas p ON p.id=u.spa_id"""
         if me["role"] == "superadmin":
             return db.all(sql + " ORDER BY p.name NULLS FIRST, lower(u.username)")
