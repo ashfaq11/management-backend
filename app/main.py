@@ -145,6 +145,8 @@ class AppointmentIn(BaseModel):
     notes: Optional[str] = None
     price: Optional[float] = Field(default=None, ge=0)  # override list price
     duration_min: Optional[int] = Field(default=None, gt=0, le=720)  # override the service's length
+    plan_type: Optional[Literal["hours", "rupees"]] = None  # pay from a plan: deducted at booking
+    deduct_amount: Optional[float] = Field(default=None, gt=0, le=1000)
 
 
 class StatusIn(BaseModel):
@@ -947,7 +949,12 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.post("/api/appointments", status_code=201)
     def add_appointment(b: AppointmentIn, u=Depends(member)):
         with db.tx() as t:
-            return {"id": insert_appointment(t, b, u["spa"])}
+            aid = insert_appointment(t, b, u["spa"])
+            deduction = None
+            if b.plan_type:
+                a = t.one("SELECT * FROM appointments WHERE id=%s", (aid,))
+                deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])
+            return {"id": aid, "plan_deduction": deduction}
 
     @app.put("/api/appointments/{aid}")
     def edit_appointment(aid: int, b: AppointmentIn, u=Depends(member)):
@@ -976,6 +983,50 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(409, SLOT_TAKEN)
         return {"id": aid}
 
+    def deduct_plan(t, a: dict, plan_type: str, deduct_amount, spa: int) -> dict:
+        """Take the visit's hours (or rupees) from the customer's oldest active plan with enough balance."""
+        already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
+                                 AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                                                          WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)
+                                 LIMIT 1""", (a["id"], spa))
+        if already_paid:
+            raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
+        amount = round(a["duration_min"] / 60.0, 2) if plan_type == "hours" else round(float(a["price"]), 2)
+        if deduct_amount is not None:
+            amount = round(deduct_amount, 2)
+        plan = t.one("""SELECT * FROM customer_plans
+                        WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
+                          AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
+                        ORDER BY created_at, id LIMIT 1 FOR UPDATE""", (a["customer_id"], spa, plan_type, amount))
+        if not plan:
+            raise HTTPException(409, f"No active {'hours' if plan_type == 'hours' else 'rupees'} plan has enough balance for this appointment")
+        t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
+        t.insert("INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit) VALUES(%s,%s,%s,%s,%s)",
+                 (plan["id"], a["id"], spa, amount, plan_type))
+        return {"plan_id": plan["id"], "plan_name": plan["name"], "amount": amount, "unit": plan_type,
+                "remaining_balance": round(float(plan["balance"]) - amount, 2)}
+
+    def reverse_plan(t, aid: int, spa: int) -> None:
+        r = t.one("""SELECT * FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL FOR UPDATE""",
+                  (aid, spa))
+        if r:
+            t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s", (r["amount"], r["plan_id"]))
+            t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (r["id"],))
+
+    @app.post("/api/appointments/{aid}/plan")
+    def use_plan(aid: int, b: StatusIn, u=Depends(member)):
+        """Pay a booked appointment from a plan now (hours / rupees come off at booking; cancel or no-show returns them)."""
+        with db.tx() as t:
+            a = t.one("SELECT * FROM appointments WHERE id=%s AND spa_id=%s FOR UPDATE", (aid, u["spa"]))
+            if not a:
+                raise HTTPException(404, "Appointment not found")
+            if a["status"] in ("cancelled", "no_show"):
+                raise HTTPException(409, "This appointment was cancelled")
+            if not b.plan_type:
+                raise HTTPException(422, "Choose hours or rupees")
+            reverse_plan(t, aid, u["spa"])  # changing the amount: put back the old deduction first
+            return {"id": aid, "plan_deduction": deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])}
+
     @app.patch("/api/appointments/{aid}/status")
     def set_status(aid: int, b: StatusIn, u=Depends(member)):
         try:
@@ -986,45 +1037,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 if a["status"] == b.status:
                     return {"id": aid, "status": b.status, "plan_deduction": None}
 
-                deduction = plan = None
-                if b.status == "completed" and b.plan_type:
-                    already_paid = t.one("""SELECT 1 FROM payments p WHERE p.appointment_id=%s AND p.spa_id=%s
-                                             AND p.amount > COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
-                                                                      WHERE r.payment_id=p.id AND r.spa_id=p.spa_id),0)
-                                             LIMIT 1""", (aid, u["spa"]))
-                    if already_paid:
-                        raise HTTPException(409, "Payment has already been collected; refund it before using a prepaid plan")
-                    amount = (round(a["duration_min"] / 60.0, 2)
-                              if b.plan_type == "hours" else round(float(a["price"]), 2))
-                    if b.deduct_amount is not None:
-                        amount = round(b.deduct_amount, 2)
-                    plan = t.one(
-                        """SELECT * FROM customer_plans
-                           WHERE customer_id=%s AND spa_id=%s AND plan_type=%s AND balance >= %s
-                             AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
-                           ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
-                        (a["customer_id"], u["spa"], b.plan_type, amount))
-                    if not plan:
-                        unit_label = "hours" if b.plan_type == "hours" else "rupees"
-                        raise HTTPException(409, f"No active {unit_label} plan has enough balance for this appointment")
-                    t.run("UPDATE customer_plans SET balance=balance-%s WHERE id=%s", (amount, plan["id"]))
-                    t.insert(
-                        """INSERT INTO plan_redemptions(plan_id,appointment_id,spa_id,amount,unit)
-                           VALUES(%s,%s,%s,%s,%s)""",
-                        (plan["id"], aid, u["spa"], amount, b.plan_type))
-                    remaining = round(float(plan["balance"]) - amount, 2)
-                    deduction = {"plan_id": plan["id"], "plan_name": plan["name"],
-                                 "amount": amount, "unit": b.plan_type, "remaining_balance": remaining}
-                elif a["status"] == "completed":
-                    redemption = t.one(
-                        """SELECT r.*, p.name FROM plan_redemptions r
-                           JOIN customer_plans p ON p.id=r.plan_id
-                           WHERE r.appointment_id=%s AND r.spa_id=%s AND r.reversed_at IS NULL
-                           FOR UPDATE OF r, p""", (aid, u["spa"]))
-                    if redemption:
-                        t.run("UPDATE customer_plans SET balance=balance+%s WHERE id=%s",
-                              (redemption["amount"], redemption["plan_id"]))
-                        t.run("UPDATE plan_redemptions SET reversed_at=now() WHERE id=%s", (redemption["id"],))
+                deduction = None
+                held = t.one("SELECT 1 FROM plan_redemptions WHERE appointment_id=%s AND spa_id=%s AND reversed_at IS NULL",
+                             (aid, u["spa"]))
+                if b.status in ("cancelled", "no_show"):
+                    reverse_plan(t, aid, u["spa"])  # the visit did not happen: hours / rupees go back
+                elif b.status == "completed" and b.plan_type and not held:
+                    deduction = deduct_plan(t, a, b.plan_type, b.deduct_amount, u["spa"])
                 t.run("UPDATE appointments SET status=%s, updated_at=now() WHERE id=%s", (b.status, aid))
         except pgerr.ExclusionViolation:
             raise HTTPException(409, SLOT_TAKEN)
