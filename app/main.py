@@ -284,6 +284,32 @@ class SpaIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
 
+PROFILE = ("contact_phone", "contact_email", "address", "city", "pincode", "rooms", "therapist_count", "license_number",
+           "gstin", "owner_name", "owner_phone", "manager_name", "manager_phone")
+
+
+class SpaProfile(BaseModel):
+    """Audit details for a spa. Phone, address, rooms, therapist count and owner are required."""
+    contact_phone: str = Field(min_length=7, max_length=20, pattern=r"^[0-9+ -]+$")
+    contact_email: Optional[str] = Field(default=None, max_length=120)
+    address: str = Field(min_length=5, max_length=500)
+    city: Optional[str] = Field(default=None, max_length=80)
+    pincode: Optional[str] = Field(default=None, max_length=10)
+    rooms: int = Field(ge=1, le=500)
+    therapist_count: int = Field(ge=0, le=1000)
+    license_number: Optional[str] = Field(default=None, max_length=60)
+    gstin: Optional[str] = Field(default=None, max_length=20)
+    owner_name: str = Field(min_length=2, max_length=120)
+    owner_phone: str = Field(min_length=7, max_length=20, pattern=r"^[0-9+ -]+$")
+    manager_name: Optional[str] = Field(default=None, max_length=120)
+    manager_phone: Optional[str] = Field(default=None, max_length=20)
+
+
+def profile_values(b) -> tuple:
+    return tuple(((getattr(b, k) or "").strip() or None) if isinstance(getattr(b, k), str) or getattr(b, k) is None
+                 else getattr(b, k) for k in PROFILE)
+
+
 class SpaPlan(BaseModel):
     plan_start: Optional[dt.date] = None
     plan_end: Optional[dt.date] = None
@@ -292,7 +318,7 @@ class SpaPlan(BaseModel):
     contact_email: Optional[str] = Field(default=None, max_length=120)
 
 
-class SpaCreate(SpaIn, SpaPlan):
+class SpaCreate(SpaIn, SpaPlan, SpaProfile):
     """A new spa and its first admin, created together."""
     admin_username: str = Field(min_length=3)
     admin_password: str = Field(min_length=8)
@@ -302,12 +328,10 @@ class SpaUpdate(SpaIn, SpaPlan):
     is_active: bool = True
 
 
-class SignupIn(BaseModel):
+class SignupIn(SpaProfile):
     spa_name: str = Field(min_length=2, max_length=120)
     username: str = Field(min_length=3, max_length=60)
     password: str = Field(min_length=8, max_length=200)
-    phone: Optional[str] = Field(default=None, max_length=30)
-    email: Optional[str] = Field(default=None, max_length=120)
 
 
 class PlatformIn(BaseModel):
@@ -461,9 +485,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             raise HTTPException(403, "Sign-up is closed. Please contact us.")
         with db.tx() as t:
             try:
-                sid = t.insert("""INSERT INTO spas(name, plan_start, plan_end, is_trial, contact_phone, contact_email)
-                                  VALUES(%s, CURRENT_DATE, CURRENT_DATE + %s, true, %s, %s)""",
-                               (b.spa_name.strip(), cfg["trial_days"], (b.phone or "").strip() or None, (b.email or "").strip() or None))
+                sid = t.insert(f"""INSERT INTO spas(name, plan_start, plan_end, is_trial, {",".join(PROFILE)})
+                                  VALUES(%s, CURRENT_DATE, CURRENT_DATE + %s, true, {",".join(["%s"] * len(PROFILE))})""",
+                               (b.spa_name.strip(), cfg["trial_days"], *profile_values(b)))
             except pgerr.UniqueViolation:
                 raise HTTPException(409, "A spa with this name already exists")
             try:
@@ -497,7 +521,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def spas(u=Depends(current_user)):
         """Superadmin: every spa with its people and this month's revenue. Others: just their own spa."""
         sql = """SELECT p.id, p.name, p.is_active, p.created_at, p.plan_start, p.plan_end, p.is_trial, p.contact_phone,
-                        p.contact_email, (p.plan_end IS NOT NULL AND p.plan_end < CURRENT_DATE) AS expired,
+                        p.contact_email, p.address, p.city, p.pincode, p.rooms, p.therapist_count, p.license_number, p.gstin,
+                        p.owner_name, p.owner_phone, p.manager_name, p.manager_phone,
+                        (p.plan_end IS NOT NULL AND p.plan_end < CURRENT_DATE) AS expired,
                         (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='admin' AND x.is_active) AS admins,
                         (SELECT COUNT(*) FROM users x WHERE x.spa_id=p.id AND x.role='staff' AND x.is_active) AS staff,
                         (SELECT COUNT(*) FROM customers c WHERE c.spa_id=p.id) AS customers,
@@ -512,9 +538,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def add_spa(b: SpaCreate, _=Depends(superadmin)):
         with db.tx() as t:
             try:
-                sid = t.insert("""INSERT INTO spas(name, plan_start, plan_end, is_trial, contact_phone, contact_email)
-                                  VALUES(%s,%s,%s,%s,%s,%s)""",
-                               (b.name.strip(), b.plan_start or dt.date.today(), b.plan_end, b.is_trial, b.contact_phone, b.contact_email))
+                sid = t.insert(f"""INSERT INTO spas(name, plan_start, plan_end, is_trial, {",".join(PROFILE)})
+                                  VALUES(%s,%s,%s,%s,{",".join(["%s"] * len(PROFILE))})""",
+                               (b.name.strip(), b.plan_start or dt.date.today(), b.plan_end, b.is_trial, *profile_values(b)))
             except pgerr.UniqueViolation:
                 raise HTTPException(409, "A spa with this name already exists")
             try:
@@ -530,9 +556,8 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             try:
                 if b.plan_start and b.plan_end and b.plan_end < b.plan_start:
                     raise HTTPException(422, "End date must be after the start date")
-                if not t.run("""UPDATE spas SET name=%s, is_active=%s, plan_start=%s, plan_end=%s, is_trial=%s,
-                                contact_phone=%s, contact_email=%s WHERE id=%s""",
-                             (b.name.strip(), b.is_active, b.plan_start, b.plan_end, b.is_trial, b.contact_phone, b.contact_email, sid)):
+                if not t.run("""UPDATE spas SET name=%s, is_active=%s, plan_start=%s, plan_end=%s, is_trial=%s WHERE id=%s""",
+                             (b.name.strip(), b.is_active, b.plan_start, b.plan_end, b.is_trial, sid)):
                     raise HTTPException(404, "Spa not found")
             except pgerr.UniqueViolation:
                 raise HTTPException(409, "A spa with this name already exists")
@@ -555,6 +580,20 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if not db.run("UPDATE spas SET logo_data_url=%s WHERE id=%s", (value, u["spa"])):
             raise HTTPException(404, "Spa not found")
         return {"logo_data_url": value}
+
+    @app.get("/api/spa/profile")
+    def get_spa_profile(u=Depends(member)):
+        row = db.one(f"SELECT name, {','.join(PROFILE)} FROM spas WHERE id=%s", (u["spa"],))
+        if not row:
+            raise HTTPException(404, "Spa not found")
+        row["complete"] = all(row.get(k) not in (None, "") for k in ("contact_phone", "address", "rooms", "therapist_count", "owner_name", "owner_phone"))
+        return row
+
+    @app.put("/api/spa/profile")
+    def set_spa_profile(b: SpaProfile, u=Depends(admin)):
+        """Admin (or superadmin inside a spa): the spa's audit details."""
+        db.run(f"UPDATE spas SET {', '.join(k + '=%s' for k in PROFILE)} WHERE id=%s", (*profile_values(b), u["spa"]))
+        return get_spa_profile(u)
 
     @app.get("/api/spa/receipt-details")
     def get_spa_receipt_details(u=Depends(member)):
@@ -1962,6 +2001,14 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         """One report tab: therapists, plans, services, customers, payments, expenses, lapsed, busy, utilisation,
         cancellations, expiring, dues. `days` drives lapsed (not seen for N days) and expiring (within N days)."""
         return insight(kind, month, date_from, date_to, days, u)
+
+    @app.get("/api/reports/insights/{kind}/pdf")
+    def insight_pdf(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                    date_to: dt.date | None = Query(None, alias="to"), days: int = Query(30, ge=1, le=365), u=Depends(admin)):
+        r = insight(kind, month, date_from, date_to, days, u)
+        pdf = payroll.table_pdf(u["spa_name"], r["title"], f"{r['from']} to {r['to']}", r["columns"], r["rows"], r.get("total"))
+        name = payroll.file_name(u["spa_name"], r["title"], month or f"{r['from']}_to_{r['to']}")
+        return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
 
     @app.get("/api/reports/insights/{kind}/xlsx")
     def insight_xlsx(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),

@@ -599,3 +599,18 @@ def report_xlsx(r: dict, business: str) -> bytes:
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+def table_pdf(business: str, title: str, period: str, columns: list, rows: list, total=None) -> bytes:
+    """Any report table as a branded PDF (landscape when it is wide)."""
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.platypus import Paragraph
+    wide = len(columns) > 6
+    d = _Pdf(business, title, period)
+    width = 770 if wide else 523
+    cell = lambda v: Paragraph(str(f"{v:,.2f}" if isinstance(v, float) else ("-" if v is None else v)), d.st["p"])  # noqa: E731
+    body = [columns] + [[cell(v) for v in r] for r in rows] + ([[cell(v) for v in total]] if total else [])
+    if len(body) == 1:
+        body.append(["-"] * len(columns))
+    d.table(body, [width / len(columns)] * len(columns), numeric=1, total=bool(total))
+    return d.build(landscape(A4) if wide else None)

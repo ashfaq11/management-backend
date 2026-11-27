@@ -702,6 +702,29 @@ COMMENT ON COLUMN platform_settings.trial_days IS 'Free trial length for self si
 COMMENT ON COLUMN platform_settings.allow_signup IS 'Whether the public sign-up page is open.';
 COMMENT ON COLUMN platform_settings.updated_at IS 'Last change.';
 
+-- ======== 023_spa_profile.sql ========
+-- Spa profile for audits: contact, address, capacity, licence, owner and manager.
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS city TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS pincode TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS rooms INT CHECK (rooms >= 0);
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS therapist_count INT CHECK (therapist_count >= 0);
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS license_number TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS gstin TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS owner_name TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS owner_phone TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS manager_name TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS manager_phone TEXT;
+COMMENT ON COLUMN spas.city IS 'City.';
+COMMENT ON COLUMN spas.pincode IS 'PIN code.';
+COMMENT ON COLUMN spas.rooms IS 'Number of treatment rooms (required for new spas).';
+COMMENT ON COLUMN spas.therapist_count IS 'Number of therapists declared for the spa (required for new spas).';
+COMMENT ON COLUMN spas.license_number IS 'Trade / shop licence number (optional).';
+COMMENT ON COLUMN spas.gstin IS 'GSTIN (optional).';
+COMMENT ON COLUMN spas.owner_name IS 'Owner name.';
+COMMENT ON COLUMN spas.owner_phone IS 'Owner phone.';
+COMMENT ON COLUMN spas.manager_name IS 'Manager name.';
+COMMENT ON COLUMN spas.manager_phone IS 'Manager phone.';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -727,5 +750,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('019_therapist_absences.sql'),
   ('020_therapist_deductions.sql'),
   ('021_expense_source_and_redemption_timing.sql'),
-  ('022_spa_subscription.sql')
+  ('022_spa_subscription.sql'),
+  ('023_spa_profile.sql')
 ON CONFLICT DO NOTHING;

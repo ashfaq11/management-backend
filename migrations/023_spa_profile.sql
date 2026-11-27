@@ -1,0 +1,21 @@
+-- Spa profile for audits: contact, address, capacity, licence, owner and manager.
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS city TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS pincode TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS rooms INT CHECK (rooms >= 0);
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS therapist_count INT CHECK (therapist_count >= 0);
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS license_number TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS gstin TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS owner_name TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS owner_phone TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS manager_name TEXT;
+ALTER TABLE spas ADD COLUMN IF NOT EXISTS manager_phone TEXT;
+COMMENT ON COLUMN spas.city IS 'City.';
+COMMENT ON COLUMN spas.pincode IS 'PIN code.';
+COMMENT ON COLUMN spas.rooms IS 'Number of treatment rooms (required for new spas).';
+COMMENT ON COLUMN spas.therapist_count IS 'Number of therapists declared for the spa (required for new spas).';
+COMMENT ON COLUMN spas.license_number IS 'Trade / shop licence number (optional).';
+COMMENT ON COLUMN spas.gstin IS 'GSTIN (optional).';
+COMMENT ON COLUMN spas.owner_name IS 'Owner name.';
+COMMENT ON COLUMN spas.owner_phone IS 'Owner phone.';
+COMMENT ON COLUMN spas.manager_name IS 'Manager name.';
+COMMENT ON COLUMN spas.manager_phone IS 'Manager phone.';
