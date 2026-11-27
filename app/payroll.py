@@ -274,6 +274,13 @@ def report_pdf(r: dict, business: str) -> bytes:
         d.text("Money collected = service revenue - services paid from prepaid plans + plan sales. "
                "Net profit = money collected - payroll - expenses.", muted=True)
 
+    if r.get("by_method"):
+        d.heading("By payment method")
+        rows = [["Method", "Services (Rs)", "Plans (Rs)", "Expenses (Rs)", "Net (Rs)"]]
+        rows += [[METHODS.get(m["method"], m["method"]), amt(m["services"]), amt(m["plans"]), amt(m["expenses"]), amt(m["net"])]
+                 for m in r["by_method"]]
+        d.table(rows, [143, 95, 95, 95, 95], numeric=4)
+
     d.heading("By service")
     rows = [["Service", "Done", "Minutes", "Revenue (Rs)"]]
     rows += [[x["service"], x["count"], x.get("minutes", ""), amt(x["revenue"])] for x in r["by_service"]]
@@ -299,20 +306,21 @@ def report_pdf(r: dict, business: str) -> bytes:
 
     if r.get("expense_lines"):
         d.heading("Expenses")
-        rows = [["Date", "Category", "Item", "Type", "Amount (Rs)"]]
-        rows += [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(), amt(x["amount"])]
-                 for x in r["expense_lines"]]
-        rows.append(["Total", "", "", "", amt(r["expenses"])])
-        d.table(rows, [80, 100, 200, 60, 83], total=True)
+        rows = [["Date", "Category", "Item", "Type", "Paid via", "Amount (Rs)"]]
+        rows += [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(),
+                  METHODS.get(x.get("payment_method"), "-"), amt(x["amount"])] for x in r["expense_lines"]]
+        rows.append(["Total", "", "", "", "", amt(r["expenses"])])
+        d.table(rows, [75, 90, 170, 55, 60, 73], total=True)
 
     if r.get("plan_lines"):
         d.heading("Prepaid plan sales")
-        rows = [["Date", "Customer", "Plan", "Kind", "Amount", "Paid (Rs)"]]
+        rows = [["Date", "Customer", "Plan", "Kind", "Amount", "Via", "Paid (Rs)"]]
         rows += [[str(x["at"])[:16], x["customer"], x["plan"], "Top-up" if x["kind"] == "topup" else "New",
-                  f"{float(x['amount']):g} {'hrs' if x['plan_type'] == 'hours' else 'Rs'}", amt(x["price_paid"])]
+                  f"{float(x['amount']):g} {'hrs' if x['plan_type'] == 'hours' else 'Rs'}",
+                  METHODS.get(x.get("payment_method"), x.get("payment_method") or "-"), amt(x["price_paid"])]
                  for x in r["plan_lines"]]
-        rows.append(["Total", "", "", "", "", amt(r["plan_sales"])])
-        d.table(rows, [88, 120, 130, 55, 55, 75], numeric=2, total=True)
+        rows.append(["Total", "", "", "", "", "", amt(r["plan_sales"])])
+        d.table(rows, [80, 105, 110, 45, 50, 58, 75], numeric=2, total=True)
     return d.build()
 
 
@@ -541,16 +549,20 @@ def report_xlsx(r: dict, business: str) -> bytes:
 
     if r.get("plan_lines") is not None:
         pl = [[str(x["at"])[:16], x["customer"], x["plan"], "Top-up" if x["kind"] == "topup" else "New",
-               float(x["amount"]), "hours" if x["plan_type"] == "hours" else "rupees", float(x["price_paid"])]
-              for x in r["plan_lines"]]
-        sheet(wb.create_sheet(), "Plan sales", ["Date", "Customer", "Plan", "Kind", "Amount", "Unit", "Paid"], pl,
-              money_cols=(7,), total=["Total", "", "", "", "", "", float(r["plan_sales"])])
+               float(x["amount"]), "hours" if x["plan_type"] == "hours" else "rupees",
+               METHODS.get(x.get("payment_method"), "-"), float(x["price_paid"])] for x in r["plan_lines"]]
+        sheet(wb.create_sheet(), "Plan sales", ["Date", "Customer", "Plan", "Kind", "Amount", "Unit", "Paid via", "Paid"], pl,
+              money_cols=(8,), total=["Total", "", "", "", "", "", "", float(r["plan_sales"])])
 
     if r.get("expense_lines"):
-        ex = [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(), float(x["amount"])]
-              for x in r["expense_lines"]]
-        sheet(wb.create_sheet(), "Expenses", ["Date", "Category", "Item", "Type", "Amount"], ex, money_cols=(5,),
-              total=["Total", "", "", "", float(r["expenses"])])
+        ex = [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(),
+               METHODS.get(x.get("payment_method"), "-"), float(x["amount"])] for x in r["expense_lines"]]
+        sheet(wb.create_sheet(), "Expenses", ["Date", "Category", "Item", "Type", "Paid via", "Amount"], ex, money_cols=(6,),
+              total=["Total", "", "", "", "", float(r["expenses"])])
+    if r.get("by_method"):
+        bm = [[METHODS.get(m["method"], m["method"]), m["services"], m["plans"], m["expenses"], m["net"]] for m in r["by_method"]]
+        sheet(wb.create_sheet(), "By payment method", ["Method", "Services", "Plans", "Expenses", "Net"], bm,
+              money_cols=(2, 3, 4, 5))
 
     out = io.BytesIO()
     wb.save(out)

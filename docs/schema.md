@@ -126,11 +126,13 @@ Prepaid package owned by one customer in one spa. A balance is measured in hours
 | `price_paid` | numeric(12,2) | yes |  | Money received when the plan was sold (INR); counted as revenue on the sale date. |
 | `paid_at` | timestamp with time zone | yes |  | When the plan cost was received; NULL = payment pending. Plan sales count on this date. |
 | `package_id` | bigint | yes |  | Package the plan was assigned from; NULL = custom plan made by an admin. |
+| `payment_method` | text | yes |  | How the plan cost was paid (cash, upi, card, bank_transfer, other); NULL while pending. |
 
 **Constraints**
 
 - Check `customer_plans_check`: `CHECK (((balance >= (0)::numeric) AND (balance <= purchased_amount)))`
 - Check `customer_plans_name_check`: `CHECK ((length(btrim(name)) > 0))`
+- Check `customer_plans_payment_method_check`: `CHECK ((payment_method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text])))`
 - Check `customer_plans_plan_type_check`: `CHECK ((plan_type = ANY (ARRAY['hours'::text, 'rupees'::text])))`
 - Check `customer_plans_price_paid_check`: `CHECK ((price_paid >= (0)::numeric))`
 - Check `customer_plans_purchased_amount_check`: `CHECK ((purchased_amount > (0)::numeric))`
@@ -190,10 +192,12 @@ One-off spa costs on a given date.
 | `note` | text | yes |  | What it was for. |
 | `created_by` | bigint | yes |  | Login that recorded it. |
 | `created_at` | timestamp with time zone | no | `now()` | When it was recorded. |
+| `payment_method` | text | yes |  | How the expense was paid (cash, upi, card, bank_transfer, other). |
 
 **Constraints**
 
 - Check `expenses_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `expenses_payment_method_check`: `CHECK ((payment_method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text])))`
 - Foreign key `expenses_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
 - Foreign key `expenses_spa_id_fkey`: `FOREIGN KEY (spa_id) REFERENCES spas(id)`
 - Primary key `expenses_pkey`: `PRIMARY KEY (id)`
@@ -335,10 +339,12 @@ Amounts added to an existing prepaid plan after it was sold.
 | `created_at` | timestamp with time zone | no | `now()` | When the top-up was added. |
 | `price_paid` | numeric(12,2) | yes |  | Money received for this top-up (INR); counted as revenue on the top-up date. |
 | `paid_at` | timestamp with time zone | yes |  | When the top-up cost was received; NULL = payment pending. Plan sales count on this date. |
+| `payment_method` | text | yes |  | How the top-up was paid (cash, upi, card, bank_transfer, other); NULL while pending. |
 
 **Constraints**
 
 - Check `plan_topups_amount_check`: `CHECK ((amount > (0)::numeric))`
+- Check `plan_topups_payment_method_check`: `CHECK ((payment_method = ANY (ARRAY['cash'::text, 'upi'::text, 'card'::text, 'bank_transfer'::text, 'other'::text])))`
 - Check `plan_topups_price_paid_check`: `CHECK ((price_paid >= (0)::numeric))`
 - Foreign key `plan_topups_created_by_fkey`: `FOREIGN KEY (created_by) REFERENCES users(id)`
 - Foreign key `plan_topups_plan_id_fkey`: `FOREIGN KEY (plan_id) REFERENCES customer_plans(id)`

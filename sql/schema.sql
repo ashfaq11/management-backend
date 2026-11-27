@@ -558,6 +558,22 @@ COMMENT ON COLUMN plan_packages.is_active IS 'Inactive packages cannot be assign
 COMMENT ON COLUMN plan_packages.created_at IS 'When the package was created.';
 COMMENT ON COLUMN customer_plans.package_id IS 'Package the plan was assigned from; NULL = custom plan made by an admin.';
 
+-- ======== 017_payment_methods.sql ========
+-- Every money movement records how it was paid: plan sales, top-ups and expenses as well as appointment payments.
+ALTER TABLE customer_plans ADD COLUMN IF NOT EXISTS payment_method TEXT
+  CHECK (payment_method IN ('cash','upi','card','bank_transfer','other'));
+ALTER TABLE plan_topups ADD COLUMN IF NOT EXISTS payment_method TEXT
+  CHECK (payment_method IN ('cash','upi','card','bank_transfer','other'));
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS payment_method TEXT
+  CHECK (payment_method IN ('cash','upi','card','bank_transfer','other'));
+-- records made before this did not say; mark them 'other'
+UPDATE customer_plans SET payment_method='other' WHERE payment_method IS NULL AND paid_at IS NOT NULL;
+UPDATE plan_topups SET payment_method='other' WHERE payment_method IS NULL AND paid_at IS NOT NULL;
+UPDATE expenses SET payment_method='other' WHERE payment_method IS NULL;
+COMMENT ON COLUMN customer_plans.payment_method IS 'How the plan cost was paid (cash, upi, card, bank_transfer, other); NULL while pending.';
+COMMENT ON COLUMN plan_topups.payment_method IS 'How the top-up was paid (cash, upi, card, bank_transfer, other); NULL while pending.';
+COMMENT ON COLUMN expenses.payment_method IS 'How the expense was paid (cash, upi, card, bank_transfer, other).';
+
 -- ======== migration bookkeeping (same table app/migrate.py uses) ========
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -577,5 +593,6 @@ INSERT INTO schema_migrations(version) VALUES
   ('013_plan_paid_status.sql'),
   ('014_spa_logo.sql'),
   ('015_spa_receipt_address.sql'),
-  ('016_plan_packages.sql')
+  ('016_plan_packages.sql'),
+  ('017_payment_methods.sql')
 ON CONFLICT DO NOTHING;

@@ -107,6 +107,7 @@ class PlanPackageIn(BaseModel):
 class AssignPlanIn(BaseModel):
     package_id: int
     paid: bool = True
+    payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None
     notes: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -140,6 +141,7 @@ class CustomerPlanIn(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=500)
     price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)  # INR; rupee plans default to amount
     paid: bool = True  # False = sold on credit, payment pending
+    payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None  # required when paid
 
 
 class CustomerPlanUpdate(BaseModel):
@@ -162,14 +164,24 @@ class PlanTopUp(BaseModel):
     price_paid: Optional[float] = Field(default=None, ge=0, le=10_000_000)
     note: Optional[str] = Field(default=None, max_length=500)
     paid: bool = True
+    payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None
 
 
 class PaidIn(BaseModel):
     paid: bool
+    payment_method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other"]] = None
+
+
+def need_method(paid: bool, method) -> Optional[str]:
+    """Money received must say how: cash, UPI, card, bank transfer or other."""
+    if paid and not method:
+        raise HTTPException(422, "Choose how it was paid (cash, UPI, card, bank transfer or other)")
+    return method if paid else None
 
 
 class ExpenseIn(BaseModel):
     on_date: dt.date
+    payment_method: Literal["cash", "upi", "card", "bank_transfer", "other"]
     category: str = Field(default="Other", min_length=1, max_length=60)
     amount: float = Field(gt=0, le=100_000_000)
     note: Optional[str] = Field(default=None, max_length=500)
@@ -189,7 +201,7 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
     """Every cost falling in [lo, hi): one-off expenses on their date, and each regular expense once per month on
     its due day while it is active."""
     rows = [{**r, "kind": "one-off"} for r in db.all(
-        """SELECT id, on_date, category, note AS name, amount FROM expenses
+        """SELECT id, on_date, category, note AS name, amount, payment_method FROM expenses
            WHERE spa_id=%s AND on_date >= %s AND on_date < %s""", (spa, lo, hi))]
     for r in db.all("SELECT * FROM recurring_expenses WHERE spa_id=%s AND starts_on < %s AND (ends_on IS NULL OR ends_on >= %s)",
                     (spa, hi, lo)):
@@ -200,7 +212,7 @@ def expenses_in(db, spa: int, lo: dt.date, hi: dt.date) -> list[dict]:
             due = dt.date(y, m, r["day_of_month"])
             if lo <= due < hi and start <= due and (end is None or due <= end):
                 rows.append({"id": r["id"], "on_date": due.isoformat(), "category": r["category"], "name": r["name"],
-                             "amount": r["amount"], "kind": "regular"})
+                             "amount": r["amount"], "kind": "regular", "payment_method": None})
             y, m = (y + 1, 1) if m == 12 else (y, m + 1)
     return sorted(rows, key=lambda x: (str(x["on_date"]), x["kind"], x["id"]))
 
@@ -212,10 +224,10 @@ def assign_package(t, cid: int, spa: int, b: "AssignPlanIn") -> int:
         raise HTTPException(404, "Plan package not found")
     expires = dt.date.today() + dt.timedelta(days=pk["validity_days"]) if pk["validity_days"] else None
     return t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,
-                                                  price_paid,paid_at,package_id)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
+                                                  price_paid,paid_at,package_id,payment_method)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s,%s)""",
                     (cid, spa, pk["name"], pk["plan_type"], pk["amount"], pk["amount"], expires,
-                     (b.notes or "").strip() or None, pk["price"], b.paid, pk["id"]))
+                     (b.notes or "").strip() or None, pk["price"], b.paid, pk["id"], need_method(b.paid, b.payment_method)))
 
 
 class OnboardIn(CustomerIn):
@@ -1104,10 +1116,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(404, "Customer not found")
             pid = t.insert(
                 """INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,
-                                               price_paid,paid_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
+                                               price_paid,paid_at,payment_method)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
                 (cid, u["spa"], b.name.strip(), b.plan_type, b.amount, b.amount, b.expires_on, b.notes,
-                 paid_for(b.plan_type, b.amount, b.price_paid), b.paid))
+                 paid_for(b.plan_type, b.amount, b.price_paid), b.paid, need_method(b.paid, b.payment_method)))
         return {"id": pid, "balance": b.amount, "plan_type": b.plan_type}
 
     @app.put("/api/customers/{cid}/plans/{pid}")
@@ -1157,15 +1169,17 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.put("/api/customers/{cid}/plans/{pid}/paid")
     def set_plan_paid(cid: int, pid: int, b: PaidIn, u=Depends(member)):
         """Mark a plan's cost received (revenue counts it today) or back to pending."""
-        if not db.run("""UPDATE customer_plans SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END
-                         WHERE id=%s AND customer_id=%s AND spa_id=%s""", (b.paid, pid, cid, u["spa"])):
+        if not db.run("""UPDATE customer_plans SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END,
+                                                  payment_method = %s
+                         WHERE id=%s AND customer_id=%s AND spa_id=%s""",
+                      (b.paid, need_method(b.paid, b.payment_method), pid, cid, u["spa"])):
             raise HTTPException(404, "Plan not found")
         return {"id": pid, "paid": b.paid}
 
     @app.put("/api/plan-topups/{tid}/paid")
     def set_topup_paid(tid: int, b: PaidIn, u=Depends(member)):
-        if not db.run("UPDATE plan_topups SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END WHERE id=%s AND spa_id=%s",
-                      (b.paid, tid, u["spa"])):
+        if not db.run("""UPDATE plan_topups SET paid_at = CASE WHEN %s THEN COALESCE(paid_at, now()) END, payment_method=%s
+                         WHERE id=%s AND spa_id=%s""", (b.paid, need_method(b.paid, b.payment_method), tid, u["spa"])):
             raise HTTPException(404, "Top-up not found")
         return {"id": tid, "paid": b.paid}
 
@@ -1179,10 +1193,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 raise HTTPException(404, "Plan not found")
             t.run("UPDATE customer_plans SET purchased_amount=purchased_amount+%s, balance=balance+%s WHERE id=%s",
                   (b.amount, b.amount, pid))
-            t.insert("""INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by,price_paid,paid_at)
-                        VALUES(%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
+            t.insert("""INSERT INTO plan_topups(plan_id,spa_id,amount,note,created_by,price_paid,paid_at,payment_method)
+                        VALUES(%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
                      (pid, u["spa"], b.amount, (b.note or "").strip() or None, u["id"],
-                      paid_for(p["plan_type"], b.amount, b.price_paid), b.paid))
+                      paid_for(p["plan_type"], b.amount, b.price_paid), b.paid, need_method(b.paid, b.payment_method)))
         return {"id": pid, "balance": round(float(p["balance"]) + b.amount, 2),
                 "purchased_amount": round(float(p["purchased_amount"]) + b.amount, 2)}
 
@@ -1202,11 +1216,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
             elif b.plan:
                 if u["role"] == "staff":
                     raise HTTPException(403, "Staff can only assign a plan package")
-                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid,paid_at)
-                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END)""",
+                pid = t.insert("""INSERT INTO customer_plans(customer_id,spa_id,name,plan_type,purchased_amount,balance,expires_on,notes,price_paid,paid_at,payment_method)
+                                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN now() END,%s)""",
                                (cid, u["spa"], b.plan.name.strip(), b.plan.plan_type, b.plan.amount, b.plan.amount,
                                 b.plan.expires_on, b.plan.notes, paid_for(b.plan.plan_type,b.plan.amount,b.plan.price_paid),
-                                b.plan.paid))
+                                b.plan.paid, need_method(b.plan.paid, b.plan.payment_method)))
         return {"customer_id": cid, "appointment_id": aid, "plan_id": pid}
 
     # ---- reports & payroll (admin) --------------------------------------
@@ -1340,11 +1354,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         plan_rows = [] if (therapist_id is not None or service_id is not None) else db.all(
             f"""SELECT 'plan' AS kind, p.paid_at AS at, c.name AS customer, p.name AS plan, p.plan_type,
                        p.purchased_amount - COALESCE((SELECT SUM(x.amount) FROM plan_topups x WHERE x.plan_id=p.id),0)
-                         AS amount, COALESCE(p.price_paid,0) AS price_paid
+                         AS amount, COALESCE(p.price_paid,0) AS price_paid, p.payment_method
                 FROM customer_plans p JOIN customers c ON c.id=p.customer_id
                 WHERE p.spa_id=%s AND p.paid_at >= %s AND p.paid_at < %s{cust}
                 UNION ALL
-                SELECT 'topup', x.paid_at, c.name, p.name, p.plan_type, x.amount, COALESCE(x.price_paid,0)
+                SELECT 'topup', x.paid_at, c.name, p.name, p.plan_type, x.amount, COALESCE(x.price_paid,0), x.payment_method
                 FROM plan_topups x JOIN customer_plans p ON p.id=x.plan_id JOIN customers c ON c.id=p.customer_id
                 WHERE x.spa_id=%s AND x.paid_at >= %s AND x.paid_at < %s{cust}
                 ORDER BY 2""", (u["spa"], lo, hi, *cargs, u["spa"], lo, hi, *cargs))
@@ -1356,6 +1370,21 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                 WHERE x.spa_id=%s AND x.paid_at IS NULL{cust}) q""",
                          (u["spa"], *cargs, u["spa"], *cargs))
         plan_sales = sum((payroll.money(x["price_paid"]) for x in plan_rows), payroll.money(0))
+        # money in and out by payment method: appointment payments (net of refunds), plan sales, expenses
+        methods: dict[str, dict] = {}
+
+        def bump(m, key, v):
+            row = methods.setdefault(m or "other", {"method": m or "other", "services": 0.0, "plans": 0.0, "expenses": 0.0})
+            row[key] += float(v or 0)
+        if therapist_id is None and service_id is None:
+            for r in db.all(f"""SELECT p.method, SUM(p.amount - COALESCE((SELECT SUM(rf.amount) FROM payment_refunds rf
+                                                                   WHERE rf.payment_id=p.id),0)) AS v
+                                FROM payments p WHERE p.spa_id=%s AND p.received_at >= %s AND p.received_at < %s
+                                {"AND p.customer_id=%s" if customer_id is not None else ""} GROUP BY 1""",
+                            (u["spa"], lo, hi, *cargs)):
+                bump(r["method"], "services", r["v"])
+            for x in plan_rows:
+                bump(x["payment_method"], "plans", x["price_paid"])
         by_plan = db.one(f"""SELECT COALESCE(SUM(a.price),0) AS v FROM appointments a
                               WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s{who}
                                 AND EXISTS (SELECT 1 FROM plan_redemptions r
@@ -1365,6 +1394,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         exp_rows = [] if (therapist_id is not None or customer_id is not None or service_id is not None) \
             else expenses_in(db, u["spa"], lo, hi)
         exp_total = sum((payroll.money(x["amount"]) for x in exp_rows), payroll.money(0))
+        for x in exp_rows:
+            bump(x.get("payment_method") or ("other" if x["kind"] == "regular" else None), "expenses", x["amount"])
+        by_method = sorted(({**m, "net": round(m["services"] + m["plans"] - m["expenses"], 2)} for m in methods.values()),
+                           key=lambda m: -(m["services"] + m["plans"]))
         pay = None
         if month and not (date_from or date_to) and therapist_id is None and customer_id is None and service_id is None:
             pay = sum((payroll.money(payroll.compute_payslip(db, t, month)["net_pay"]) for t in
@@ -1375,7 +1408,7 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 "paid_by_plan": float(paid_by_plan),
                 "collected": float(rev - paid_by_plan + plan_sales), "plan_lines": plan_rows,
                 "payroll": None if pay is None else float(pay),
-                "expenses": float(exp_total), "expense_lines": exp_rows,
+                "expenses": float(exp_total), "expense_lines": exp_rows, "by_method": by_method,
                 "profit": None if pay is None else float(rev - paid_by_plan + plan_sales - pay - exp_total),
                 "services_count": len(lines), "minutes": sum(r["duration_min"] for r in lines), "new_customers": new_c, "by_status": by_status,
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
@@ -1608,14 +1641,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.post("/api/expenses", status_code=201)
     def add_expense(b: ExpenseIn, u=Depends(admin)):
-        return {"id": db.insert("""INSERT INTO expenses(spa_id,on_date,category,amount,note,created_by)
-                                   VALUES(%s,%s,%s,%s,%s,%s)""",
-                                (u["spa"], b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, u["id"]))}
+        return {"id": db.insert("""INSERT INTO expenses(spa_id,on_date,category,amount,note,created_by,payment_method)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                                (u["spa"], b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, u["id"],
+                                 b.payment_method))}
 
     @app.put("/api/expenses/{eid}")
     def edit_expense(eid: int, b: ExpenseIn, u=Depends(admin)):
-        if not db.run("UPDATE expenses SET on_date=%s,category=%s,amount=%s,note=%s WHERE id=%s AND spa_id=%s",
-                      (b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, eid, u["spa"])):
+        if not db.run("UPDATE expenses SET on_date=%s,category=%s,amount=%s,note=%s,payment_method=%s WHERE id=%s AND spa_id=%s",
+                      (b.on_date, b.category.strip(), b.amount, (b.note or "").strip() or None, b.payment_method, eid,
+                       u["spa"])):
             raise HTTPException(404, "Expense not found")
         return {"id": eid}
 
