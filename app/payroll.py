@@ -320,67 +320,134 @@ METHODS = {"cash": "Cash", "upi": "UPI", "card": "Card", "bank_transfer": "Bank 
 
 
 def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
-    """A clean, simple customer receipt (A5, white): spa name and receipt number, billed to, one item line,
-    total, how it was paid, refunds if any, thank-you note."""
+    """Minimal editorial-style spa receipt inspired by a clean digital invoice layout."""
+    import base64
+    import re
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A5
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     from xml.sax.saxutils import escape as e
 
-    INK, MUT, LINE, ACC = colors.HexColor("#0f1c2e"), colors.HexColor("#6b7686"), colors.HexColor("#e5e8ec"), colors.HexColor("#0e6e6a")
-    S = lambda name, **k: ParagraphStyle(name, **{"fontName": "Helvetica", "fontSize": 9, "leading": 12, "textColor": INK, **k})  # noqa: E731
-    h1, lab, txt = S("h1", fontName="Helvetica-Bold", fontSize=16, leading=20), S("lab", fontSize=7, textColor=MUT, leading=9), S("t")
-    right, rlab = S("r", alignment=TA_RIGHT), S("rl", alignment=TA_RIGHT, fontSize=7, textColor=MUT, leading=9)
+    INK = colors.HexColor("#171717")
+    MUT = colors.HexColor("#777777")
+    LINE = colors.HexColor("#dedede")
+    BLACK = colors.HexColor("#080808")
+    PALE = colors.HexColor("#f1f1f1")
     number = f"SP-{p['id']:06d}"
     received = dt.datetime.fromisoformat(str(p["received_at"]).replace(" ", "T")[:19])
     appt = dt.datetime.fromisoformat(str(p["start_at"]).replace(" ", "T")[:19])
+    gross = float(p["amount"])
     refunded = sum(float(r["amount"]) for r in refunds)
-    net = float(p["amount"]) - refunded
-    W = 336  # A5 width minus margins and frame padding
+    net = gross - refunded
+    W = 354
 
-    def line(space=8):
-        t = Table([[""]], colWidths=[W], rowHeights=[1])
-        t.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, -1), .6, LINE)]))
-        return [Spacer(1, space), t, Spacer(1, space)]
+    def style(name, **kw):
+        return ParagraphStyle(name, **{"fontName": "Helvetica", "fontSize": 8, "leading": 10,
+                                       "textColor": INK, **kw})
 
-    f = []
-    head = Table([[Paragraph(e(business), h1), Paragraph('<font size="13"><b>RECEIPT</b></font>', right)],
-                  [Paragraph(e(p.get("spa_address") or ""), lab), Paragraph(f"{number}<br/>{received:%d %b %Y, %I:%M %p}", rlab)]],
-                 colWidths=[W * .62, W * .38])
-    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                              ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
-    f += [head] + line(10)
+    title = style("receipt_title", fontName="Times-Roman", fontSize=19, leading=22, alignment=TA_RIGHT)
+    small = style("small", fontSize=6.5, leading=8, textColor=MUT)
+    body = style("body", fontSize=7.5, leading=10)
+    right = style("right", alignment=TA_RIGHT, fontSize=7.5, leading=10)
+    label = style("label", fontName="Helvetica-Bold", fontSize=6.5, leading=8)
+    tiny_right = style("tiny_right", fontSize=6.5, leading=8, alignment=TA_RIGHT, textColor=MUT)
 
-    meta = Table([[Paragraph("BILLED TO", lab), Paragraph("PAYMENT", rlab)],
-                  [Paragraph(f"<b>{e(p['customer'])}</b><br/>{e(p.get('phone') or '')}", txt),
-                   Paragraph(f"{METHODS.get(p['method'], p['method'])}" + (f"<br/>Ref: {e(p['reference'])}" if p.get("reference") else ""), right)]],
-                 colWidths=[W / 2, W / 2])
-    meta.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
-    f += [meta, Spacer(1, 14)]
+    def money(value):
+        return f"{value:,.2f}"
 
-    rows = [["DESCRIPTION", "AMOUNT (Rs)"],
-            [Paragraph(f"<b>{e(p['service'])}</b><br/><font color='#6b7686' size='8'>{appt:%d %b %Y, %I:%M %p} &middot; with {e(p['therapist'])}</font>", txt),
-             amt(p["amount"])]]
-    for r in refunds:
-        rows.append([Paragraph(f"Refund" + (f" &middot; {e(r['reason'])}" if r.get("reason") else ""), txt), "- " + amt(r["amount"])])
-    rows.append(["Total paid", amt(net)])
-    t = Table(rows, colWidths=[W - 90, 90])
-    t.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, 0), 7),
-                           ("TEXTCOLOR", (0, 0), (-1, 0), MUT), ("LINEBELOW", (0, 0), (-1, 0), .6, LINE),
-                           ("LINEBELOW", (0, 1), (-1, -2), .3, LINE), ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-                           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                           ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-                           ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, -1), (-1, -1), 12),
-                           ("TEXTCOLOR", (0, -1), (-1, -1), ACC), ("LINEABOVE", (0, -1), (-1, -1), 1, INK)]))
-    f += [t, Spacer(1, 26), Paragraph(f"Thank you for visiting {e(business)}.", S("ty", fontName="Helvetica-Bold")),
-          Spacer(1, 3), Paragraph("Computer-generated receipt; no signature required.", lab)]
+    # Use the spa-specific logo when one has been configured.
+    brand_cell = [Paragraph(f"<b>{e(business)}</b>", style("brand", fontName="Helvetica-Bold", fontSize=11, leading=13))]
+    data_url = p.get("logo_data_url")
+    if data_url:
+        match = re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})", data_url)
+        if match:
+            try:
+                raw = base64.b64decode(match.group(1), validate=True)
+                from reportlab.lib.utils import ImageReader
+                from io import BytesIO
+                reader = ImageReader(BytesIO(raw))
+                iw, ih = reader.getSize()
+                scale = min(54 / max(iw, 1), 42 / max(ih, 1))
+                brand_cell = [Image(BytesIO(raw), width=iw * scale, height=ih * scale), Spacer(1, 3),
+                              Paragraph(e(business), style("brand2", fontName="Helvetica-Bold", fontSize=9, leading=11))]
+            except Exception:
+                pass
+
+    head = Table([[brand_cell, [Paragraph("RECEIPT", title),
+                                Paragraph(f"{number}<br/>{received:%d %b %Y}", tiny_right)]]],
+                 colWidths=[W * .60, W * .40])
+    head.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING",(0,0),(-1,-1),0),
+                              ("RIGHTPADDING",(0,0),(-1,-1),0), ("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+    story = [head, Spacer(1, 15)]
+
+    # Customer and issue details, in the simple two-column block from the reference.
+    customer = Paragraph(f"<b>{e(p.get('customer') or '')}</b><br/>{e(p.get('phone') or '')}", body)
+    meta = Table([[Paragraph("BILL TO", small), Paragraph("ISSUE DATE", tiny_right)],
+                  [customer, Paragraph(f"{received:%d %b %Y}", right)],
+                  [Paragraph("APPOINTMENT", small), Paragraph("PAYMENT METHOD", tiny_right)],
+                  [Paragraph(f"{appt:%d %b %Y, %I:%M %p}<br/>{e(p.get('therapist') or '')}", body),
+                   Paragraph(e(METHODS.get(p.get("method"), p.get("method", ""))), right)]],
+                 colWidths=[W * .58, W * .42])
+    meta.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),
+                              ("RIGHTPADDING",(0,0),(-1,-1),0),("TOPPADDING",(0,0),(-1,-1),2),
+                              ("BOTTOMPADDING",(0,0),(-1,-1),2)]))
+    story += [meta, Spacer(1, 16)]
+
+    rows = [[Paragraph("#", style("th", fontName="Helvetica-Bold", fontSize=6.5, textColor=colors.white)),
+             Paragraph("ITEM &amp; DESCRIPTION", style("th2", fontName="Helvetica-Bold", fontSize=6.5, textColor=colors.white)),
+             Paragraph("QTY", style("th3", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("RATE", style("th4", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("TAX", style("th5", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("AMOUNT", style("th6", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white))],
+            ["1", Paragraph(f"<b>{e(p.get('service') or 'Spa service')}</b><br/><font color='#777777' size='6.5'>Payment received · {appt:%d %b %Y}</font>", body),
+             "1.00", Paragraph(money(gross), right), "—", Paragraph(money(gross), right)]]
+    for idx, refund in enumerate(refunds, 2):
+        desc = "Refund" + (f" · {e(refund.get('reason') or '')}" if refund.get("reason") else "")
+        rows.append([str(idx), Paragraph(desc, body), "1.00", "—", "—",
+                     Paragraph("− " + money(float(refund["amount"])), right)])
+    table = Table(rows, colWidths=[20, 157, 35, 47, 35, 60], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),BLACK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),5),
+        ("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),7),
+        ("BOTTOMPADDING",(0,0),(-1,-1),7),("LINEBELOW",(0,1),(-1,-1),.45,LINE),
+        ("ALIGN",(2,0),(-1,-1),"RIGHT")
+    ]))
+    story += [table, Spacer(1, 8)]
+
+    totals = [
+        ["Subtotal", money(gross)],
+    ]
+    if refunded:
+        totals.append(["Refunds", "− " + money(refunded)])
+    totals.append(["TOTAL PAID", money(net)])
+    summary = Table([[Paragraph(k, style("sum_"+str(i), fontName="Helvetica-Bold" if i == len(totals)-1 else "Helvetica",
+                                        fontSize=8 if i == len(totals)-1 else 7.2,
+                                        alignment=TA_RIGHT)),
+                      Paragraph(v, style("sumv_"+str(i), fontName="Helvetica-Bold" if i == len(totals)-1 else "Helvetica",
+                                        fontSize=8 if i == len(totals)-1 else 7.2,
+                                        alignment=TA_RIGHT))]
+                     for i,(k,v) in enumerate(totals)],
+                    colWidths=[W-145,145])
+    summary.setStyle(TableStyle([("ALIGN",(0,0),(-1,-1),"RIGHT"),("LEFTPADDING",(0,0),(-1,-1),5),
+                                 ("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),
+                                 ("BOTTOMPADDING",(0,0),(-1,-1),5),
+                                 ("BACKGROUND",(0,-1),(-1,-1),PALE),
+                                 ("LINEABOVE",(0,-1),(-1,-1),.5,LINE)]))
+    story += [summary, Spacer(1, 25)]
+    note = Table([[Paragraph("<b>Notes</b><br/>Thank you for choosing us. We hope to see you again.", body)],
+                  [Paragraph("<b>Terms &amp; Conditions</b><br/>This is a computer-generated receipt for the payment shown above. Please retain it for your records.", small)]],
+                 colWidths=[W])
+    note.setStyle(TableStyle([("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+                              ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
+    story += [note, Spacer(1, 8), Paragraph(f"{e(business)} · Thank you", style("footer", fontSize=6.5, textColor=MUT))]
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A5, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36,
+    doc = SimpleDocTemplate(buf, pagesize=A5, leftMargin=32, rightMargin=32, topMargin=30, bottomMargin=28,
                             title=f"{business} - Receipt {number}", author=business, creator="StudioDesk")
-    doc.build(f)
+    doc.build(story)
     return buf.getvalue()
 
 
