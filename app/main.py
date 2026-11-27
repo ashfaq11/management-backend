@@ -29,6 +29,14 @@ class Login(BaseModel):
     password: str
 
 
+def search_terms(q: str) -> tuple[str, str]:
+    """Case-insensitive name/phone pattern (trimmed, wildcards escaped) and the digits alone, so '98450 11122'
+    is found by '9845011122' and the other way round."""
+    q = (q or "").strip()
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    return like, re.sub(r"\D", "", q)
+
+
 class CustomerIn(BaseModel):
     name: str = Field(min_length=1)
     phone: str = Field(min_length=5)
@@ -552,9 +560,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.get("/api/customers")
     def customers(q: str = "", u=Depends(member)):
-        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        return db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)
-                         ORDER BY lower(name) LIMIT 200""", (u["spa"], like, like))
+        like, digits = search_terms(q)
+        return db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))
+                         ORDER BY lower(name) LIMIT 200""", (u["spa"], like, like, digits, "%" + digits + "%"))
 
     @app.post("/api/customers", status_code=201)
     def add_customer(b: CustomerIn, u=Depends(member)):
@@ -564,13 +572,13 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     @app.get("/api/customers/page")
     def customer_page(q: str = "", page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
                       u=Depends(member)):
-        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        like, digits = search_terms(q)
         total = db.one("""SELECT COUNT(*) AS n FROM customers
-                          WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)""",
-                       (u["spa"], like, like))["n"]
-        items = db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s)
+                          WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))""",
+                       (u["spa"], like, like, digits, "%" + digits + "%"))["n"]
+        items = db.all("""SELECT * FROM customers WHERE spa_id=%s AND (name ILIKE %s OR phone ILIKE %s OR (%s <> '' AND regexp_replace(phone,'\\D','','g') LIKE %s))
                           ORDER BY lower(name), id LIMIT %s OFFSET %s""",
-                       (u["spa"], like, like, page_size, (page - 1) * page_size))
+                       (u["spa"], like, like, digits, "%" + digits + "%", page_size, (page - 1) * page_size))
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     @app.get("/api/customers/{cid}")
