@@ -1297,8 +1297,9 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
     def summary(month: str | None = Query(None), therapist_id: int | None = Query(None),
                 date_from: dt.date | None = Query(None, alias="from"), date_to: dt.date | None = Query(None, alias="to"),
                 customer_id: int | None = Query(None), service_id: int | None = Query(None),
+                method: Optional[Literal["cash", "upi", "card", "bank_transfer", "other", "plan", "unpaid"]] = Query(None),
                 u=Depends(admin)):
-        """The month's figures. Revenue counts COMPLETED appointments only, at the price agreed at booking.
+        """The month's figures. `method` narrows everything to money through one source (or plan / unpaid services). Revenue counts COMPLETED appointments only, at the price agreed at booking.
         `lines` is every completed service (who, what, for whom, how much); `by_therapist` gives each
         therapist's count and amount with a per-service breakdown. `therapist_id` narrows everything but
         new_customers to one therapist."""
@@ -1313,11 +1314,16 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                                FROM appointments a WHERE a.start_at >= %s AND a.start_at < %s{who}
                                GROUP BY a.status ORDER BY a.status""", args)
         lines = db.all(f"""SELECT a.id, a.start_at, a.duration_min, a.price, c.name AS customer, s.name AS service,
-                                  t.id AS therapist_id, t.name AS therapist
+                                  t.id AS therapist_id, t.name AS therapist,
+                                  COALESCE((SELECT string_agg(DISTINCT p.method, ',') FROM payments p WHERE p.appointment_id=a.id),
+                                           CASE WHEN EXISTS (SELECT 1 FROM plan_redemptions r WHERE r.appointment_id=a.id
+                                                             AND r.reversed_at IS NULL) THEN 'plan' END, 'unpaid') AS paid_via
                            FROM appointments a JOIN customers c ON c.id=a.customer_id
                            JOIN services s ON s.id=a.service_id JOIN therapists t ON t.id=a.therapist_id
                            WHERE a.status='completed' AND a.start_at >= %s AND a.start_at < %s{who}
                            ORDER BY a.start_at, a.id""", args)
+        if method:
+            lines = [x for x in lines if method in (x["paid_via"] or "").split(",")]
         by_service: dict[str, dict] = {}
         by_therapist: dict[int, dict] = {}
         for r in lines:
@@ -1402,7 +1408,15 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         if month and not (date_from or date_to) and therapist_id is None and customer_id is None and service_id is None:
             pay = sum((payroll.money(payroll.compute_payslip(db, t, month)["net_pay"]) for t in
                        db.all("SELECT * FROM therapists WHERE spa_id=%s AND is_active", (u["spa"],))), payroll.money(0))
-        return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(),
+        if method:
+            by_method = [m for m in by_method if m["method"] == method]
+            plan_rows = [x for x in plan_rows if (x.get("payment_method") or "other") == method]
+            exp_rows = [x for x in exp_rows if (x.get("payment_method") or "other") == method]
+            plan_sales = sum((payroll.money(x["price_paid"]) for x in plan_rows), payroll.money(0))
+            exp_total = sum((payroll.money(x["amount"]) for x in exp_rows), payroll.money(0))
+            pay = None
+        rev = sum((payroll.money(r["price"]) for r in lines), payroll.money(0))
+        return {"month": month, "from": lo.isoformat(), "to": (hi - dt.timedelta(days=1)).isoformat(), "method": method,
                 "therapist_id": therapist_id, "customer_id": customer_id, "service_id": service_id, "revenue": float(rev),
                 "plan_sales": float(plan_sales), "plan_dues": float(pending["v"]), "plan_dues_count": int(pending["n"]),
                 "paid_by_plan": float(paid_by_plan),
@@ -1414,9 +1428,11 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
                 "by_service": sorted((out(v) for v in by_service.values()), key=lambda x: -x["revenue"]),
                 "by_therapist": therapists, "lines": lines}
 
-    def report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user):
-        r = summary(month, therapist_id, date_from, date_to, customer_id, service_id, user)
-        parts = []
+    def report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user, method=None):
+        if method not in (None, "", "cash", "upi", "card", "bank_transfer", "other", "plan", "unpaid"):
+            raise HTTPException(422, "Unknown payment source")
+        r = summary(month, therapist_id, date_from, date_to, customer_id, service_id, method or None, user)
+        parts = [method] if method else []
         for key, table, val in (("therapist", "therapists", therapist_id), ("customer", "customers", customer_id),
                                 ("service", "services", service_id)):
             if val is not None:
@@ -1430,33 +1446,36 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
 
     @app.get("/api/reports/summary/pdf")
     def summary_pdf(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                    method: Optional[str] = Query(None),
                     date_from: dt.date | None = Query(None, alias="from"),
                     date_to: dt.date | None = Query(None, alias="to"),
                     customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
         """The same report as /api/reports/summary (same filters), as a PDF to download or print."""
-        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user, method)
         return Response(payroll.report_pdf(r, user["spa_name"]), media_type="application/pdf",
                         headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
 
     @app.get("/api/reports/summary/xlsx")
     def summary_xlsx(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                    method: Optional[str] = Query(None),
                      date_from: dt.date | None = Query(None, alias="from"),
                      date_to: dt.date | None = Query(None, alias="to"),
                      customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
         """The same report as an Excel workbook (Summary, Services done, By therapist, Plan sales)."""
-        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user, method)
         return Response(payroll.report_xlsx(r, user["spa_name"]),
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
 
     @app.get("/api/reports/summary/csv")
     def summary_csv(month: str | None = Query(None), therapist_id: int | None = Query(None),
+                    method: Optional[str] = Query(None),
                     date_from: dt.date | None = Query(None, alias="from"),
                     date_to: dt.date | None = Query(None, alias="to"),
                     customer_id: int | None = Query(None), service_id: int | None = Query(None), user=Depends(admin)):
         """Every completed service in the report (same filters), one row each, for Excel. UTF-8 with BOM
         so Excel shows names correctly."""
-        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user)
+        r, name = report_for(month, therapist_id, date_from, date_to, customer_id, service_id, user, method)
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["Date", "Time", "Customer", "Service", "Therapist", "Minutes", "Price"])

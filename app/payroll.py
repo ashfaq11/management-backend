@@ -256,6 +256,8 @@ def payslip_pdf(p: dict, business: str) -> bytes:
 def report_pdf(r: dict, business: str) -> bytes:
     """The revenue report: KPIs, money collected and profit, by service, by therapist, every service, plan sales."""
     filters = [r[k] for k in ("therapist", "customer", "service") if r.get(k)]
+    if r.get("method"):
+        filters.append({"plan": "Paid from plan", "unpaid": "Unpaid"}.get(r["method"], METHODS.get(r["method"], r["method"])))
     d = _Pdf(business, "Revenue report", period_label(r.get("month"), r.get("from"), r.get("to")),
              " / ".join(filters) or "All therapists")
     tiles = [("Service revenue", f"Rs {amt(r['revenue'])}"), ("Services done", str(r["services_count"])),
@@ -270,6 +272,10 @@ def report_pdf(r: dict, business: str) -> bytes:
     if r.get("profit") is not None:
         tiles += [("Payroll", f"Rs {amt(r['payroll'])}"), ("Net profit", f"Rs {amt(r['profit'])}")]
     d.kpis(tiles)
+    if r.get("by_method"):
+        parts = [f"{METHODS.get(m['method'], m['method'])} Rs {amt(m['services'] + m['plans'])}" for m in r["by_method"]]
+        total = sum(m["services"] + m["plans"] for m in r["by_method"])
+        d.text("Received by source: " + "  &middot;  ".join(parts) + f"  &middot;  <b>Total Rs {amt(total)}</b>", muted=True)
     if "plan_sales" in r:
         d.text("Money collected = service revenue - services paid from prepaid plans + plan sales. "
                "Net profit = money collected - payroll - expenses.", muted=True)
@@ -298,11 +304,11 @@ def report_pdf(r: dict, business: str) -> bytes:
     d.table(rows, [283, 70, 80, 90], numeric=3, bold_rows=bold)
 
     d.heading(f"Services done ({len(r['lines'])})")
-    rows = [["Date", "Customer", "Service", "Therapist", "Min", "Price (Rs)"]]
+    rows = [["Date", "Customer", "Service", "Therapist", "Min", "Paid via", "Price (Rs)"]]
     rows += [[str(x["start_at"]).replace("T", " ")[:16], x["customer"], x["service"], x["therapist"],
-              x.get("duration_min", ""), amt(x["price"])] for x in r["lines"]] or [["-"] * 6]
-    rows.append(["Total", "", "", "", r.get("minutes", ""), amt(r["revenue"])])
-    d.table(rows, [88, 115, 115, 95, 35, 75], numeric=2, total=True)
+              x.get("duration_min", ""), {"plan": "Plan", "unpaid": "Unpaid"}.get(x.get("paid_via"), ", ".join(METHODS.get(m, m) for m in (x.get("paid_via") or "").split(",") if m)), amt(x["price"])] for x in r["lines"]] or [["-"] * 7]
+    rows.append(["Total", "", "", "", r.get("minutes", ""), "", amt(r["revenue"])])
+    d.table(rows, [80, 100, 100, 80, 30, 58, 75], numeric=2, total=True)
 
     if r.get("expense_lines"):
         d.heading("Expenses")
@@ -537,9 +543,9 @@ def report_xlsx(r: dict, business: str) -> bytes:
             c.number_format = money
 
     lines = [[str(x["start_at"])[:10], str(x["start_at"]).replace(" ", "T")[11:16], x["customer"], x["service"],
-              x["therapist"], x.get("duration_min"), float(x["price"])] for x in r["lines"]]
-    sheet(wb.create_sheet(), "Services done", ["Date", "Time", "Customer", "Service", "Therapist", "Minutes", "Price"],
-          lines, money_cols=(7,), total=["Total", "", "", "", "", r.get("minutes", 0), float(r["revenue"])])
+              x["therapist"], x.get("duration_min"), {"plan": "Plan", "unpaid": "Unpaid"}.get(x.get("paid_via"), ", ".join(METHODS.get(m, m) for m in (x.get("paid_via") or "").split(",") if m)), float(x["price"])] for x in r["lines"]]
+    sheet(wb.create_sheet(), "Services done", ["Date", "Time", "Customer", "Service", "Therapist", "Minutes", "Paid via", "Price"],
+          lines, money_cols=(8,), total=["Total", "", "", "", "", r.get("minutes", 0), "", float(r["revenue"])])
 
     th = []
     for t in r["by_therapist"]:
