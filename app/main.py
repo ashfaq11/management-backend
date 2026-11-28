@@ -2123,6 +2123,46 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         return Response(out.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
 
+    @app.get("/api/reports/overview")
+    def overview(month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
+                 date_to: dt.date | None = Query(None, alias="to"), u=Depends(admin)):
+        """High-level counts only -- no customer or therapist names (those live in the detailed tabs)."""
+        lo, hi = period(month, date_from, date_to)
+        q = {"spa": u["spa"], "lo": lo, "hi": hi}
+        b = db.one("""SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='completed') completed,
+                             COUNT(*) FILTER (WHERE status='booked') booked, COUNT(*) FILTER (WHERE status='cancelled') cancelled,
+                             COUNT(*) FILTER (WHERE status='no_show') no_show,
+                             COALESCE(SUM(duration_min) FILTER (WHERE status='completed'),0)/60.0 hours,
+                             COUNT(DISTINCT customer_id) FILTER (WHERE status='completed') customers
+                      FROM appointments WHERE spa_id=%(spa)s AND start_at >= %(lo)s AND start_at < %(hi)s""", q)
+        c = db.one("""WITH v AS (SELECT customer_id, MIN(start_at)::date first FROM appointments
+                                 WHERE spa_id=%(spa)s AND status='completed' GROUP BY 1),
+                           p AS (SELECT DISTINCT customer_id FROM appointments WHERE spa_id=%(spa)s AND status='completed'
+                                 AND start_at >= %(lo)s AND start_at < %(hi)s)
+                      SELECT COUNT(*) FILTER (WHERE v.first >= %(lo)s) new_visitors,
+                             COUNT(*) FILTER (WHERE v.first < %(lo)s) AS returning_visitors
+                      FROM p JOIN v USING (customer_id)""", q)
+        c["signed_up"] = db.one("SELECT COUNT(*) n FROM customers WHERE spa_id=%(spa)s AND created_at >= %(lo)s AND created_at < %(hi)s", q)["n"]
+        m = db.one("""SELECT COUNT(*) FILTER (WHERE created_at >= %(lo)s AND created_at < %(hi)s) sold,
+                             COUNT(*) FILTER (WHERE balance > 0 AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)) active,
+                             COUNT(*) FILTER (WHERE balance > 0 AND expires_on BETWEEN CURRENT_DATE AND CURRENT_DATE + 7) expiring_week,
+                             COUNT(*) FILTER (WHERE paid_at IS NULL AND balance > 0) unpaid
+                      FROM customer_plans WHERE spa_id=%(spa)s""", q)
+        m["hours_used"] = db.one("""SELECT COALESCE(SUM(amount),0) n FROM plan_redemptions WHERE spa_id=%(spa)s AND unit='hours'
+                                    AND reversed_at IS NULL AND created_at >= %(lo)s AND created_at < %(hi)s""", q)["n"]
+        pay = db.all("""SELECT method, COUNT(*) n, SUM(amount) amount FROM payments WHERE spa_id=%(spa)s
+                        AND received_at >= %(lo)s AND received_at < %(hi)s GROUP BY 1 ORDER BY 3 DESC""", q)
+        day = db.one("""SELECT to_char(start_at,'FMDay') d, COUNT(*) n FROM appointments WHERE spa_id=%(spa)s
+                        AND status<>'cancelled' AND start_at >= %(lo)s AND start_at < %(hi)s GROUP BY 1 ORDER BY 2 DESC LIMIT 1""", q)
+        hour = db.one("""SELECT EXTRACT(HOUR FROM start_at)::int h, COUNT(*) n FROM appointments WHERE spa_id=%(spa)s
+                         AND status<>'cancelled' AND start_at >= %(lo)s AND start_at < %(hi)s GROUP BY 1 ORDER BY 2 DESC LIMIT 1""", q)
+        svc = db.all("""SELECT s.name, COUNT(*) n, SUM(a.price) revenue FROM appointments a JOIN services s ON s.id=a.service_id
+                        WHERE a.spa_id=%(spa)s AND a.status='completed' AND a.start_at >= %(lo)s AND a.start_at < %(hi)s
+                        GROUP BY 1 ORDER BY 2 DESC""", q)
+        staff = db.one("""SELECT COUNT(*) FILTER (WHERE is_active) active FROM therapists WHERE spa_id=%(spa)s""", q)
+        return {"from": lo, "to": hi, "bookings": b, "customers": c, "memberships": m, "payments": pay,
+                "busiest_day": day, "busiest_hour": hour, "services": svc, "therapists_active": staff["active"]}
+
     @app.get("/api/reports/insights/{kind}")
     def insight_json(kind: str, month: str | None = Query(None), date_from: dt.date | None = Query(None, alias="from"),
                      date_to: dt.date | None = Query(None, alias="to"), days: int = Query(30, ge=1, le=365), u=Depends(admin)):
