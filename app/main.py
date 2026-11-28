@@ -322,10 +322,18 @@ class SpaPlan(BaseModel):
     contact_email: Optional[str] = Field(default=None, max_length=120)
 
 
+def strong_password(v: str) -> str:
+    """Every password: 8+ characters with at least one letter and one number."""
+    if len(v) < 8 or not (re.search(r"[A-Za-z]", v) and re.search(r"\d", v)):
+        raise ValueError("password must have at least 8 characters with letters and numbers")
+    return v
+
+
 class SpaCreate(SpaIn, SpaPlan, SpaProfile):
     """A new spa and its first admin, created together."""
     admin_username: str = Field(min_length=3)
     admin_password: str = Field(min_length=8)
+    _pw = field_validator("admin_password")(classmethod(lambda cls, v: strong_password(v)))
 
 
 class SpaUpdate(SpaIn, SpaPlan):
@@ -337,12 +345,7 @@ class SignupIn(SpaProfile):
     username: str = Field(min_length=3, max_length=60)
     password: str = Field(min_length=8, max_length=200)
 
-    @field_validator("password")
-    @classmethod
-    def strong_enough(cls, v: str) -> str:
-        if not (re.search(r"[A-Za-z]", v) and re.search(r"\d", v)):
-            raise ValueError("password must have at least 8 characters with letters and numbers")
-        return v
+    _pw = field_validator("password")(classmethod(lambda cls, v: strong_password(v)))
 
 
 class PlatformIn(BaseModel):
@@ -363,11 +366,13 @@ class SpaReceiptDetailsUpdate(BaseModel):
 
 class PasswordReset(BaseModel):
     password: str = Field(min_length=8)
+    _pw = field_validator("password")(classmethod(lambda cls, v: strong_password(v)))
 
 
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
+    _pw = field_validator("new_password")(classmethod(lambda cls, v: strong_password(v)))
 
 
 class UserIn(BaseModel):
@@ -375,6 +380,7 @@ class UserIn(BaseModel):
     password: str = Field(min_length=8)
     role: Literal["superadmin", "admin", "staff"] = "staff"
     spa_id: Optional[int] = None  # superadmin only: which spa an admin/staff login belongs to
+    _pw = field_validator("password")(classmethod(lambda cls, v: strong_password(v)))
 
 
 def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastAPI:
