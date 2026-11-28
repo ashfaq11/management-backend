@@ -2180,7 +2180,10 @@ def create_app(dsn: Optional[str] = None, schema: Optional[str] = None) -> FastA
         r = closing(day, month, u)
         name = payroll.file_name(u["spa_name"], r["title"], str(day) if day else month)
         if ext == "pdf":
-            body = payroll.table_pdf(u["spa_name"], r["title"], r["period"], r["columns"], r["rows"])
+            vals = {str(x[0]): x[1] for x in r["rows"] if len(x) > 1}
+            pick = [(k, vals[k]) for k in ("Total received", "Completed", "Service revenue", "Expenses", "Net profit") if k in vals]
+            kp = [(k, (f"\u20b9{float(v):,.0f}" if isinstance(v, float) or k != "Completed" else str(v))) for k, v in pick][:4]
+            body = payroll.table_pdf(u["spa_name"], r["title"], r["period"], r["columns"], r["rows"], kpis=kp)
             return Response(body, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
         from openpyxl import Workbook
         from openpyxl.styles import Font

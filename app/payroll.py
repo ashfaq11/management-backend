@@ -85,6 +85,26 @@ def period_label(month: str | None, date_from: str | None = None, date_to: str |
     return f"{fmt(date_from)} to {fmt(date_to)}"
 
 
+_FONTS = False
+
+
+def fonts():
+    """Inter (OFL, bundled in app/fonts): crisp at small sizes and it has the ₹ sign, unlike Helvetica."""
+    global _FONTS
+    if _FONTS:
+        return
+    import os
+    from reportlab.lib.fonts import addMapping
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    d = os.path.join(os.path.dirname(__file__), "fonts")
+    for name, f in (("Inter", "Regular"), ("Inter-Medium", "Medium"), ("Inter-SemiBold", "SemiBold"), ("Inter-Bold", "Bold")):
+        pdfmetrics.registerFont(TTFont(name, os.path.join(d, f"Inter-{f}.ttf")))
+    pdfmetrics.registerFontFamily("Inter", normal="Inter", bold="Inter-Bold", italic="Inter", boldItalic="Inter-Bold")
+    addMapping("Inter", 0, 0, "Inter"); addMapping("Inter", 1, 0, "Inter-Bold")
+    _FONTS = True
+
+
 class _Pdf:
     """The house style for every PDF: a sage header band with the spa name, title, period and generated
     time; KPI tiles; striped tables; and a footer with page numbers."""
@@ -95,17 +115,18 @@ class _Pdf:
         from reportlab.lib.enums import TA_RIGHT
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 
+        fonts()
         self.c = colors
         self.business, self.title, self.period, self.subtitle = business, title, period, subtitle
         self.when = generated_at().strftime("%d %b %Y, %I:%M %p IST")
-        base = getSampleStyleSheet()["Normal"]
+        base = ParagraphStyle("b", parent=getSampleStyleSheet()["Normal"], fontName="Inter")
         self.st = {
-            "h": ParagraphStyle("h", parent=base, fontName="Helvetica-Bold", fontSize=11.5, textColor=colors.HexColor(self.ACC),
+            "h": ParagraphStyle("h", parent=base, fontName="Inter-Bold", fontSize=11.5, textColor=colors.HexColor(self.ACC),
                                 spaceBefore=14, spaceAfter=6),
             "p": ParagraphStyle("p", parent=base, fontSize=9, textColor=colors.HexColor(self.INK), leading=12),
             "m": ParagraphStyle("m", parent=base, fontSize=8, textColor=colors.HexColor(self.MUT), leading=10),
             "kl": ParagraphStyle("kl", parent=base, fontSize=7, textColor=colors.HexColor(self.MUT), leading=9),
-            "kv": ParagraphStyle("kv", parent=base, fontName="Helvetica-Bold", fontSize=13, leading=16,
+            "kv": ParagraphStyle("kv", parent=base, fontName="Inter-Bold", fontSize=13, leading=16,
                                  textColor=colors.HexColor(self.INK)),
             "r": ParagraphStyle("r", parent=base, alignment=TA_RIGHT, fontSize=8),
         }
@@ -115,24 +136,27 @@ class _Pdf:
         w, h = doc.pagesize
         c = self.c
         canvas.saveState()
+        # clean white header: accent stripe, spa name, document title; period and time on the right
         canvas.setFillColor(c.HexColor(self.ACC))
-        canvas.rect(0, h - 78, w, 78, stroke=0, fill=1)
-        canvas.setFillColor(c.HexColor(self.GOLD))
-        canvas.rect(0, h - 81, w, 3, stroke=0, fill=1)
-        canvas.setFillColor(c.white)
-        canvas.setFont("Helvetica-Bold", 18)
-        canvas.drawString(36, h - 36, self.business)
-        canvas.setFont("Helvetica", 10)
-        canvas.drawString(36, h - 54, self.title + (f"  \u00b7  {self.subtitle}" if self.subtitle else ""))
-        canvas.setFont("Helvetica-Bold", 10)
-        canvas.drawRightString(w - 36, h - 36, self.period)
-        canvas.setFont("Helvetica", 8)
+        canvas.rect(0, h - 6, w, 6, stroke=0, fill=1)
+        canvas.setFillColor(c.HexColor(self.INK))
+        canvas.setFont("Inter-Bold", 17)
+        canvas.drawString(36, h - 38, self.business)
+        canvas.setFillColor(c.HexColor(self.ACC))
+        canvas.setFont("Inter-SemiBold", 8.5)
+        canvas.drawString(36, h - 54, (self.title + (f"  \u00b7  {self.subtitle}" if self.subtitle else "")).upper())
+        canvas.setFillColor(c.HexColor(self.INK))
+        canvas.setFont("Inter-SemiBold", 10.5)
+        canvas.drawRightString(w - 36, h - 38, self.period)
+        canvas.setFillColor(c.HexColor(self.MUT))
+        canvas.setFont("Inter", 7.5)
         canvas.drawRightString(w - 36, h - 54, f"Generated {self.when}")
         canvas.setStrokeColor(c.HexColor(self.LINE))
+        canvas.setLineWidth(.8)
+        canvas.line(36, h - 68, w - 36, h - 68)
         canvas.line(36, 40, w - 36, 40)
-        canvas.setFillColor(c.HexColor(self.MUT))
-        canvas.setFont("Helvetica", 7.5)
-        canvas.drawString(36, 28, f"{self.business} \u00b7 {self.title} \u00b7 {self.period}")
+        canvas.setFont("Inter", 7)
+        canvas.drawString(36, 28, f"{self.business}  \u00b7  {self.title}  \u00b7  {self.period}")
         canvas.restoreState()
 
     def heading(self, text):
@@ -147,7 +171,8 @@ class _Pdf:
         """items: [(label, value)] shown as tiles, four to a row."""
         from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
         c = self.c
-        cells = [[Paragraph(label.upper(), self.st["kl"]), Paragraph(value, self.st["kv"])] for label, value in items]
+        cells = [[Paragraph(label.upper(), self.st["kl"]), Paragraph(value.replace("\u20b9-", "\u2212\u20b9"), self.st["kv"])]
+                 for label, value in items]
         for k in range(0, len(cells), 4):
             row = cells[k:k + 4]
             row += [""] * (4 - len(row))
@@ -160,19 +185,25 @@ class _Pdf:
     def table(self, rows, widths, numeric=1, total=False, bold_rows=()):
         from reportlab.platypus import Table, TableStyle
         c = self.c
+        rows = [[x.upper() if isinstance(x, str) else x for x in rows[0]], *rows[1:]]
         t = Table(rows, colWidths=widths, repeatRows=1)
-        style = [("BACKGROUND", (0, 0), (-1, 0), c.HexColor(self.ACC)), ("TEXTCOLOR", (0, 0), (-1, 0), c.white),
-                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 8),
-                 ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                 ("LINEBELOW", (0, 0), (-1, -1), .25, c.HexColor(self.LINE)),
+        style = [("BACKGROUND", (0, 0), (-1, 0), c.HexColor(self.SOFT)), ("TEXTCOLOR", (0, 0), (-1, 0), c.HexColor(self.MUT)),
+                 ("FONTNAME", (0, 0), (-1, 0), "Inter-SemiBold"), ("FONTSIZE", (0, 0), (-1, 0), 7.2),
+                 ("FONTNAME", (0, 1), (-1, -1), "Inter"), ("FONTSIZE", (0, 1), (-1, -1), 8.2),
+                 ("TEXTCOLOR", (0, 1), (-1, -1), c.HexColor(self.INK)),
+                 ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                 ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                 ("LINEBELOW", (0, 0), (-1, 0), 1, c.HexColor(self.ACC)),
+                 ("LINEBELOW", (0, 1), (-1, -1), .3, c.HexColor(self.LINE)),
                  ("ALIGN", (-numeric, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]
         for i in range(1, len(rows)):
             if i % 2 == 0:
-                style.append(("BACKGROUND", (0, i), (-1, i), c.HexColor("#f8fafc")))
+                style.append(("BACKGROUND", (0, i), (-1, i), c.HexColor("#fafbfc")))
         for i in bold_rows:
-            style += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("BACKGROUND", (0, i), (-1, i), c.HexColor("#e3f3f1"))]
+            style += [("SPAN", (0, i), (-1, i)), ("BACKGROUND", (0, i), (-1, i), c.HexColor("#eef6f5")),
+                      ("TOPPADDING", (0, i), (-1, i), 8)]
         if total:
-            style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), c.HexColor(self.SOFT)),
+            style += [("FONTNAME", (0, -1), (-1, -1), "Inter-Bold"), ("BACKGROUND", (0, -1), (-1, -1), c.HexColor(self.SOFT)),
                       ("LINEABOVE", (0, -1), (-1, -1), 1, c.HexColor(self.ACC))]
         t.setStyle(TableStyle(style))
         self.flow.append(t)
@@ -181,7 +212,7 @@ class _Pdf:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate
         buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=pagesize or A4, leftMargin=36, rightMargin=36, topMargin=100, bottomMargin=54,
+        doc = SimpleDocTemplate(buf, pagesize=pagesize or A4, leftMargin=36, rightMargin=36, topMargin=86, bottomMargin=54,
                                 title=f"{self.business} - {self.title} - {self.period}", author=self.business,
                                 subject=self.title, creator="StudioDesk")
         doc.build(self.flow, onFirstPage=self._page, onLaterPages=self._page, canvasmaker=_numbered_canvas(self.MUT))
@@ -226,7 +257,7 @@ def _numbered_canvas(muted: str):
             for state in self._pages:
                 self.__dict__.update(state)
                 w = self._pagesize[0]
-                self.setFont("Helvetica", 7.5)
+                self.setFont("Inter", 7.5)
                 self.setFillColor(colors.HexColor(muted))
                 self.drawRightString(w - 36, 28, f"Page {self._pageNumber} of {total}")
                 super().showPage()
@@ -240,12 +271,12 @@ def amt(v) -> str:
 
 def payslip_pdf(p: dict, business: str) -> bytes:
     d = _Pdf(business, "Payslip", period_label(p["month"]), p["therapist"])
-    d.kpis([("Net pay", f"Rs {amt(p['net_pay'])}"), ("Fixed salary", f"Rs {amt(p['fixed_salary'])}"),
-            ("Incentive", f"Rs {amt(p['incentive'] + p.get('extra_incentive', 0))}"),
+    d.kpis([("Net pay", f"₹{amt(p['net_pay'])}"), ("Fixed salary", f"₹{amt(p['fixed_salary'])}"),
+            ("Incentive", f"₹{amt(p['incentive'] + p.get('extra_incentive', 0))}"),
             ("Services done", str(p["services_count"]))])
     d.heading("Earnings")
-    rows = [["Description", "Amount (Rs)"], ["Fixed salary", amt(p["fixed_salary"])],
-            [f"Incentive: {p['incentive_percent']:g}% of Rs {amt(p['service_revenue'])} from {p['services_count']} services",
+    rows = [["Description", "Amount (₹)"], ["Fixed salary", amt(p["fixed_salary"])],
+            [f"Incentive: {p['incentive_percent']:g}% of ₹{amt(p['service_revenue'])} from {p['services_count']} services",
              amt(p["incentive"])],
             *[[f"Extra incentive, {b['on_date']}" + (f" - {b['note']}" if b.get("note") else ""), amt(b["amount"])]
               for b in p.get("bonuses", [])],
@@ -255,7 +286,7 @@ def payslip_pdf(p: dict, business: str) -> bytes:
     d.table(rows, [400, 123], total=True)
     d.heading("Completed services")
     body = [[str(r["start_at"]).replace("T", " ")[:16], r["customer"], r["service"], amt(r["price"])] for r in p["lines"]]
-    d.table([["Date", "Customer", "Service", "Price (Rs)"], *(body or [["-", "-", "-", "-"]])], [110, 160, 170, 83])
+    d.table([["Date", "Customer", "Service", "Price (₹)"], *(body or [["-", "-", "-", "-"]])], [110, 160, 170, 83])
     t = p.get("therapist_profile") or {}
     acct = t.get("bank_account_number") or ""
     pay_to = [("Account holder", t.get("bank_account_name") or p["therapist"]), ("Bank", t.get("bank_name")),
@@ -276,41 +307,41 @@ def report_pdf(r: dict, business: str) -> bytes:
         filters.append({"plan": "Paid from plan", "unpaid": "Unpaid"}.get(r["method"], METHODS.get(r["method"], r["method"])))
     d = _Pdf(business, "Revenue report", period_label(r.get("month"), r.get("from"), r.get("to")),
              " / ".join(filters) or "All therapists")
-    tiles = [("Service revenue", f"Rs {amt(r['revenue'])}"), ("Services done", str(r["services_count"])),
+    tiles = [("Service revenue", f"₹{amt(r['revenue'])}"), ("Services done", str(r["services_count"])),
              ("Service time", f"{r.get('minutes', 0) // 60} h" + (f" {r.get('minutes', 0) % 60} min" if r.get('minutes', 0) % 60 else ""))]
     if r.get("therapist_id") is None:
         tiles.append(("New customers", str(r["new_customers"])))
     if "plan_sales" in r:
-        tiles += [("Plan sales", f"Rs {amt(r['plan_sales'])}"), ("Paid from plans", f"Rs {amt(r['paid_by_plan'])}"),
-                  ("Money collected", f"Rs {amt(r['collected'])}")]
+        tiles += [("Plan sales", f"₹{amt(r['plan_sales'])}"), ("Paid from plans", f"₹{amt(r['paid_by_plan'])}"),
+                  ("Money collected", f"₹{amt(r['collected'])}")]
     if r.get("expenses") is not None and "expense_lines" in r:
-        tiles.append(("Expenses", f"Rs {amt(r['expenses'])}"))
+        tiles.append(("Expenses", f"₹{amt(r['expenses'])}"))
     if r.get("profit") is not None:
-        tiles += [("Payroll", f"Rs {amt(r['payroll'])}"), ("Net profit", f"Rs {amt(r['profit'])}")]
+        tiles += [("Payroll", f"₹{amt(r['payroll'])}"), ("Net profit", f"₹{amt(r['profit'])}")]
     d.kpis(tiles)
     if r.get("by_method"):
-        parts = [f"{METHODS.get(m['method'], m['method'])} Rs {amt(m['services'] + m['plans'])}" for m in r["by_method"]]
+        parts = [f"{METHODS.get(m['method'], m['method'])} ₹{amt(m['services'] + m['plans'])}" for m in r["by_method"]]
         total = sum(m["services"] + m["plans"] for m in r["by_method"])
-        d.text("Received by source: " + "  &middot;  ".join(parts) + f"  &middot;  <b>Total Rs {amt(total)}</b>", muted=True)
+        d.text("Received by source: " + "  &middot;  ".join(parts) + f"  &middot;  <b>Total ₹{amt(total)}</b>", muted=True)
     if "plan_sales" in r:
         d.text("Money collected = service revenue - services paid from prepaid plans + plan sales. "
                "Net profit = money collected - payroll - expenses.", muted=True)
 
     if r.get("by_method"):
         d.heading("By payment method")
-        rows = [["Method", "Services (Rs)", "Plans (Rs)", "Expenses (Rs)", "Net (Rs)"]]
+        rows = [["Method", "Services (₹)", "Plans (₹)", "Expenses (₹)", "Net (₹)"]]
         rows += [[METHODS.get(m["method"], m["method"]), amt(m["services"]), amt(m["plans"]), amt(m["expenses"]), amt(m["net"])]
                  for m in r["by_method"]]
         d.table(rows, [143, 95, 95, 95, 95], numeric=4)
 
     d.heading("By service")
-    rows = [["Service", "Done", "Minutes", "Revenue (Rs)"]]
+    rows = [["Service", "Done", "Minutes", "Revenue (₹)"]]
     rows += [[x["service"], x["count"], x.get("minutes", ""), amt(x["revenue"])] for x in r["by_service"]]
     rows.append(["Total", r["services_count"], r.get("minutes", ""), amt(r["revenue"])])
     d.table(rows, [283, 70, 80, 90], numeric=3, total=True)
 
     d.heading("By therapist")
-    rows, bold = [["Therapist / service", "Done", "Minutes", "Amount (Rs)"]], []
+    rows, bold = [["Therapist / service", "Done", "Minutes", "Amount (₹)"]], []
     for t in r["by_therapist"]:
         bold.append(len(rows))
         rows.append([t["therapist"], t["count"], t.get("minutes", ""), amt(t["revenue"])])
@@ -320,7 +351,7 @@ def report_pdf(r: dict, business: str) -> bytes:
     d.table(rows, [283, 70, 80, 90], numeric=3, bold_rows=bold)
 
     d.heading(f"Services done ({len(r['lines'])})")
-    rows = [["Date", "Customer", "Service", "Therapist", "Min", "Paid via", "Price (Rs)"]]
+    rows = [["Date", "Customer", "Service", "Therapist", "Min", "Paid via", "Price (₹)"]]
     rows += [[str(x["start_at"]).replace("T", " ")[:16], x["customer"], x["service"], x["therapist"],
               x.get("duration_min", ""), {"plan": "Plan", "unpaid": "Unpaid"}.get(x.get("paid_via"), ", ".join(METHODS.get(m, m) for m in (x.get("paid_via") or "").split(",") if m)), amt(x["price"])] for x in r["lines"]] or [["-"] * 7]
     rows.append(["Total", "", "", "", r.get("minutes", ""), "", amt(r["revenue"])])
@@ -328,7 +359,7 @@ def report_pdf(r: dict, business: str) -> bytes:
 
     if r.get("expense_lines"):
         d.heading("Expenses")
-        rows = [["Date", "Category", "Item", "Type", "Paid via", "Amount (Rs)"]]
+        rows = [["Date", "Category", "Item", "Type", "Paid via", "Amount (₹)"]]
         rows += [[str(x["on_date"]), x["category"], x.get("name") or "", x["kind"].title(),
                   METHODS.get(x.get("payment_method"), "-"), amt(x["amount"])] for x in r["expense_lines"]]
         rows.append(["Total", "", "", "", "", amt(r["expenses"])])
@@ -336,7 +367,7 @@ def report_pdf(r: dict, business: str) -> bytes:
 
     if r.get("plan_lines"):
         d.heading("Prepaid plan sales")
-        rows = [["Date", "Customer", "Plan", "Kind", "Amount", "Via", "Paid (Rs)"]]
+        rows = [["Date", "Customer", "Plan", "Kind", "Amount", "Via", "Paid (₹)"]]
         rows += [[str(x["at"])[:16], x["customer"], x["plan"], "Top-up" if x["kind"] == "topup" else "New",
                   f"{float(x['amount']):g} {'hrs' if x['plan_type'] == 'hours' else 'Rs'}",
                   METHODS.get(x.get("payment_method"), x.get("payment_method") or "-"), amt(x["price_paid"])]
@@ -368,6 +399,7 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     from xml.sax.saxutils import escape as e
 
+    fonts()
     INK = colors.HexColor("#171717")
     MUT = colors.HexColor("#777777")
     LINE = colors.HexColor("#dedede")
@@ -382,14 +414,14 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     W = 354
 
     def style(name, **kw):
-        return ParagraphStyle(name, **{"fontName": "Helvetica", "fontSize": 8, "leading": 10,
+        return ParagraphStyle(name, **{"fontName": "Inter", "fontSize": 8, "leading": 10,
                                        "textColor": INK, **kw})
 
-    title = style("receipt_title", fontName="Times-Roman", fontSize=19, leading=22, alignment=TA_RIGHT)
+    title = style("receipt_title", fontName="Inter-Bold", fontSize=18, leading=22, alignment=TA_RIGHT)
     small = style("small", fontSize=6.5, leading=8, textColor=MUT)
     body = style("body", fontSize=7.5, leading=10)
     right = style("right", alignment=TA_RIGHT, fontSize=7.5, leading=10)
-    label = style("label", fontName="Helvetica-Bold", fontSize=6.5, leading=8)
+    label = style("label", fontName="Inter-Bold", fontSize=6.5, leading=8)
     tiny_right = style("tiny_right", fontSize=6.5, leading=8, alignment=TA_RIGHT, textColor=MUT)
 
     def money(value):
@@ -412,16 +444,19 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
             except Exception:
                 pass
     spa_details = []
-    spa_details.append(Paragraph(e(business), style("brand", fontName="Helvetica-Bold", fontSize=9, leading=11)))
+    spa_details.append(Paragraph(e(business), style("brand", fontName="Inter-Bold", fontSize=9, leading=11)))
     if p.get("spa_address"):
         spa_details.append(Paragraph(e(p["spa_address"]).replace("\\n", "<br/>"), small))
     if not logo_cell:
         # No uploaded logo: keep the spa identity readable without an empty logo column.
         logo_cell = [Paragraph("", small)]
+    spa_details[0] = Paragraph(e(business), style("brand", fontName="Inter-Bold", fontSize=13, leading=16))
 
-    head = Table([[logo_cell, spa_details, [Paragraph("RECEIPT", title),
-                                            Paragraph(f"{number}<br/>{received:%d %b %Y}", tiny_right)]]],
-                 colWidths=[W * .22, W * .38, W * .40])
+    right_block = [Paragraph("RECEIPT", title), Paragraph(f"{number}<br/>{received:%d %b %Y}", tiny_right)]
+    if logo_cell and not isinstance(logo_cell[0], Paragraph):
+        head = Table([[logo_cell, spa_details, right_block]], colWidths=[W * .22, W * .38, W * .40])
+    else:
+        head = Table([[spa_details, right_block]], colWidths=[W * .6, W * .4])
     head.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING",(0,0),(-1,-1),0),
                               ("RIGHTPADDING",(0,0),(-1,-1),0), ("BOTTOMPADDING",(0,0),(-1,-1),5)]))
     story = [head, Spacer(1, 15)]
@@ -431,7 +466,7 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     meta = Table([[Paragraph("BILL TO", small), Paragraph("ISSUE DATE", tiny_right)],
                   [customer, Paragraph(f"{received:%d %b %Y}", right)],
                   [Paragraph("APPOINTMENT", small), Paragraph("PAYMENT METHOD", tiny_right)],
-                  [Paragraph(f"{appt:%d %b %Y, %I:%M %p}<br/>{_dur(p.get('duration_min'))}{e(p.get('therapist') or '')}", body),
+                  [Paragraph(f"{appt:%d %b %Y}, {appt:%I:%M %p}".replace(" 0", " ").replace("AM", "am").replace("PM", "pm") + "<br/>" + f"{_dur(p.get('duration_min'))}{e(p.get('therapist') or '')}", body),
                    Paragraph(e(METHODS.get(p.get("method"), p.get("method", ""))), right)]],
                  colWidths=[W * .58, W * .42])
     meta.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),
@@ -439,17 +474,17 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
                               ("BOTTOMPADDING",(0,0),(-1,-1),2)]))
     story += [meta, Spacer(1, 16)]
 
-    rows = [[Paragraph("#", style("th", fontName="Helvetica-Bold", fontSize=6.5, textColor=colors.white)),
-             Paragraph("ITEM &amp; DESCRIPTION", style("th2", fontName="Helvetica-Bold", fontSize=6.5, textColor=colors.white)),
-             Paragraph("QTY", style("th3", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
-             Paragraph("RATE", style("th4", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
-             Paragraph("TAX", style("th5", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
-             Paragraph("AMOUNT", style("th6", fontName="Helvetica-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white))],
-            ["1", Paragraph(f"<b>{e(p.get('service') or 'Spa service')}</b><br/><font color='#777777' size='6.5'>Payment received · {appt:%d %b %Y}</font>", body),
-             "1.00", Paragraph(money(gross), right), "—", Paragraph(money(gross), right)]]
+    rows = [[Paragraph("#", style("th", fontName="Inter-Bold", fontSize=6.5, textColor=colors.white)),
+             Paragraph("ITEM &amp; DESCRIPTION", style("th2", fontName="Inter-Bold", fontSize=6.5, textColor=colors.white)),
+             Paragraph("QTY", style("th3", fontName="Inter-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("RATE", style("th4", fontName="Inter-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("TAX", style("th5", fontName="Inter-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white)),
+             Paragraph("AMOUNT", style("th6", fontName="Inter-Bold", fontSize=6.5, alignment=TA_RIGHT, textColor=colors.white))],
+            [Paragraph("1", body), Paragraph(f"<b>{e(p.get('service') or 'Spa service')}</b><br/><font color='#777777' size='6.5'>Payment received · {appt:%d %b %Y}</font>", body),
+             Paragraph("1", right), Paragraph(money(gross), right), Paragraph("—", right), Paragraph(money(gross), right)]]
     for idx, refund in enumerate(refunds, 2):
         desc = "Refund" + (f" · {e(refund.get('reason') or '')}" if refund.get("reason") else "")
-        rows.append([str(idx), Paragraph(desc, body), "1.00", "—", "—",
+        rows.append([Paragraph(str(idx), body), Paragraph(desc, body), Paragraph("1", right), Paragraph("—", right), Paragraph("—", right),
                      Paragraph("− " + money(float(refund["amount"])), right)])
     table = Table(rows, colWidths=[20, 157, 35, 47, 35, 60], repeatRows=1)
     table.setStyle(TableStyle([
@@ -467,10 +502,10 @@ def receipt_pdf(p: dict, refunds: list, business: str) -> bytes:
     if refunded:
         totals.append(["Refunds", "− " + money(refunded)])
     totals.append(["TOTAL PAID", money(net)])
-    summary = Table([[Paragraph(k, style("sum_"+str(i), fontName="Helvetica-Bold" if i == len(totals)-1 else "Helvetica",
+    summary = Table([[Paragraph(k, style("sum_"+str(i), fontName="Inter-Bold" if i == len(totals)-1 else "Inter",
                                         fontSize=8 if i == len(totals)-1 else 7.2,
                                         alignment=TA_RIGHT)),
-                      Paragraph(v, style("sumv_"+str(i), fontName="Helvetica-Bold" if i == len(totals)-1 else "Helvetica",
+                      Paragraph(v, style("sumv_"+str(i), fontName="Inter-Bold" if i == len(totals)-1 else "Inter",
                                         fontSize=8 if i == len(totals)-1 else 7.2,
                                         alignment=TA_RIGHT))]
                      for i,(k,v) in enumerate(totals)],
@@ -499,16 +534,16 @@ def settlement_pdf(r: dict, lines: list, business: str) -> bytes:
     """The day's cash-up: totals by payment method, refunds, net, and every payment."""
     day = dt.date.fromisoformat(str(r["date"])[:10])
     d = _Pdf(business, "Daily settlement", day.strftime("%d %b %Y"))
-    d.kpis([("Collected", f"Rs {amt(r['gross'])}"), ("Refunds", f"Rs {amt(r['refunds'])}"), ("Net", f"Rs {amt(r['net'])}"),
+    d.kpis([("Collected", f"₹{amt(r['gross'])}"), ("Refunds", f"₹{amt(r['refunds'])}"), ("Net", f"₹{amt(r['net'])}"),
             ("Payments", str(sum(m["count"] for m in r["methods"])))])
     d.heading("By payment method")
-    rows = [["Method", "Payments", "Collected (Rs)", "Refunds (Rs)", "Net (Rs)"]]
+    rows = [["Method", "Payments", "Collected (₹)", "Refunds (₹)", "Net (₹)"]]
     rows += [[METHODS.get(m["method"], m["method"]), m["count"], amt(m["gross"]), amt(m["refunds"]), amt(m["gross"] - m["refunds"])]
              for m in r["methods"]] or [["-", "-", "-", "-", "-"]]
     rows.append(["Total", sum(m["count"] for m in r["methods"]), amt(r["gross"]), amt(r["refunds"]), amt(r["net"])])
     d.table(rows, [143, 80, 100, 100, 100], numeric=4, total=True)
     d.heading("Payments")
-    pr = [["Time", "Receipt", "Customer", "Service", "Method", "Amount (Rs)"]]
+    pr = [["Time", "Receipt", "Customer", "Service", "Method", "Amount (₹)"]]
     pr += [[str(x["received_at"]).replace("T", " ")[11:16], f"SP-{x['id']:06d}", x["customer"], x["service"],
             METHODS.get(x["method"], x["method"]), amt(x["amount"])] for x in lines] or [["-"] * 6]
     d.table(pr, [45, 70, 130, 130, 68, 80])
@@ -601,16 +636,52 @@ def report_xlsx(r: dict, business: str) -> bytes:
     return out.getvalue()
 
 
-def table_pdf(business: str, title: str, period: str, columns: list, rows: list, total=None) -> bytes:
-    """Any report table as a branded PDF (landscape when it is wide)."""
+def nice(v) -> str:
+    """Cell text for reports: 1,234.50 · 27 Nov 2026 · 27 Nov 2026, 3:41 pm · '-' for empty."""
+    import re as _re
+    if v is None or v == "":
+        return "-"
+    if isinstance(v, float) or isinstance(v, Decimal):
+        return f"{float(v):,.2f}"
+    if isinstance(v, (dt.datetime, dt.date)):
+        v = v.isoformat()
+    t = str(v)
+    m = _re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?", t)
+    if m and len(t) <= 32:
+        y, mo, d, h, mi = m.groups()
+        day = f"{int(d)} {dt.date(2000, int(mo), 1):%b} {y}"
+        return day if h is None else f"{day}, {int(h) % 12 or 12}:{mi} {'am' if int(h) < 12 else 'pm'}"
+    return t.replace("&", "&amp;").replace("<", "&lt;")
+
+
+def table_pdf(business: str, title: str, period: str, columns: list, rows: list, total=None, kpis=None) -> bytes:
+    """Any report table as a branded PDF (landscape when it is wide). Numbers align right; a row whose
+    other cells are all empty is drawn as a section heading."""
+    from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import Paragraph
     wide = len(columns) > 6
     d = _Pdf(business, title, period)
+    if kpis:
+        d.kpis(kpis)
+        d.spacer(6)
     width = 770 if wide else 523
-    cell = lambda v: Paragraph(str(f"{v:,.2f}" if isinstance(v, float) else ("-" if v is None else v)), d.st["p"])  # noqa: E731
-    body = [columns] + [[cell(v) for v in r] for r in rows] + ([[cell(v) for v in total]] if total else [])
+    num = ParagraphStyle("num", parent=d.st["p"], alignment=TA_RIGHT)
+    sec = ParagraphStyle("sec", parent=d.st["p"], fontName="Inter-Bold", textColor=d.c.HexColor(d.ACC))
+    is_num = lambda v: isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)  # noqa: E731
+    body, sections = [columns], []
+    for r in rows:
+        if len(r) > 1 and all(x in (None, "") for x in r[1:]):
+            sections.append(len(body))
+            body.append([Paragraph(nice(r[0]), sec)] + [""] * (len(r) - 1))
+        else:
+            body.append([Paragraph(nice(v), num if is_num(v) else d.st["p"]) for v in r])
+    if total:
+        body.append([Paragraph(f"<b>{nice(v)}</b>", num if is_num(v) else d.st["p"]) for v in total])
     if len(body) == 1:
         body.append(["-"] * len(columns))
-    d.table(body, [width / len(columns)] * len(columns), numeric=1, total=bool(total))
+    n = len(columns)
+    widths = [width * .45] + [width * .55 / (n - 1)] * (n - 1) if n == 2 else [width / n] * n
+    d.table(body, widths, numeric=1, total=bool(total), bold_rows=sections)
     return d.build(landscape(A4) if wide else None)
