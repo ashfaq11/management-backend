@@ -11,7 +11,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg import errors as pgerr
-from pydantic import BaseModel, Field
+from pydantic import field_validator, BaseModel, Field
 
 from . import payroll, security
 from .audit import AuditMiddleware
@@ -336,6 +336,13 @@ class SignupIn(SpaProfile):
     spa_name: str = Field(min_length=2, max_length=120)
     username: str = Field(min_length=3, max_length=60)
     password: str = Field(min_length=8, max_length=200)
+
+    @field_validator("password")
+    @classmethod
+    def strong_enough(cls, v: str) -> str:
+        if not (re.search(r"[A-Za-z]", v) and re.search(r"\d", v)):
+            raise ValueError("password must have at least 8 characters with letters and numbers")
+        return v
 
 
 class PlatformIn(BaseModel):
