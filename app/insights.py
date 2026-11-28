@@ -49,6 +49,15 @@ REPORTS = {
            HAVING MAX(a.start_at) < CURRENT_DATE - (%(days)s || ' days')::interval
               AND NOT EXISTS (SELECT 1 FROM appointments b WHERE b.customer_id=c.id AND b.status='booked' AND b.start_at >= now())
            ORDER BY 6 DESC LIMIT 500"""),
+    "repeat": ("Repeat customers", ["Customer", "Phone", "Visits", "Spent", "First visit", "Last visit", "Avg gap (days)", "Type"],
+        f"""WITH v AS (SELECT a.customer_id, a.start_at::date d, a.price FROM appointments a
+                       WHERE a.spa_id=%(spa)s AND a.status='completed'),
+                p AS (SELECT DISTINCT customer_id FROM v WHERE d >= %(lo)s AND d < %(hi)s)
+           SELECT c.name, c.phone, COUNT(*), SUM(v.price), MIN(v.d), MAX(v.d),
+                  CASE WHEN COUNT(*) > 1 THEN ROUND((MAX(v.d) - MIN(v.d))::numeric / (COUNT(*) - 1)) END,
+                  CASE WHEN MIN(v.d) >= %(lo)s THEN 'New' ELSE 'Returning' END
+           FROM p JOIN customers c ON c.id=p.customer_id JOIN v ON v.customer_id=p.customer_id
+           GROUP BY c.id HAVING COUNT(*) > 1 ORDER BY 3 DESC, 4 DESC LIMIT 500"""),
     "busy": ("Busy hours (bookings)", ["Day", "Hour", "Bookings", "Completed"],
         f"""SELECT to_char(a.start_at,'Dy'), to_char(a.start_at,'HH24":00"'), COUNT(*), COUNT(*) FILTER (WHERE a.status='completed')
             FROM appointments a WHERE {C} AND a.status<>'cancelled'
@@ -118,5 +127,5 @@ def run(db, kind: str, spa: int, lo: dt.date, hi: dt.date, days: int, expenses_i
     return {"title": title, "columns": cols, "rows": rows}
 
 
-KINDS = ["therapists", "plans", "services", "customers", "payments", "expenses", "lapsed", "busy", "utilisation",
+KINDS = ["therapists", "plans", "services", "customers", "payments", "expenses", "lapsed", "repeat", "busy", "utilisation",
          "cancellations", "expiring", "dues"]
